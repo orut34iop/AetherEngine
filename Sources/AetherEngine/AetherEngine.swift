@@ -4045,6 +4045,14 @@ public final class AetherEngine: ObservableObject {
             // the video track's own measure of how many frames the player is actually putting on screen.
             let playerRate = self.currentAVPlayer?.currentItem?.tracks
                 .lazy.map(\.currentVideoFrameRate).first { $0 > 0 }
+            self.diagnostics.displayModeDiagnostic = DisplayModeDiagnostic(
+                backend: backend,
+                contentFrameRate: contentRate,
+                requestedRefreshRate: requestedRate,
+                measuredRefreshRate: sample?.measured,
+                nominalRefreshRate: sample?.nominal,
+                playerFrameRate: playerRate.map(Double.init)
+            )
             func fmt(_ value: Double?) -> String {
                 value.map { String(format: "%.3f", $0) } ?? "n/a"
             }
@@ -4633,6 +4641,7 @@ public final class AetherEngine: ObservableObject {
         liveTelemetrySampler?.stop()
         liveTelemetrySampler = nil
         diagnostics.liveTelemetry = nil
+        diagnostics.displayModeDiagnostic = nil
         nativeCancellables.removeAll()
         // AE#158: keepCurrentItem defers the item detach to the next host.load(inPlaceSwap:) so a
         // system PiP window never sees a nil-item gap across a native->native load. Only meaningful
