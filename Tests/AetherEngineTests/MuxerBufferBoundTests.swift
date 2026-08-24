@@ -13,6 +13,20 @@ import Libavutil
 @Suite("MP4SegmentMuxer buffered-fragment bound (#64)")
 struct MuxerBufferBoundTests {
 
+    @Test("Only unusually fine source clocks are normalized to the 90 kHz HLS video clock")
+    func videoTrackTimescaleNormalization() {
+        #expect(MP4SegmentMuxer.normalizedVideoTrackTimescale(
+            for: AVRational(num: 1, den: 1_200_000)) == 90_000)
+        #expect(MP4SegmentMuxer.normalizedVideoTrackTimescale(
+            for: AVRational(num: 1, den: 90_000)) == nil)
+        #expect(MP4SegmentMuxer.normalizedVideoTrackTimescale(
+            for: AVRational(num: 1, den: 16_000)) == nil)
+        #expect(MP4SegmentMuxer.normalizedVideoTrackTimescale(
+            for: AVRational(num: 1_001, den: 1_200_000)) == nil)
+        #expect(MP4SegmentMuxer.normalizedVideoTrackTimescale(
+            for: AVRational(num: 0, den: 1_200_000)) == nil)
+    }
+
     @Test("Tick span is computed from the output video time base")
     func ticksFromTimeBase() {
         // movenc's typical 24 fps rewrite is 1/16000; 8 s -> 128000 ticks.

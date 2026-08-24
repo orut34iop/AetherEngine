@@ -301,6 +301,19 @@ final class MP4SegmentMuxer {
         return Int64(seconds * Double(timeBase.den) / Double(timeBase.num))
     }
 
+    /// Keep unusually fine source clocks out of the HLS-fMP4 track header. tvOS AVPlayer has been
+    /// observed pacing a 29.97 fps AVC stream unevenly when movenc preserves its 1/1,200,000 source
+    /// clock in the loopback fragments, while the same elementary stream is smooth outside that
+    /// carriage. 90 kHz is precise enough for common broadcast cadences (including 30000/1001) and
+    /// limits the workaround to clocks finer than the conventional MPEG video clock.
+    static func normalizedVideoTrackTimescale(for timeBase: AVRational) -> Int32? {
+        guard timeBase.num > 0, timeBase.den > 0 else { return nil }
+        let ticksPerSecondNumerator = Int64(timeBase.den)
+        let thresholdNumerator = 90_000 * Int64(timeBase.num)
+        guard ticksPerSecondNumerator > thresholdNumerator else { return nil }
+        return 90_000
+    }
+
     /// True when the buffered video span [firstDts, currentDts] has reached `boundTicks` and an interim
     /// flush is due. A sentinel firstDts (Int64.min) means no window is open yet; a backward currentDts
     /// (a DTS reset) never triggers; boundTicks <= 0 disables the bound.
@@ -435,6 +448,9 @@ final class MP4SegmentMuxer {
         // lipsync drift. Position belongs in each fragment's tfdt; moov stays restart-invariant.
         av_dict_set(&opts, "use_editlist", "0", 0)
         av_dict_set(&opts, "avoid_negative_ts", "disabled", 0)
+        if let timescale = normalizedVideoTrackTimescale(for: video.timeBase) {
+            av_dict_set(&opts, "video_track_timescale", String(timescale), 0)
+        }
 
         let ret = avformat_write_header(ctx, &opts)
         guard ret >= 0 else {
@@ -959,4 +975,3 @@ private func mp4SegmentMuxerSinkWrite(
     muxer.receive(buf, count: Int(size))
     return size
 }
-
