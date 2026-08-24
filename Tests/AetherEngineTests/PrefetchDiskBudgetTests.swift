@@ -42,7 +42,7 @@ struct PrefetchBudgetSizingTests {
 @Suite("Prefetch disk-budget backpressure decision")
 struct PrefetchDiskBudgetDecisionTests {
 
-    @Test("A session without a retention budget never parks (live keeps window-only pruning)")
+    @Test("A window-only session without a retention budget never parks")
     func noBudgetNeverParks() {
         #expect(PrefetchDiskBudget.shouldPark(forwardBytes: 5_000, budgetBytes: 0,
                                               head: 100, consumerTarget: 0) == false)

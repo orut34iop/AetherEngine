@@ -159,6 +159,10 @@ extension AetherEngine {
 
     func loadRemoteHLS(url: URL, options: LoadOptions, startPosition: Double? = nil) async throws {
         playbackBackend = .native
+        sessionCacheStatusToken &+= 1
+        diagnostics.sessionCacheStatus = .nativeRemoteHLS(
+            requestedBudgetBytes: options.sessionCacheByteBudget.map { max(0, $0) }
+        )
         // #168 follow-up: detect a superseding load()/stop() between the carriage verdict and the reroute.
         let bypassGeneration = loadGeneration
 
@@ -470,8 +474,17 @@ extension AetherEngine {
             // Caller-bounded probe budget (#68) for the fallback open / live reopen; the happy path reuses preopenedDemuxer.
             probesize: loadedOptions.probesize,
             maxAnalyzeDuration: loadedOptions.maxAnalyzeDuration,
-            forwardBufferSegments: loadedOptions.forwardBufferSegments
+            forwardBufferSegments: loadedOptions.forwardBufferSegments,
+            sessionCacheByteBudget: loadedOptions.sessionCacheByteBudget
         )
+        sessionCacheStatusToken &+= 1
+        let cacheStatusToken = sessionCacheStatusToken
+        session.onSessionCacheStatusChanged = { [weak self] status in
+            Task { @MainActor [weak self] in
+                guard let self, self.sessionCacheStatusToken == cacheStatusToken else { return }
+                self.diagnostics.sessionCacheStatus = status
+            }
+        }
         // #240: the pump claims the source link through this gate while it is fetching, so the
         // subtitle side readers can stay out of its way. Set before start().
         session.sideReaderLinkGate = sideReaderLinkGate
@@ -775,9 +788,16 @@ extension AetherEngine {
         session.initialStartSeconds = startPosition
 
         // session.start() opens its own Demuxer + prewarm seek (~1-3 s on slow CDN); detach so @MainActor doesn't block.
-        var playbackURL = try await Task.detached(priority: .userInitiated) { [session] in
-            try session.start()
-        }.value
+        let playbackURLFromSession: URL
+        do {
+            playbackURLFromSession = try await Task.detached(priority: .userInitiated) { [session] in
+                try session.start()
+            }.value
+        } catch {
+            session.stop(reason: .loadFailed)
+            throw error
+        }
+        var playbackURL = playbackURLFromSession
         // AirPlay (#86): while external playback is active, serve the loopback over the device's LAN IP so
         // the receiver reaches the engine-processed stream (DV/Atmos/subtitles preserved). An HDR/DV master
         // is downgraded to the media playlist there (an SDR receiver rejects it, DrHurt); an SDR master is
@@ -786,7 +806,7 @@ extension AetherEngine {
         playbackURL = served.url
         // Superseded while starting: stop and unwind before touching shared state.
         if loadGeneration != generation {
-            session.stop()
+            session.stop(reason: .sourceChanged)
             try checkLoadCurrent(generation)
         }
         self.nativeVideoSession = session
@@ -1778,7 +1798,7 @@ extension AetherEngine {
                         + "failing the reload so the host can retune",
                         category: .engine
                     )
-                    self.stopInternal()
+                    self.stopInternal(cacheCleanupReason: .loadFailed)
                     self.state = .error("Live reload failed: player never became ready")
                     return
                 }

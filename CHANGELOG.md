@@ -12,6 +12,19 @@ the public-API contract.
 
 ### Added
 
+- **Explicit, observable session-cache byte policy.**
+  `LoadOptions.sessionCacheByteBudget` now accepts a caller-exact current-session
+  request (`0` means playback-window only). Aether applies the tmp-volume
+  quarter-free safety clamp, preserves the AVPlayer hard window even when its
+  actual bytes exceed that request, and publishes requested/base-effective/
+  hard-floor/effective/resident/forward bytes, producer park, eviction count,
+  route capability, failures and typed cleanup through `sessionCacheStatus`.
+  Native remote HLS reports `.unsupported` rather than zero-byte cache support.
+  Session directories are deleted on stop, source replacement and load failure;
+  startup crash-remnant cleanup now bounds both inspection and deletion while
+  preserving current and fresh siblings. This remains an ephemeral fMP4 cache:
+  no segment or index is reused by a later session.
+
 - **A complete first-release dual-subtitle host contract.** The secondary
   channel now publishes `activeSecondarySubtitleTrackIndex` for embedded and
   registered external identities, `secondaryBitmapSupported` explicitly

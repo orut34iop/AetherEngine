@@ -9,4 +9,8 @@ public final class EngineDiagnostics: ObservableObject {
 
     /// 1 Hz snapshot while playing/paused; nil while idle. Cleared in stopInternal so sessions don't inherit stale numbers.
     @Published public internal(set) var liveTelemetry: LiveTelemetry?
+
+    /// Route-aware session-only fMP4 cache state. Updated at session lifecycle transitions and by
+    /// the 1 Hz sampler while active; cleanup completion remains visible after live telemetry stops.
+    @Published public internal(set) var sessionCacheStatus: SessionCacheStatus = .inactive
 }

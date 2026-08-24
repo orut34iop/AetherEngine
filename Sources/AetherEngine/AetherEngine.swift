@@ -696,6 +696,10 @@ public final class AetherEngine: ObservableObject {
     /// Forwarder; for push updates subscribe to `diagnostics.$liveTelemetry` (objectWillChange does NOT fire).
     public var liveTelemetry: LiveTelemetry? { diagnostics.liveTelemetry }
 
+    /// Forwarder for Aether's ephemeral fMP4 cache contract. Native remote HLS reports
+    /// `.unsupported` because AVPlayer/the origin own that route's buffering.
+    public var sessionCacheStatus: SessionCacheStatus { diagnostics.sessionCacheStatus }
+
     /// Human-readable decoder label for stats UI (e.g. "VideoToolbox HEVC (HW)", "dav1d AV1 (SW)",
     /// "libavcodec VP9 (SW)"). nil while idle; cleared in stopInternal so sessions never inherit the previous label.
     @Published public internal(set) var activeVideoDecoder: String?
@@ -967,6 +971,8 @@ public final class AetherEngine: ObservableObject {
 
     /// Loopback HLS-fMP4 engine. Non-nil between load and stop.
     var nativeVideoSession: HLSVideoEngine?
+    /// Rejects a detached cleanup callback from an older cache after a newer route has published.
+    var sessionCacheStatusToken: UInt64 = 0
 
     /// Stands in for the origin on the native remote HLS route when the host
     /// has opted into certificates that fail system trust. Non-nil only for
@@ -2343,6 +2349,8 @@ public final class AetherEngine: ObservableObject {
         // reloads. Sessions that never reach apply() clear a stale criteria via loadDisplayCriteriaAction
         // (audio-only fast path, suppressed hosts); a load() that throws before routing leaves it for stop().
         stopInternal(resetDisplayCriteria: false, keepNativeHost: priorBackendWasNative, keepCurrentItem: handOverInPlace)
+        sessionCacheStatusToken &+= 1
+        diagnostics.sessionCacheStatus = .inactive
         // #35/#93: a genuinely new item has not rendered yet; re-arm the cold-startup wedge suspension.
         // Scrub/seek/producer-restart never route through load(), so mid-stream #93 detection stays armed.
         hasRenderedFirstFrameMirror.set(false)
@@ -3872,7 +3880,8 @@ public final class AetherEngine: ObservableObject {
     ///   `finalTeardown: true`. Only a final teardown honours `deactivatesAudioSessionOnStop`.
     public func stop(resetDisplayCriteria: Bool = true, finalTeardown: Bool? = nil) {
         stopInternal(resetDisplayCriteria: resetDisplayCriteria,
-                     finalTeardown: finalTeardown ?? resetDisplayCriteria)
+                     finalTeardown: finalTeardown ?? resetDisplayCriteria,
+                     cacheCleanupReason: .sessionStopped)
         state = .idle
         clock.currentTime = 0
         clock.bufferedPosition = 0
@@ -4575,7 +4584,14 @@ public final class AetherEngine: ObservableObject {
     ///   never settles and burns the full settle timeout (~12 s of
     ///   black-screen latency per audio switch on the old fixed 5 s
     ///   poll; capped at ~2 s since #117, but still worth skipping).
-    func stopInternal(resetDisplayCriteria: Bool = true, keepNativeHost: Bool = false, keepCustomReader: Bool = false, keepCurrentItem: Bool = false, finalTeardown: Bool = false) {
+    func stopInternal(
+        resetDisplayCriteria: Bool = true,
+        keepNativeHost: Bool = false,
+        keepCustomReader: Bool = false,
+        keepCurrentItem: Bool = false,
+        finalTeardown: Bool = false,
+        cacheCleanupReason: SessionCacheCleanupReason = .sourceChanged
+    ) {
         // Bump generation to invalidate in-flight load() checkpoints.
         loadGeneration &+= 1
         resumeAfterInterruption = false
@@ -4616,7 +4632,7 @@ public final class AetherEngine: ObservableObject {
             nativeHost = nil
             currentAVPlayer = nil
         }
-        nativeVideoSession?.stop()
+        nativeVideoSession?.stop(reason: cacheCleanupReason)
         nativeVideoSession = nil
         tlsProxy?.stop()
         tlsProxy = nil

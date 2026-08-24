@@ -586,11 +586,52 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// `capRelaxed` (#207) drops the 2 GiB default for a host that explicitly asked to pre-buffer more
     /// than the historical window could hold; the quarter-of-free-space clamp, which is what actually
     /// protects the volume, always applies. Unknown capacity keeps the conservative cap either way.
+    struct SessionCacheBudgetResolution: Sendable, Equatable {
+        let requestedBytes: Int?
+        let volumeSafetyLimitBytes: Int
+        let baseEffectiveBytes: Int
+    }
+
+    /// Resolve a caller-exact session budget without weakening the existing tmp-volume guard.
+    /// nil keeps the historical automatic policy. Unknown capacity stays conservatively bounded
+    /// at 2 GiB even for an explicit aggressive-prefetch request.
+    static func resolveSessionCacheBudget(
+        requestedBytes: Int?,
+        volumeAvailableBytes: Int64?,
+        capRelaxed: Bool = false
+    ) -> SessionCacheBudgetResolution {
+        let conservativeCap = 2 << 30
+        let quarterOfFree = volumeAvailableBytes.map { available -> Int in
+            let quarter = max(Int64(0), available / 4)
+            return Int(min(quarter, Int64(Int.max)))
+        }
+        let safetyLimit = quarterOfFree ?? conservativeCap
+
+        if let requestedBytes {
+            let normalized = max(0, requestedBytes)
+            return SessionCacheBudgetResolution(
+                requestedBytes: normalized,
+                volumeSafetyLimitBytes: safetyLimit,
+                baseEffectiveBytes: min(normalized, safetyLimit)
+            )
+        }
+
+        let effective = capRelaxed
+            ? safetyLimit
+            : min(conservativeCap, safetyLimit)
+        return SessionCacheBudgetResolution(
+            requestedBytes: nil,
+            volumeSafetyLimitBytes: safetyLimit,
+            baseEffectiveBytes: effective
+        )
+    }
+
     static func sessionRetentionBudgetBytes(volumeAvailableBytes: Int64?, capRelaxed: Bool = false) -> Int {
-        let cap = 2 << 30
-        guard let available = volumeAvailableBytes else { return cap }
-        let quarterOfFree = max(0, Int(available / 4))
-        return capRelaxed ? quarterOfFree : min(cap, quarterOfFree)
+        resolveSessionCacheBudget(
+            requestedBytes: nil,
+            volumeAvailableBytes: volumeAvailableBytes,
+            capRelaxed: capRelaxed
+        ).baseEffectiveBytes
     }
 
     /// Largest forward window the default 2 GiB retention budget covers by construction
@@ -638,7 +679,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         companionAudioReader: IOReader? = nil,
         probesize: Int64? = nil,
         maxAnalyzeDuration: Int64? = nil,
-        forwardBufferSegments: Int? = nil
+        forwardBufferSegments: Int? = nil,
+        sessionCacheByteBudget: Int? = nil
     ) {
         self.sourceURL = url
         self.sourceHTTPHeaders = sourceHTTPHeaders
@@ -677,6 +719,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.customSourceReopenFactory = customSourceReopenFactory
         self.companionAudioReader = companionAudioReader
         self.forwardWindowSegments = Self.clampedForwardWindow(forwardBufferSegments)
+        self.requestedSessionCacheBudgetBytes = sessionCacheByteBudget.map { max(0, $0) }
     }
 
     /// Session forward-buffer window in segments. Drives BOTH the producer's race-ahead
@@ -690,6 +733,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// playlist advertises stays resident; the producer-side prefetch park it also feeds is
     /// VOD-only (`advanceMuxer`), so live cannot park on it.
     private var retentionBudgetBytes: Int = 0
+    private let requestedSessionCacheBudgetBytes: Int?
+    private var sessionCacheVolumeSafetyLimitBytes: Int?
+
+    /// Lifecycle snapshots, including async close completion, are delivered here. The host may
+    /// sample `sessionCacheStatus()` for current bytes; this callback is primarily for cleanup.
+    public var onSessionCacheStatusChanged: (@Sendable (SessionCacheStatus) -> Void)?
 
     /// Clamp for `forwardWindowSegments`: below 4 the window would undercut AVPlayer's own ~5-7-segment
     /// prefetch and starve it (see `LiveWindowSizing.minSafeSegments`). The 2700 ceiling (~3 h at 4 s
@@ -1050,14 +1099,23 @@ public final class HLSVideoEngine: @unchecked Sendable {
             .volumeAvailableCapacityForImportantUsage
         #endif
         let capRelaxed = Self.retentionCapRelaxed(forwardWindowSegments: forwardWindowSegments)
-        let retentionBudget = Self.sessionRetentionBudgetBytes(volumeAvailableBytes: availableBytes,
-                                                               capRelaxed: capRelaxed)
+        let budget = Self.resolveSessionCacheBudget(
+            requestedBytes: requestedSessionCacheBudgetBytes,
+            volumeAvailableBytes: availableBytes,
+            capRelaxed: capRelaxed
+        )
+        let retentionBudget = budget.baseEffectiveBytes
         self.retentionBudgetBytes = retentionBudget
+        self.sessionCacheVolumeSafetyLimitBytes = budget.volumeSafetyLimitBytes
         let segmentCache = SegmentCache(forwardWindow: forwardWindowSegments,
                                         retentionBudgetBytes: retentionBudget)
         self.cache = segmentCache
+        onSessionCacheStatusChanged?(sessionCacheStatus())
+        let requestedBudgetDescription = budget.requestedBytes
+            .map { "\($0 / (1 << 20)) MiB" } ?? "automatic"
         EngineLog.emit(
-            "[HLSVideoEngine] segment retention budget: \(retentionBudget / (1 << 20)) MiB "
+            "[HLSVideoEngine] segment retention budget: requested=\(requestedBudgetDescription) "
+            + "effective=\(retentionBudget / (1 << 20)) MiB "
             + "(volumeAvailable=\(availableBytes.map { "\($0 / (1 << 20)) MiB" } ?? "unknown"), "
             + "forwardWindow=\(forwardWindowSegments) seg"
             + (capRelaxed ? ", opt-in prefetch: default cap relaxed" : "") + ")",
@@ -1503,7 +1561,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             ? srv.playlistURL
             : srv.mediaPlaylistURL
         guard let url = resolvedURL else {
-            stop()
+            stop(reason: .loadFailed)
             throw HLSVideoEngineError.openFailed(reason: "server URL not ready")
         }
         self.servingMasterPlaylist = useMasterPlaylist
@@ -1720,6 +1778,32 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var audioBridgeOutputBytesLifetime: Int64 { subsystemSnapshot().audioBridge?.outputBytesLifetime ?? 0 }
     var lastAVGapMs: Double { subsystemSnapshot().producer?.lastAVGapMs ?? 0 }
 
+    /// Current route-aware cache contract. Byte fields come from the cache ledger, not segment-count
+    /// estimates. The close-completion snapshot is also delivered through
+    /// `onSessionCacheStatusChanged` because the cache object is intentionally detached at stop.
+    public func sessionCacheStatus() -> SessionCacheStatus {
+        if let cache = subsystemSnapshot().cache {
+            return cache.status(
+                route: .loopbackFMP4,
+                requestedBudgetBytes: requestedSessionCacheBudgetBytes.map { max(0, $0) },
+                baseEffectiveBudgetBytes: retentionBudgetBytes,
+                volumeSafetyLimitBytes: sessionCacheVolumeSafetyLimitBytes
+            )
+        }
+        return SessionCacheStatus(
+            route: .loopbackFMP4, capability: .active,
+            requestedBudgetBytes: requestedSessionCacheBudgetBytes.map { max(0, $0) },
+            volumeSafetyLimitBytes: sessionCacheVolumeSafetyLimitBytes,
+            baseEffectiveBudgetBytes: retentionBudgetBytes, playbackSafeFloorBytes: 0,
+            effectiveBudgetBytes: retentionBudgetBytes, currentResidentBytes: 0,
+            currentForwardBytes: 0, forwardWindowSegments: forwardWindowSegments,
+            backwardWindowSegments: SegmentCache.defaultBackwardWindow,
+            producerParked: false, evictionCount: 0,
+            hardWindowFloorExceeded: false, cleanupReason: nil, cleanupResult: .notRun,
+            lastFailure: nil
+        )
+    }
+
     public func diagnosticStats() -> DiagnosticStats {
         let subs = subsystemSnapshot()
         let abLive = subs.audioBridge?.liveBytes
@@ -1759,7 +1843,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return (initData + segData, seg.index)
     }
 
-    public func stop() {
+    public func stop(reason: SessionCacheCleanupReason = .sessionStopped) {
         // Sodalite#32: drop the tap routes first so a pump still draining its last packets no-ops
         // instead of decoding into stores being torn down.
         subtitleTapLock.lock()
@@ -1776,6 +1860,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         server = nil
         let c = cache
         cache = nil
+        let cacheStatusCallback = onSessionCacheStatusChanged
+        let cacheRequestedBudget = requestedSessionCacheBudgetBytes.map { max(0, $0) }
+        let cacheEffectiveBudget = retentionBudgetBytes
+        let cacheVolumeSafetyLimit = sessionCacheVolumeSafetyLimitBytes
         let ab = audioBridge
         audioBridge = nil
         let d = demuxer
@@ -1820,7 +1908,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
         Task.detached {
             _ = p?.waitForFinish(timeout: 3.0)
             s?.stop()
-            c?.close()
+            if let c {
+                _ = c.close(reason: reason)
+                cacheStatusCallback?(c.status(
+                    route: .loopbackFMP4,
+                    requestedBudgetBytes: cacheRequestedBudget,
+                    baseEffectiveBudgetBytes: cacheEffectiveBudget,
+                    volumeSafetyLimitBytes: cacheVolumeSafetyLimit
+                ))
+            }
             ab?.close()
             d?.close()
             sd?.close()
@@ -1830,7 +1926,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     }
 
     deinit {
-        stop()
+        stop(reason: .sessionStopped)
     }
 
     // MARK: - Producer construction + restart

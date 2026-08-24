@@ -64,6 +64,7 @@ A scannable summary; the depth for each row lives in **[docs/formats.md](docs/fo
 | Metadata | `MediaMetadata` (title / artist / album / albumArtist + cover) parsed on load |
 | Seek | VOD seeks into watched content are restart-free cache hits (byte-budgeted retention, 2 GiB cap); short forward scrubs ride the cached window; only never-produced targets restart the producer |
 | Streaming | One long-lived forward-streaming connection, reconnect-on-drop; CDN-stutter resilient; optional caller-bounded open-time probe budget (`LoadOptions.probesize` / `maxAnalyzeDuration`) to cut first-frame latency on sparse remote remuxes; configurable forward-buffer window (`LoadOptions.forwardBufferSegments`), from the 40 s default up to an opt-in whole-source pre-buffer that is bounded in bytes by the session's disk budget rather than in segments |
+| Session cache | Ephemeral loopback-fMP4 segments only: `LoadOptions.sessionCacheByteBudget` requests an exact byte ceiling (`0` = playback window only), the tmp-volume quarter-free clamp and any actual hard-window overrun are reported through `sessionCacheStatus`, and stop/reload removes the UUID directory. Native remote HLS reports the feature unsupported; no bytes are reused across sessions. See [session-cache.md](docs/session-cache.md) |
 | Live / DVR | Unbounded live + optional timeshift; direct HLS ingest with AES-128 clear-key and SSAI ad-pod handling |
 | Custom input | Play any byte source via the `IOReader` protocol (`load(source:)`) |
 | Network | SMB2/3 shares via the optional `AetherEngineSMB` product (NTLMv2 / guest, read-only) |
@@ -104,7 +105,8 @@ try await player.load(url: videoURL)                            // or with a res
 try await player.load(url: videoURL, startPosition: 347.5)
 try await player.load(url: videoURL, options: .init(
     httpHeaders: headers,              // attached to every demux + segment fetch
-    matchContentEnabled: matchContent  // tvOS Match Content master toggle
+    matchContentEnabled: matchContent, // tvOS Match Content master toggle
+    sessionCacheByteBudget: 512 << 20  // current-session target; never persistent
 ))
 try await player.reloadAtCurrentPosition()                      // background reopen, preserves options
 try await player.load(url: trackURL, options: .init(audioOnly: true))   // lean audio path

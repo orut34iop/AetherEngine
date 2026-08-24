@@ -328,6 +328,13 @@ extension AetherEngine {
         diagnostics.liveTelemetry = snapshot
     }
 
+    /// Refresh current byte/park/eviction fields without disturbing the lifecycle result retained
+    /// for native-remote, software, audio, failed-load, or stopped sessions.
+    func refreshSessionCacheStatus() {
+        guard let session = nativeVideoSession else { return }
+        diagnostics.sessionCacheStatus = session.sessionCacheStatus()
+    }
+
 
     /// `Demuxer.avioBytesFetched` via HLSVideoEngine. Used by `LiveTelemetrySampler` for instant + average bitrate. 0 on SW path or pre-start.
     var demuxerBytesFetched: Int64 {

@@ -134,6 +134,129 @@ public enum LiveJoinProfile: Sendable, Equatable {
     case fastZap
 }
 
+/// Route that owns buffering for the current session. Only `loopbackFMP4` uses Aether's
+/// session-scoped `SegmentCache`; native remote HLS remains AVPlayer/server managed.
+public enum SessionCacheRoute: String, Sendable, Equatable {
+    case none
+    case loopbackFMP4 = "loopback_fmp4"
+    case nativeRemoteHLS = "native_remote_hls"
+}
+
+/// Whether the active route can apply Aether's session-cache byte policy.
+public enum SessionCacheCapability: String, Sendable, Equatable {
+    case inactive
+    case active
+    case unsupported
+}
+
+/// Why a session cache directory was closed. Values describe lifecycle, not persistence: every
+/// successful close deletes the entire UUID directory and no later session reuses it.
+public enum SessionCacheCleanupReason: String, Sendable, Equatable {
+    case sessionStopped = "session_stopped"
+    case sourceChanged = "source_changed"
+    case loadFailed = "load_failed"
+}
+
+public enum SessionCacheCleanupResult: String, Sendable, Equatable {
+    case notRun = "not_run"
+    case succeeded
+    case failed
+}
+
+/// Typed, credential-free disk failure for the current session cache.
+public enum SessionCacheFailureReason: String, Sendable, Equatable {
+    case sessionDirectoryCreationFailed = "session_directory_creation_failed"
+    case writeFailed = "write_failed"
+    case adoptFailed = "adopt_failed"
+    case staleSweepFailed = "stale_sweep_failed"
+    case cleanupFailed = "cleanup_failed"
+}
+
+/// Route-aware snapshot of Aether's ephemeral fMP4 segment cache.
+///
+/// `baseEffectiveBudgetBytes` is the caller request after the tmp-volume safety clamp.
+/// `playbackSafeFloorBytes` is the actual resident hard window that cannot be evicted without
+/// risking AVPlayer starvation. `effectiveBudgetBytes` is the larger of those two values, so a
+/// high-bitrate hard window is reported honestly rather than silently violating the requested cap.
+public struct SessionCacheStatus: Sendable, Equatable {
+    public let route: SessionCacheRoute
+    public let capability: SessionCacheCapability
+    public let requestedBudgetBytes: Int?
+    public let volumeSafetyLimitBytes: Int?
+    public let baseEffectiveBudgetBytes: Int
+    public let playbackSafeFloorBytes: Int
+    public let effectiveBudgetBytes: Int
+    public let currentResidentBytes: Int
+    public let currentForwardBytes: Int
+    public let forwardWindowSegments: Int
+    public let backwardWindowSegments: Int
+    public let producerParked: Bool
+    public let evictionCount: Int
+    public let hardWindowFloorExceeded: Bool
+    public let cleanupReason: SessionCacheCleanupReason?
+    public let cleanupResult: SessionCacheCleanupResult
+    public let lastFailure: SessionCacheFailureReason?
+
+    public init(
+        route: SessionCacheRoute,
+        capability: SessionCacheCapability,
+        requestedBudgetBytes: Int?,
+        volumeSafetyLimitBytes: Int?,
+        baseEffectiveBudgetBytes: Int,
+        playbackSafeFloorBytes: Int,
+        effectiveBudgetBytes: Int,
+        currentResidentBytes: Int,
+        currentForwardBytes: Int,
+        forwardWindowSegments: Int,
+        backwardWindowSegments: Int,
+        producerParked: Bool,
+        evictionCount: Int,
+        hardWindowFloorExceeded: Bool,
+        cleanupReason: SessionCacheCleanupReason?,
+        cleanupResult: SessionCacheCleanupResult,
+        lastFailure: SessionCacheFailureReason?
+    ) {
+        self.route = route
+        self.capability = capability
+        self.requestedBudgetBytes = requestedBudgetBytes
+        self.volumeSafetyLimitBytes = volumeSafetyLimitBytes
+        self.baseEffectiveBudgetBytes = baseEffectiveBudgetBytes
+        self.playbackSafeFloorBytes = playbackSafeFloorBytes
+        self.effectiveBudgetBytes = effectiveBudgetBytes
+        self.currentResidentBytes = currentResidentBytes
+        self.currentForwardBytes = currentForwardBytes
+        self.forwardWindowSegments = forwardWindowSegments
+        self.backwardWindowSegments = backwardWindowSegments
+        self.producerParked = producerParked
+        self.evictionCount = evictionCount
+        self.hardWindowFloorExceeded = hardWindowFloorExceeded
+        self.cleanupReason = cleanupReason
+        self.cleanupResult = cleanupResult
+        self.lastFailure = lastFailure
+    }
+
+    public static let inactive = SessionCacheStatus(
+        route: .none, capability: .inactive, requestedBudgetBytes: nil,
+        volumeSafetyLimitBytes: nil, baseEffectiveBudgetBytes: 0,
+        playbackSafeFloorBytes: 0, effectiveBudgetBytes: 0, currentResidentBytes: 0,
+        currentForwardBytes: 0, forwardWindowSegments: 0, backwardWindowSegments: 0,
+        producerParked: false, evictionCount: 0, hardWindowFloorExceeded: false,
+        cleanupReason: nil, cleanupResult: .notRun, lastFailure: nil
+    )
+
+    public static func nativeRemoteHLS(requestedBudgetBytes: Int?) -> SessionCacheStatus {
+        SessionCacheStatus(
+            route: .nativeRemoteHLS, capability: .unsupported,
+            requestedBudgetBytes: requestedBudgetBytes, volumeSafetyLimitBytes: nil,
+            baseEffectiveBudgetBytes: 0, playbackSafeFloorBytes: 0,
+            effectiveBudgetBytes: 0, currentResidentBytes: 0, currentForwardBytes: 0,
+            forwardWindowSegments: 0, backwardWindowSegments: 0, producerParked: false,
+            evictionCount: 0, hardWindowFloorExceeded: false, cleanupReason: nil,
+            cleanupResult: .notRun, lastFailure: nil
+        )
+    }
+}
+
 /// Options for `AetherEngine.load(url:options:)`. All flags default to safe values.
 public struct LoadOptions: Sendable, Equatable {
     /// Diagnostic lever: omit BT.2020 / transfer / YCbCr matrix from AVDisplayCriteria so AVPlayer re-reads color from the bitstream. Default off.
@@ -280,6 +403,14 @@ public struct LoadOptions: Sendable, Equatable {
     /// remote server directly.
     public var forwardBufferSegments: Int?
 
+    /// Requested byte ceiling for Aether's current-session fMP4 segment cache. The engine clamps
+    /// this to one quarter of available tmp-volume capacity and reports both values through
+    /// `sessionCacheStatus`. `0` means window-only (the playback-safe hard window still writes
+    /// temporary segments); `512 << 20` expresses a 512-MB adaptive session; 2...16 GiB supports
+    /// aggressive session prefetch. nil preserves the historical automatic policy. Ignored, with
+    /// `.unsupported` capability reported, on `nativeRemoteHLS`. No data survives `stop()`/reload.
+    public var sessionCacheByteBudget: Int?
+
     /// Autostart at load completion. Default `true`: every load path ends in `host.play()` and a
     /// `.playing` state (current behavior, byte-identical). Set `false` to mount PAUSED: a host that
     /// holds a pause at mount (synchronized-start lobby that loads several devices and starts them on
@@ -341,6 +472,7 @@ public struct LoadOptions: Sendable, Equatable {
         preferredSubtitleLanguages: [String] = [],
         externalSubtitles: [ExternalSubtitleTrack] = [],
         forwardBufferSegments: Int? = nil,
+        sessionCacheByteBudget: Int? = nil,
         autoplay: Bool = true,
         teletextPage: Int? = nil,
         deinterlaceMode: DeinterlaceMode = .auto,
@@ -371,6 +503,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.preferredSubtitleLanguages = preferredSubtitleLanguages
         self.externalSubtitles = externalSubtitles
         self.forwardBufferSegments = forwardBufferSegments
+        self.sessionCacheByteBudget = sessionCacheByteBudget.map { max(0, $0) }
         self.autoplay = autoplay
         self.teletextPage = teletextPage
         self.deinterlaceMode = deinterlaceMode
