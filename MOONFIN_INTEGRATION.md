@@ -17,6 +17,11 @@ not float with upstream `main`.
 
 ## Integration boundaries
 
+- Moonfin accepts tvOS 17 as the deployment floor required by this Aether
+  baseline. Host targets, tests, extensions, and generated metadata must use
+  the same floor.
+- The host pins only a full, pushed commit SHA from this fork. A version
+  shorthand, branch name, or floating `main` is never a release dependency.
 - AetherEngine is the only playback kernel in the final tvOS application.
   MPVKit, libmpv, the previous custom native playback main path, and runtime
   kernel fallback are removed at the host cutover.
@@ -27,6 +32,14 @@ not float with upstream `main`.
   host. Demux, decode, route selection, subtitle cue production, session-cache
   contracts, and other engine behavior are fixed in this fork rather than by
   untracked host workarounds.
+- First-release dual subtitles cover text, ASS, and external tracks through the
+  host's two-row layout and symmetric engine channel contracts. Secondary
+  bitmap support remains disabled until focused engine fixtures prove decode,
+  seek/reload generation, and geometry behavior end to end.
+- First-release subtitle translation consumes embedded text cues that Aether
+  publishes. Remote-HLS and external subtitle translation remain out of scope;
+  neither the host nor this fork may silently add a Jellyfin extraction or
+  temporary-sidecar path to expand eligibility.
 
 ## Change and delivery rules
 
