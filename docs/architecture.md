@@ -275,6 +275,7 @@ Sources/AetherEngine/
 │   ├── HLSSegmentProducer.swift             Native path: pump loop reading from Demuxer, feeding MP4SegmentMuxer, cutting fragments keyframe-gated in decode order so the IRAP opens its segment (#92); SSAI program-switch detection + no-cut watchdog
 │   ├── VODSegmentCutter.swift               Native path: decode-order, keyframe-gated VOD segment cutter (the IRAP opens its segment, #92)
 │   ├── H264SPS.swift                        Hand-rolled H.264 SPS parser (SSAI ad-creative coded dimensions / codec config)
+│   ├── H264CompositionOffsetRepair.swift    Rebuilds the presentation axis of an MP4 whose writer dropped `ctts` while the bitstream still reorders pictures: libavcodec's H.264 parser supplies each access unit's picture order count without decoding, a fail-closed head sample settles the ladder and the shift, and packets are rewritten to the timeline a correct muxer would have written, so the native path and hardware decode are kept (#409)
 │   ├── OutputTimestampSanitizer.swift       Final-stage DTS/PTS monotonicity guard before the fMP4 mux (SSAI splices, program restarts)
 │   ├── RestartCoalescer.swift               Coalesces a burst of producer-restart requests into one in-flight + one settled target (rapid-seek, AetherEngine#35)
 │   ├── LiveWindow.swift                     Live path: session-relative DVR timeline (seconds since first frame), shared by the native and SW live paths
