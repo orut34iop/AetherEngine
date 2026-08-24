@@ -1,6 +1,6 @@
-// Addressing and rewriting, none of which reads the trust flag. The live
+// Addressing and rewriting, none of which reads the TLS origin policy. The live
 // proof that a client which never sees the certificate still gets the stream
-// lives with the other tests that flip that flag, in EngineTLSHandshakeTests.
+// lives with the other tests that mutate the origin policy, in EngineTLSHandshakeTests.
 import Foundation
 import Testing
 

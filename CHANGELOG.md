@@ -12,33 +12,33 @@ the public-API contract.
 
 ### Added
 
-- **`EngineTLS.allowUntrustedCertificates`: host opt-in to accept server
-  certificates that fail system trust evaluation.** Every engine fetch runs
-  over URLSession, which enforces system certificate trust that the
-  in-demuxer network stacks the engine replaces never did. A media server
-  fronted by a self-signed or private-CA certificate therefore keeps working
-  in a host whose own API layer bypasses trust, while the engine's open fails
-  its handshake before a byte is read and surfaces as bare
-  `AVERROR_INVALIDDATA`, invisible in any server log. The flag is read per
-  challenge, so a host settings toggle applies from the next connection.
-  Default off; while off, and for every non-server-trust challenge, handling
-  is unchanged. Covers all outbound sessions: the AVIOReader probe, chunk,
-  persistent and streaming paths, the disc reader, both HLS ingest readers,
-  and the audio tap fetcher.
+- **`EngineTLS.allowedUntrustedCertificateOrigins`: exact-origin host opt-in
+  for certificates that fail system trust evaluation.** Every approval is an
+  `EngineTLS.Origin` normalized to HTTPS scheme, case-insensitive host and
+  effective port. Redirects and playlist resources are evaluated against
+  their own protection-space origin, so a source approval cannot grant a
+  sibling host or port the same bypass. Replacing or clearing the thread-safe
+  set revokes future connections immediately; an empty set and every non-
+  server-trust challenge preserve system default handling. The former
+  process-global `allowUntrustedCertificates` boolean has been removed. The
+  policy covers all outbound sessions: AVIOReader probe/chunk/persistent/
+  streaming paths, the disc reader, HLS ingest/reverse-proxy readers, subtitle
+  fetches and the audio tap fetcher.
 
-- **Loopback proxy so the trust opt-in reaches the native remote HLS route.**
+- **Loopback proxy so an exact-origin trust opt-in reaches native remote HLS.**
   `EngineTLS` only governs sessions the engine opens, and on that route the
   origin URL goes to `AVURLAsset`, where AVPlayer resolves it through its own
   networking and asks no delegate about the certificate. An origin behind a
   self-signed certificate could direct play, since that reads through
   AVIOReader, and then fail the moment it transcoded. AVPlayer is now pointed
   at a loopback stand-in and the engine makes the https request itself, so the
-  handshake happens where the opt-in is read. Playlists are rewritten so every
-  variant, key, map and segment follows, and anything else is relayed byte for
-  byte with `Range` forwarded and `Content-Range` mirrored. The proxy binds
-  `127.0.0.1` rather than all interfaces, since it fetches whatever URL a
-  request names, and refuses any origin no playlist advertised. Sessions that
-  have not opted in reach AVPlayer unchanged.
+  handshake happens where the exact-origin policy is read. Playlists are
+  rewritten so every variant, key, map and segment follows, and anything else
+  is relayed byte for byte with `Range` forwarded and `Content-Range` mirrored.
+  The proxy binds `127.0.0.1` rather than all interfaces, refuses any origin no
+  playlist advertised, and still requires each advertised HTTPS origin to be
+  independently present in `allowedUntrustedCertificateOrigins`. Sessions
+  whose source origin is not approved reach AVPlayer unchanged.
 
 ## [6.7.0] - 2026-08-04
 

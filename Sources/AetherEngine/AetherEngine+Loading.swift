@@ -321,7 +321,7 @@ extension AetherEngine {
     /// whose certificate the system already trusts rather than failing the
     /// whole load.
     func remoteHLSPlayerURL(for origin: URL, options: LoadOptions) -> URL {
-        guard EngineTLS.allowUntrustedCertificates,
+        guard EngineTLS.allowsUntrustedCertificate(for: origin),
             origin.scheme?.lowercased() == "https"
         else { return origin }
 

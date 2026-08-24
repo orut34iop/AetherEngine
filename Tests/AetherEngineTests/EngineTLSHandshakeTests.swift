@@ -1,4 +1,4 @@
-// Live-handshake proof for `EngineTLS.allowUntrustedCertificates`. The
+// Live-handshake proof for `EngineTLS.allowedUntrustedCertificateOrigins`. The
 // resolver unit tests cannot show the load-bearing part: that URLSession
 // actually delivers the server-trust challenge to the reader's per-task
 // delegates. NWListener rejects an imported in-memory identity with EINVAL,
@@ -11,21 +11,22 @@
 
     @testable import AetherEngine
 
-    /// Everything that flips `EngineTLS.allowUntrustedCertificates` lives in
-    /// this one suite. The flag is process global and suites otherwise run in
-    /// parallel, so a second suite setting it would decide what this one is
-    /// testing.
-    @Suite("EngineTLS live handshake against a self-signed origin", .serialized)
-    struct EngineTLSHandshakeTests {
+    /// Everything that replaces EngineTLS's process-wide origin set lives in
+    /// this one suite. Suites otherwise run in parallel, so a second suite
+    /// mutating it would decide what this one is testing.
+    extension EngineTLSTestSuite {
 
-        @Test("Flag off: the handshake is refused and no request reaches the origin")
+    @Suite("Live handshake against a self-signed origin")
+    struct HandshakeTests {
+
+        @Test("Empty policy: the handshake is refused and no request reaches the origin")
         func refusedByDefault() async throws {
             let server = try #require(SelfSignedTLSOrigin())
             defer { server.stop() }
 
-            let previous = EngineTLS.allowUntrustedCertificates
-            defer { EngineTLS.allowUntrustedCertificates = previous }
-            EngineTLS.allowUntrustedCertificates = false
+            let previous = EngineTLS.allowedUntrustedCertificateOrigins
+            defer { EngineTLS.allowedUntrustedCertificateOrigins = previous }
+            EngineTLS.allowedUntrustedCertificateOrigins = []
 
             let reader = AVIOReader(
                 url: URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!,
@@ -38,17 +39,20 @@
                     "a request crossed a handshake that system trust should have refused")
         }
 
-        @Test("Flag on: the same origin serves the reader")
-        func acceptedWhenOptedIn() async throws {
+        @Test("Exact origin approval serves the reader")
+        func acceptedWhenExactOriginIsAllowed() async throws {
             let server = try #require(SelfSignedTLSOrigin())
             defer { server.stop() }
 
-            let previous = EngineTLS.allowUntrustedCertificates
-            defer { EngineTLS.allowUntrustedCertificates = previous }
-            EngineTLS.allowUntrustedCertificates = true
+            let url = URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!
+            let previous = EngineTLS.allowedUntrustedCertificateOrigins
+            defer { EngineTLS.allowedUntrustedCertificateOrigins = previous }
+            EngineTLS.allowedUntrustedCertificateOrigins = [
+                try #require(EngineTLS.Origin(url: url))
+            ]
 
             let reader = AVIOReader(
-                url: URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!,
+                url: url,
                 chunkRequestTimeout: 10, chunkMaxRetries: 2)
             defer { reader.markClosed(); reader.close() }
             try reader.open()
@@ -68,20 +72,45 @@
             #expect(server.requestsServed > 0)
         }
 
+        @Test("A different port does not inherit an origin approval")
+        func wrongPortIsRefused() async throws {
+            let server = try #require(SelfSignedTLSOrigin())
+            defer { server.stop() }
+
+            let wrongPort = server.port == UInt16.max ? Int(server.port) - 1 : Int(server.port) + 1
+            let previous = EngineTLS.allowedUntrustedCertificateOrigins
+            defer { EngineTLS.allowedUntrustedCertificateOrigins = previous }
+            EngineTLS.allowedUntrustedCertificateOrigins = [
+                try #require(EngineTLS.Origin(
+                    scheme: "https", host: "127.0.0.1", port: wrongPort))
+            ]
+
+            let reader = AVIOReader(
+                url: URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!,
+                chunkRequestTimeout: 5, chunkMaxRetries: 1)
+            defer { reader.markClosed(); reader.close() }
+            try reader.open()
+
+            try await Task.sleep(for: .seconds(3))
+            #expect(server.requestsServed == 0)
+        }
+
         @Test("Through the proxy: a client that never sees the certificate gets the stream")
         func proxyServesThroughUntrustedOrigin() async throws {
             let origin = try #require(SelfSignedHLSOrigin())
             defer { origin.stop() }
 
-            let previous = EngineTLS.allowUntrustedCertificates
-            defer { EngineTLS.allowUntrustedCertificates = previous }
-            EngineTLS.allowUntrustedCertificates = true
+            let master = URL(string: "https://127.0.0.1:\(origin.port)/master.m3u8")!
+            let previous = EngineTLS.allowedUntrustedCertificateOrigins
+            defer { EngineTLS.allowedUntrustedCertificateOrigins = previous }
+            EngineTLS.allowedUntrustedCertificateOrigins = [
+                try #require(EngineTLS.Origin(url: master))
+            ]
 
             let proxy = HLSReverseProxyServer()
             try proxy.start()
             defer { proxy.stop() }
 
-            let master = URL(string: "https://127.0.0.1:\(origin.port)/master.m3u8")!
             let entry = try #require(proxy.proxyURL(for: master))
 
             let playlist = try await Self.text(of: entry)
@@ -103,14 +132,14 @@
             #expect(bytes.first == 0x47, "not an MPEG-TS sync byte")
         }
 
-        @Test("Through the proxy: flag off refuses to launder an untrusted origin")
+        @Test("Through the proxy: an unapproved origin is not laundered")
         func proxyRefusesWhenNotOptedIn() async throws {
             let origin = try #require(SelfSignedHLSOrigin())
             defer { origin.stop() }
 
-            let previous = EngineTLS.allowUntrustedCertificates
-            defer { EngineTLS.allowUntrustedCertificates = previous }
-            EngineTLS.allowUntrustedCertificates = false
+            let previous = EngineTLS.allowedUntrustedCertificateOrigins
+            defer { EngineTLS.allowedUntrustedCertificateOrigins = previous }
+            EngineTLS.allowedUntrustedCertificateOrigins = []
 
             let proxy = HLSReverseProxyServer()
             try proxy.start()
@@ -126,6 +155,70 @@
                     "the upstream handshake should have failed system trust")
         }
 
+        @Test("A redirect target does not inherit the source origin approval")
+        func redirectTargetMustBeApprovedSeparately() async throws {
+            let target = try #require(SelfSignedTLSOrigin())
+            defer { target.stop() }
+            let targetURL = URL(string: "https://127.0.0.1:\(target.port)/movie.bin")!
+            let source = try #require(SelfSignedTLSOrigin(redirectURL: targetURL))
+            defer { source.stop() }
+            let sourceURL = URL(string: "https://127.0.0.1:\(source.port)/redirect")!
+
+            let previous = EngineTLS.allowedUntrustedCertificateOrigins
+            defer { EngineTLS.allowedUntrustedCertificateOrigins = previous }
+            EngineTLS.allowedUntrustedCertificateOrigins = [
+                try #require(EngineTLS.Origin(url: sourceURL))
+            ]
+
+            let config = URLSessionConfiguration.ephemeral
+            let session = URLSession(
+                configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
+            defer { session.invalidateAndCancel() }
+            var request = URLRequest(url: sourceURL)
+            request.timeoutInterval = 10
+            request.setValue("bytes=0-1023", forHTTPHeaderField: "Range")
+            do {
+                _ = try await session.data(for: request)
+                Issue.record("an unapproved redirect target unexpectedly completed")
+            } catch {
+                // Expected: source TLS is approved, target TLS remains on system trust.
+            }
+
+            #expect(source.requestsServed > 0)
+            #expect(target.requestsServed == 0)
+        }
+
+        @Test("A separately approved redirect target may complete")
+        func separatelyApprovedRedirectTargetCompletes() async throws {
+            let target = try #require(SelfSignedTLSOrigin())
+            defer { target.stop() }
+            let targetURL = URL(string: "https://127.0.0.1:\(target.port)/movie.bin")!
+            let source = try #require(SelfSignedTLSOrigin(redirectURL: targetURL))
+            defer { source.stop() }
+            let sourceURL = URL(string: "https://127.0.0.1:\(source.port)/redirect")!
+
+            let previous = EngineTLS.allowedUntrustedCertificateOrigins
+            defer { EngineTLS.allowedUntrustedCertificateOrigins = previous }
+            EngineTLS.allowedUntrustedCertificateOrigins = [
+                try #require(EngineTLS.Origin(url: sourceURL)),
+                try #require(EngineTLS.Origin(url: targetURL)),
+            ]
+
+            let config = URLSessionConfiguration.ephemeral
+            let session = URLSession(
+                configuration: config, delegate: EngineTLS.sessionDelegate, delegateQueue: nil)
+            defer { session.invalidateAndCancel() }
+            var request = URLRequest(url: sourceURL)
+            request.timeoutInterval = 10
+            request.setValue("bytes=0-1023", forHTTPHeaderField: "Range")
+            let (data, response) = try await session.data(for: request)
+
+            #expect((response as? HTTPURLResponse)?.statusCode == 206)
+            #expect(data.count == 1024)
+            #expect(source.requestsServed > 0)
+            #expect(target.requestsServed > 0)
+        }
+
         private static func text(of url: URL) async throws -> String {
             var request = URLRequest(url: url)
             request.timeoutInterval = 15
@@ -133,6 +226,8 @@
             #expect((response as? HTTPURLResponse)?.statusCode == 200)
             return String(decoding: data, as: UTF8.self)
         }
+    }
+
     }
 
     /// Loopback HTTPS origin with a self-signed certificate for 127.0.0.1,
@@ -151,7 +246,7 @@
             return text.split(separator: "\n").count
         }
 
-        init?() {
+        init?(redirectURL: URL? = nil) {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("aether-tls-origin-\(UUID().uuidString)")
             guard (try? FileManager.default.createDirectory(
@@ -170,6 +265,11 @@
             proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
             proc.arguments = [dir.appendingPathComponent("origin.py").path]
             proc.currentDirectoryURL = dir
+            if let redirectURL {
+                proc.environment = ProcessInfo.processInfo.environment.merging(
+                    ["AETHER_REDIRECT_URL": redirectURL.absoluteString]
+                ) { _, new in new }
+            }
             let stdout = Pipe()
             proc.standardOutput = stdout
             proc.standardError = FileHandle.nullDevice
@@ -208,6 +308,7 @@
 
             TOTAL = 4 * 1024 * 1024
             BODY_BYTE = b"\\xa7"
+            REDIRECT_URL = os.environ.get("AETHER_REDIRECT_URL")
 
             class Handler(http.server.BaseHTTPRequestHandler):
                 protocol_version = "HTTP/1.1"
@@ -218,6 +319,12 @@
                 def do_GET(self):
                     with open("requests.log", "a") as f:
                         f.write(self.path + "\\n")
+                    if REDIRECT_URL and self.path.startswith("/redirect"):
+                        self.send_response(302)
+                        self.send_header("Location", REDIRECT_URL)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
                     start, end = 0, TOTAL - 1
                     m = re.match(r"bytes=(\\d*)-(\\d*)", self.headers.get("Range", ""))
                     ranged = bool(m)
