@@ -1621,6 +1621,10 @@ extension AetherEngine {
                 softwareHost?.play()
             } else {
                 EngineLog.emit("[AetherEngine] reload: loadNative enter audio=\(audioStreamIndex.map(String.init) ?? "nil") resumeAt=\(String(format: "%.2f", resumeAt))s", category: .engine)
+                // #339: the only write this reload can still produce is a sole-writer host's re-write on the
+                // swapped item, which happens inside loadNative. Arm before it, or the gate below is again
+                // reading a flag for a switch whose notifications it was not registered for.
+                if loadedOptions.suppressDisplayCriteria { displayCriteria.armSwitchObservation() }
                 try await loadNative(
                     url: url,
                     sourceHTTPHeaders: loadedOptions.httpHeaders,
@@ -1653,12 +1657,14 @@ extension AetherEngine {
                 // #274: this reload preserved the criteria (resetDisplayCriteria: false) and re-applies none,
                 // so only a sole-writer host's re-write on the swapped item can still switch anything; the
                 // published (panel-clamped) format decides whether that can be a dynamic-range switch.
-                await displayCriteria.waitForSwitch(startGrace: Self.playGateGrace(
-                    criteriaUnchanged: false,
-                    engineIsCriteriaWriter: !loadedOptions.suppressDisplayCriteria,
-                    formatKnown: true,
-                    effectiveFormat: videoFormat
-                ))
+                await displayCriteria.waitForSwitch(
+                    startGrace: Self.playGateGrace(
+                        criteriaUnchanged: false,
+                        engineIsCriteriaWriter: !loadedOptions.suppressDisplayCriteria,
+                        formatKnown: true,
+                        effectiveFormat: videoFormat
+                    ),
+                    settleCap: loadedOptions.isLive ? .standard : .awaitObservedEnd)
                 try checkLoadCurrent(gen)
                 nativeHost?.play()
             }

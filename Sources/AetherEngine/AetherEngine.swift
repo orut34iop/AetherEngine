@@ -2766,7 +2766,9 @@ public final class AetherEngine: ObservableObject {
             ) {
             case .willSwitch:
                 didSwitchPanel = true
-                await displayCriteria.waitForSwitch()
+                // #339: consumesRecord: false, the play gate after loadNative is entitled to the same
+                // start/end timestamps; spending them here made it pay Stage 1's grace for a settled switch.
+                await displayCriteria.waitForSwitch(consumesRecord: false)
                 // Superseded during panel handshake: close local probe and unwind.
                 if loadGeneration != gen {
                     probe.markClosed()
@@ -2785,6 +2787,11 @@ public final class AetherEngine: ObservableObject {
             // own from the AVPlayerItem formatDescription later. Clear a leftover engine criteria now
             // (didApply-gated no-op for hosts that always suppress) so the two writers can't fight.
             displayCriteria.reset()
+            // #339: AVKit's write lands inside loadNative, so the observation has to be armed before the
+            // load rather than when the play gate opens. After reset(), so a switch back to the default
+            // mode is not recorded as this session's. Audio-only loads reach clearStale too and have no
+            // panel handshake to observe.
+            if options.suppressDisplayCriteria { displayCriteria.armSwitchObservation() }
         }
 
         // 2.5. Post-handshake panel-mode snapshot.
@@ -3064,12 +3071,17 @@ public final class AetherEngine: ObservableObject {
                 // #274: the 1000ms Stage 1 budget is the DV-cold-start bet on a sole-writer host's inbound
                 // write. Sessions no dynamic-range switch can reach (engine-writer, or SDR content) take the
                 // 200ms budget instead of paying it on every load.
-                await displayCriteria.waitForSwitch(startGrace: Self.playGateGrace(
-                    criteriaUnchanged: criteriaUnchanged,
-                    engineIsCriteriaWriter: !options.suppressDisplayCriteria,
-                    formatKnown: probeOpened,
-                    effectiveFormat: effectiveFormat
-                ))
+                await displayCriteria.waitForSwitch(
+                    startGrace: Self.playGateGrace(
+                        criteriaUnchanged: criteriaUnchanged,
+                        engineIsCriteriaWriter: !options.suppressDisplayCriteria,
+                        formatKnown: probeOpened,
+                        effectiveFormat: effectiveFormat
+                    ),
+                    // Sodalite#49: this gate runs after the item is ready, so waiting out an observed switch
+                    // blocks nothing else, and the panel is dark until it ends either way. Live keeps the
+                    // standard cap: a zap must not sit behind a panel handshake.
+                    settleCap: options.isLive ? .standard : .awaitObservedEnd)
                 try checkLoadCurrent(gen)
                 // automaticallyWaitsToMinimizeStalling=true (default) handles play-before-ready.
                 // #35: on a real SDR->HDR switch while serving a VOD master, drive the bounded
