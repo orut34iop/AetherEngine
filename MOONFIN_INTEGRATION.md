@@ -40,6 +40,14 @@ not float with upstream `main`.
   publishes. Remote-HLS and external subtitle translation remain out of scope;
   neither the host nor this fork may silently add a Jellyfin extraction or
   temporary-sidecar path to expand eligibility.
+- Moonfin does not add audio-delay support to Aether. Every Aether route is
+  exposed to the host with `audioDelaySupported=false`; the existing no-op is
+  not a successful capability and must never be presented as an applied value.
+- Process-global `EngineTLS.allowUntrustedCertificates` is forbidden for every
+  Moonfin candidate. Before the host pins an integration commit, this fork must
+  expose a per-origin trust policy that matches the configured Jellyfin scheme,
+  host, and effective port exactly. Redirects and sibling media, subtitle, HLS,
+  or audio origins do not inherit approval.
 
 ## Change and delivery rules
 
