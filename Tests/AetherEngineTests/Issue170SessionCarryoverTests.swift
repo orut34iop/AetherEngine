@@ -55,6 +55,20 @@ struct Issue170CarryoverCaptureTests {
         #expect(carryover.hostExplicitSubtitleAction)
     }
 
+    @Test("capture records the unified secondary identity for reload restore")
+    func captureSecondarySelection() throws {
+        let engine = try AetherEngine()
+        engine.loadedURL = URL(string: "https://media.example/movie.mkv")!
+        engine.subtitleTracks = [TrackInfo(
+            id: 7, name: "Spanish", codec: "subrip", language: "spa",
+            isDefault: false)]
+        engine.selectSecondarySubtitleTrack(index: 7)
+
+        let carryover = engine.captureSubtitleSessionCarryover()
+        #expect(carryover.secondaryTrackIndex == 7)
+        #expect(carryover.secondarySidecarURL == nil)
+    }
+
     @Test("capture flags whether the reapply ordinal maps to the active track (rendering-derived vs host-positional)")
     func captureOrdinalDerivation() throws {
         let engine = try AetherEngine()

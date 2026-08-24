@@ -12,6 +12,19 @@ the public-API contract.
 
 ### Added
 
+- **A complete first-release dual-subtitle host contract.** The secondary
+  channel now publishes `activeSecondarySubtitleTrackIndex` for embedded and
+  registered external identities, `secondaryBitmapSupported` explicitly
+  reports false, and `secondarySidecarASSHeader` pairs with raw ASS/SSA events
+  when `preserveASSMarkup` is enabled. One track id cannot occupy primary and
+  secondary roles simultaneously; either channel still clears independently.
+  Embedded and decoded-external bitmap selections fail closed without replacing
+  an active text selection. Sidecar completions are fenced by the load
+  generation, audio-switch reloads retain external secondary identity, and
+  inherited media headers are limited to the sidecar's exact HTTP(S) origin.
+  Two-stream text and ASS fixtures cover independent cue publication, stream
+  identity, raw markup/header ownership, exclusion and clear behavior.
+
 - **`EngineTLS.allowedUntrustedCertificateOrigins`: exact-origin host opt-in
   for certificates that fail system trust evaluation.** Every approval is an
   `EngineTLS.Origin` normalized to HTTPS scheme, case-insensitive host and

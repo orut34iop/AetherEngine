@@ -14,7 +14,9 @@ public struct ExternalSubtitleTrack: Sendable, Equatable {
     public var isForced: Bool
     public var isHearingImpaired: Bool
     public var isDefault: Bool
-    /// nil forwards `LoadOptions.httpHeaders` (same auth as the media).
+    /// nil forwards `LoadOptions.httpHeaders` only when this URL has the media URL's exact
+    /// scheme/host/effective-port origin. Cross-origin tracks receive no inherited media headers;
+    /// provide an explicit dictionary when that subtitle origin requires its own credentials.
     public var httpHeaders: [String: String]?
     /// File-extension override ("srt", "ass", "vtt", "ssa") for URLs whose path hides the format.
     public var formatHint: String?

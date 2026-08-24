@@ -801,6 +801,17 @@ public final class AetherEngine: ObservableObject {
     @Published public internal(set) var secondarySubtitleCues: [SubtitleCue] = []
     @Published public internal(set) var isLoadingSecondarySubtitles: Bool = false
     @Published public internal(set) var isSecondarySubtitleActive: Bool = false
+    /// Active secondary embedded or registered-external `TrackInfo.id`. nil when the secondary
+    /// channel is off or uses the compatibility one-shot sidecar API, mirroring
+    /// `activeSubtitleTrackIndex` on the primary channel.
+    @Published public internal(set) var activeSecondarySubtitleTrackIndex: Int?
+    /// Secondary bitmap subtitles deliberately fail closed until a real two-channel bitmap
+    /// selection/decode fixture exists. Hosts should use this capability instead of inferring from
+    /// codec lists or accepting the historical text-only comment as runtime enforcement.
+    public nonisolated var secondaryBitmapSupported: Bool { false }
+    /// ASS/SSA script header for the active secondary sidecar when `preserveASSMarkup` is enabled.
+    /// Pair with `secondarySubtitleCues`, whose text bodies then carry raw ASS event lines.
+    @Published public internal(set) var secondarySidecarASSHeader: String? = nil
 
     /// True once the NativeSubtitleCueStore has at least one cue for the native mov_text track (#55).
     /// Use to gate the AVMediaSelection picker (PiP/AirPlay). Cleared by clearSubtitle and stopInternal.
@@ -2382,6 +2393,7 @@ public final class AetherEngine: ObservableObject {
         nextExternalSubtitleOrdinal = 0
         hostExplicitSubtitleAction = false
         activeSecondaryExternalSubtitleTrackID = nil
+        activeSecondarySubtitleTrackIndex = nil
         // #170: a stale latched rendering request from a superseded session-preserving reload
         // must not leak into this session; requests for the in-flight reload can only land at
         // suspension points after this prologue, so they survive.
@@ -3875,6 +3887,7 @@ public final class AetherEngine: ObservableObject {
         nextExternalSubtitleOrdinal = 0
         hostExplicitSubtitleAction = false
         activeSecondaryExternalSubtitleTrackID = nil
+        activeSecondarySubtitleTrackIndex = nil
         pendingNativeRenderingRequest = nil   // #170: the session the latched request targeted is gone
         externalNativeStoreFillTask?.cancel()
         externalNativeStoreFillTask = nil
@@ -4729,9 +4742,12 @@ public final class AetherEngine: ObservableObject {
         nativeSubtitleRenditionAvailable = false
         cancelSidecarTask(channel: .secondary)
         activeSecondaryEmbeddedSubtitleStreamIndex = -1
+        activeSecondaryExternalSubtitleTrackID = nil
+        activeSecondarySubtitleTrackIndex = nil
         loadedSecondarySidecarURL = nil
         isSecondarySubtitleActive = false
         secondarySubtitleCues = []
+        secondarySidecarASSHeader = nil
         isLoadingSecondarySubtitles = false
         // Clear so a stale index from the previous session can't be re-applied before the next load() repopulates audioTracks.
         activeAudioTrackIndex = nil

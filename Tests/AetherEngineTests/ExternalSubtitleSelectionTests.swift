@@ -38,13 +38,24 @@ struct ExternalSubtitleSelectionTests {
         #expect(!engine.isSubtitleActive)
     }
 
-    @Test("secondary channel routes external ids")
-    func secondaryExternal() throws {
+    @Test("secondary channel publishes a registered external id after decode")
+    func secondaryExternal() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("secondary-external-\(UUID().uuidString).srt")
+        try "1\n00:00:01,000 --> 00:00:02,000\nhello\n".write(
+            to: url, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: url) }
         let engine = try AetherEngine()
-        let info = engine.addExternalSubtitleTrack(makeTrack())
+        let info = engine.addExternalSubtitleTrack(ExternalSubtitleTrack(url: url, name: "local"))
         engine.selectSecondarySubtitleTrack(index: info.id)
+        let deadline = ContinuousClock.now + .seconds(5)
+        while engine.isLoadingSecondarySubtitles {
+            try #require(ContinuousClock.now < deadline)
+            try await Task.sleep(for: .milliseconds(10))
+        }
         #expect(engine.isSecondarySubtitleActive)
         #expect(engine.activeSecondaryExternalSubtitleTrackID == info.id)
+        #expect(engine.activeSecondarySubtitleTrackIndex == info.id)
         #expect(engine.activeSecondaryEmbeddedSubtitleStreamIndex == -1)
     }
 

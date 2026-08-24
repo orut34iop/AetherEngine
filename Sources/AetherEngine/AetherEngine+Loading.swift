@@ -1464,6 +1464,7 @@ extension AetherEngine {
         let preSwitchSourceTime = PresentationAxis.source(displayTime: resumeAt, origin: sourcePresentationOrigin)
         let preservedActiveImageCues = Self.activeImageCues(in: subtitleCues, at: preSwitchSourceTime)
         let secondaryEmbeddedToResume: Int32 = activeSecondaryEmbeddedSubtitleStreamIndex
+        let secondaryTrackToResume = activeSecondarySubtitleTrackIndex
         let secondarySidecarToResume: URL? = isSecondarySubtitleActive && activeSecondaryEmbeddedSubtitleStreamIndex < 0
             ? loadedSecondarySidecarURL
             : nil
@@ -1712,7 +1713,11 @@ extension AetherEngine {
             }
         }
         if let secondarySidecar = secondarySidecarToResume {
-            selectSecondarySidecarSubtitle(url: secondarySidecar)
+            if let active = secondaryTrackToResume, externalSubtitleRegistry[active] != nil {
+                selectSecondarySubtitleTrack(index: active, startAt: preSwitchSourceTime)
+            } else {
+                selectSecondarySidecarSubtitle(url: secondarySidecar)
+            }
         } else if secondaryEmbeddedToResume >= 0 {
             // #112 (audio-switch reanchor): same collapsed-sourceTime slip on the secondary channel.
             selectSecondarySubtitleTrack(index: Int(secondaryEmbeddedToResume), startAt: preSwitchSourceTime)

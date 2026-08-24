@@ -192,6 +192,9 @@ player.selectSecondarySidecarSubtitle(url: srt2URL)
 player.clearSecondarySubtitle()
 player.$secondarySubtitleCues                  // [SubtitleCue] for the secondary track
 player.$isSecondarySubtitleActive             // Bool
+player.$activeSecondarySubtitleTrackIndex      // TrackInfo.id; nil for off / one-shot sidecar
+player.secondaryBitmapSupported               // false: secondary PGS/DVB/DVD/XSUB fails closed
+player.$secondarySidecarASSHeader              // script header when preserveASSMarkup is enabled
 
 // Disc titles + chapters (DVD-Video / Blu-ray ISO; empty for non-disc sources)
 player.$discTitles                             // [TitleInfo]: id, name, durationSeconds, chapterCount (longest first, id 0 is the main feature)
