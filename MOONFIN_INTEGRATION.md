@@ -48,6 +48,15 @@ not float with upstream `main`.
   expose a per-origin trust policy that matches the configured Jellyfin scheme,
   host, and effective port exactly. Redirects and sibling media, subtitle, HLS,
   or audio origins do not inherit approval.
+- Moonfin inherits this baseline's decrypted DVD-Video/Blu-ray ISO playback
+  only through its generic seekable local or HTTP(S) source adapter. The first
+  release adds no ISO-specific engine patch, SMB product, disc browser,
+  title/chapter selector UI, decryption, menu/BD-J/multi-angle behavior, server
+  workaround, or failure-compatibility work; the existing default-main-title
+  behavior is the accepted boundary.
+- PiP, AirPlay, Live/DVR, SMB, and audio tap stay outside Moonfin's first-release
+  implementation scope. This fork keeps its existing APIs, but the integration
+  does not add new behavior or optional runtime dependencies for those areas.
 
 ## Change and delivery rules
 
