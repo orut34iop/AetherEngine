@@ -19,6 +19,8 @@ struct LoadOptionsTests {
         #expect(opts.panelIsInHDRMode == false)
         #expect(opts.audioBridgeMode == .surroundCompat)
         #expect(opts.isLive == false)
+        #expect(opts.recoverMissingH264CompositionTimestamps == false)
+        #expect(opts.resolvedSoftwareFrameTimestampPolicy == .decodedPTS)
         #expect(opts.audioOnly == false)
         // #68: probe-budget overrides default to nil so the engine keeps the
         // built-in .playback budget (50 MB / 60 s) unless a caller opts in.
@@ -64,6 +66,14 @@ struct LoadOptionsTests {
         let audio = LoadOptions(audioOnly: true)
         #expect(audio.audioOnly == true)
         #expect(video != audio)
+    }
+
+    @Test("missing-composition-timestamp recovery is explicit and affects equality")
+    func compositionTimestampRecoveryOptIn() {
+        let defaultOptions = LoadOptions()
+        let recovery = LoadOptions(recoverMissingH264CompositionTimestamps: true)
+        #expect(recovery.recoverMissingH264CompositionTimestamps)
+        #expect(defaultOptions != recovery)
     }
 
     // MARK: - Probe budget (#68)

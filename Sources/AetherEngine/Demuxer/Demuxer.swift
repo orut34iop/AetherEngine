@@ -181,6 +181,15 @@ public final class Demuxer: @unchecked Sendable {
     // Forward-only custom sources report false.
     var isSourceSeekable: Bool { avioProvider?.isSeekable ?? true }
 
+    /// True when libavformat opened an ISO Base Media File family demuxer (mov/mp4/m4a/3gp/3g2/mj2).
+    /// Used by narrowly-scoped container integrity probes; codec-private data alone cannot distinguish
+    /// MP4 from Matroska because both may carry H.264 as an AVCDecoderConfigurationRecord.
+    var isISOBaseMediaFile: Bool {
+        guard let rawName = formatContext?.pointee.iformat?.pointee.name else { return false }
+        let names = String(cString: rawName).split(separator: ",")
+        return names.contains("mov") || names.contains("mp4")
+    }
+
     /// Timestamp of last unplanned reconnect (drop/stall, not a seek).
     /// Live producer correlates with backward source-PTS reset to detect
     /// Jellyfin transcode respawn. See `AVIOReader.lastUnplannedReconnectAt`.
@@ -1078,14 +1087,17 @@ public final class Demuxer: @unchecked Sendable {
 
     /// Seek via avformat_seek_file (not av_seek_frame: assertion failures
     /// in matroskadec.c with nested elements).
-    func seek(to seconds: Double) {
+    @discardableResult
+    func seek(to seconds: Double) -> Bool {
         accessLock.lock()
         defer { accessLock.unlock() }
-        guard let ctx = formatContext else { return }
+        guard let ctx = formatContext else { return false }
         if let reader = timeSeekableReader {
-            guard repositionTimeSeekable(reader, toSourceSeconds: seconds, streamIndex: -1) else { return }
+            guard repositionTimeSeekable(reader, toSourceSeconds: seconds, streamIndex: -1) else {
+                return false
+            }
             resetAfterTimeSeek(ctx)
-            return
+            return true
         }
         let timestamp = Int64(seconds * Double(AV_TIME_BASE))
         let ret = avformat_seek_file(ctx, -1, Int64.min, timestamp, Int64.max, 0)
@@ -1096,6 +1108,7 @@ public final class Demuxer: @unchecked Sendable {
         }
         avformat_flush(ctx)  // prevents assertion failures in matroskadec.c
         lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
+        return ret >= 0
     }
 
     /// Seek on one stream's native timestamp axis, never before `timestamp`.

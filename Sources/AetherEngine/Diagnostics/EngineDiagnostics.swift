@@ -18,6 +18,11 @@ public final class EngineDiagnostics: ObservableObject {
     /// can persist the numeric cadence evidence without installing the raw `EngineLog.handler`, whose
     /// unrelated lines may contain source URLs or request credentials.
     @Published public internal(set) var displayModeDiagnostic: DisplayModeDiagnostic?
+
+    /// One safe, bounded result from the optional MP4/H.264 composition-timestamp integrity probe.
+    /// Carries counts and the resolved frame-clock mode only; never source identity or request data.
+    @Published public internal(set) var h264CompositionTimestampDiagnostic:
+        H264CompositionTimestampDiagnostic?
 }
 
 /// Safe numeric read-back of the content cadence, requested display criteria, active panel refresh rate,
@@ -45,5 +50,45 @@ public struct DisplayModeDiagnostic: Equatable, Sendable {
         self.measuredRefreshRate = measuredRefreshRate
         self.nominalRefreshRate = nominalRefreshRate
         self.playerFrameRate = playerFrameRate
+    }
+}
+
+public struct H264CompositionTimestampDiagnostic: Equatable, Sendable {
+    public let verdict: String
+    public let videoPackets: Int
+    public let validTimestampPairs: Int
+    public let nonKeyPackets: Int
+    public let decodedFrames: Int
+    public let bestEffortAdvances: Int
+    public let bestEffortRegressions: Int
+    public let rawPTSRegressions: Int
+    public let rawPTSDiffersFromBestEffort: Int
+    public let rewound: Bool
+    public let frameTimestampMode: String
+
+    public init(
+        verdict: String,
+        videoPackets: Int,
+        validTimestampPairs: Int,
+        nonKeyPackets: Int,
+        decodedFrames: Int,
+        bestEffortAdvances: Int,
+        bestEffortRegressions: Int,
+        rawPTSRegressions: Int,
+        rawPTSDiffersFromBestEffort: Int,
+        rewound: Bool,
+        frameTimestampMode: String
+    ) {
+        self.verdict = verdict
+        self.videoPackets = videoPackets
+        self.validTimestampPairs = validTimestampPairs
+        self.nonKeyPackets = nonKeyPackets
+        self.decodedFrames = decodedFrames
+        self.bestEffortAdvances = bestEffortAdvances
+        self.bestEffortRegressions = bestEffortRegressions
+        self.rawPTSRegressions = rawPTSRegressions
+        self.rawPTSDiffersFromBestEffort = rawPTSDiffersFromBestEffort
+        self.rewound = rewound
+        self.frameTimestampMode = frameTimestampMode
     }
 }

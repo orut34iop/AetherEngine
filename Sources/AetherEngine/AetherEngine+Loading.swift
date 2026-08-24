@@ -1186,6 +1186,7 @@ extension AetherEngine {
             mode: loadedOptions.deinterlaceMode,
             fieldRate: loadedOptions.deinterlaceFieldRate
         )
+        host.frameTimestampPolicy = loadedOptions.resolvedSoftwareFrameTimestampPolicy
         host.onFirstHDR10PlusDetected = { [weak self] in
             Task { @MainActor in self?.handleHDR10PlusDetected() }
         }
