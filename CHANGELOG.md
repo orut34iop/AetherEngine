@@ -28,11 +28,17 @@ the public-API contract.
   the served output presents all 301 frames at the same times as the healthy twin's does.
   Because the repair sits at the demuxer boundary, the fMP4 producer, the segment plan, the
   software decoder and the still extractor all read one axis, and hardware decode is kept:
-  a container defect no longer costs the native path. Detection is fail-closed and cheap, a healthy
-  file leaves on its first composition offset, and anything unproven (variable frame timing, a
-  picture order that does not advance one rank per picture, a sample that cannot be anchored) is
-  delivered exactly as the container wrote it. Reported by @orut34iop, whose fixture pair is the
-  regression test.
+  a container defect no longer costs the native path. Fractional CFR is covered without treating
+  ordinary integer-tick quantization as VFR: a repeated STTS cycle (including the observed
+  40040/40041 five-picture cycle in a 1/1200000 time base) recovers the exact rational cadence and
+  its sampling phase independently of the edit-list/reorder offset. Declared and average frame rates
+  are consistency evidence only; they never construct timestamps. Once anchored, decode order
+  advances continuously so a later one-tick container anomaly is folded back onto the repaired
+  lattice instead of mixing raw and repaired axes. Detection remains fail-closed and cheap, a
+  healthy file leaves on its first composition offset, and anything unproven (variable frame timing,
+  a picture order that does not advance one rank per picture, a non-repeating cadence, or a sample
+  that cannot be anchored) is delivered exactly as the container wrote it. Reported by @orut34iop,
+  whose fixture pair and Apple TV timing signature are regression tests.
 
 ### Added
 

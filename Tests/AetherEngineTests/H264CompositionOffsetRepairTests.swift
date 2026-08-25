@@ -41,6 +41,32 @@ struct H264CompositionOffsetRepairTests {
         }
     }
 
+    /// Identity-free timing evidence from the affected physical Apple TV source. The DTS ladder is
+    /// exact; the POC ranks model the logged videoDelay=1 and three regressions without exposing the
+    /// source's full bitstream order. The nominal coded rate rounds to a 40040-tick integer cadence,
+    /// while the duration-derived average rate is nearly 200202/5 and the actual STTS pattern repeats
+    /// that five-frame quantization twice.
+    private func physicalQuantizedSamples() -> [H264CompositionOffsetRepair.Sample] {
+        let pocs: [Int64] = [0, 4, 2, 6, 8, 12, 10, 14, 16, 20, 18, 22]
+        let steps: [Int64] = [
+            40040, 40041, 40040, 40040, 40041,
+            40040, 40041, 40040, 40040, 40041, 40040,
+        ]
+        var dts: Int64 = -40040
+        return pocs.enumerated().map { index, poc in
+            defer { if index < steps.count { dts += steps[index] } }
+            return H264CompositionOffsetRepair.Sample(
+                dts: dts, pts: dts, pictureOrderCount: poc, isKeyframe: index == 0)
+        }
+    }
+
+    private var physicalAverageCadence: H264CompositionOffsetRepair.Cadence {
+        H264CompositionOffsetRepair.Cadence(
+            numerator: 34_597_562_400_000,
+            denominator: 864_066_353
+        )!
+    }
+
     private func verdict(
         _ samples: [H264CompositionOffsetRepair.Sample],
         videoDelay: Int = 2,
@@ -141,6 +167,249 @@ struct H264CompositionOffsetRepairTests {
             samples: samples, videoDelay: 2,
             streamStartTime: 0, ladderStart: samples[0].dts)
             == .inconclusive("decode ladder is not uniform"))
+    }
+
+    @Test("the physical five-frame phase is recovered independently of nominal frame-rate metadata")
+    func physicalQuantizationPhaseClassification() {
+        let samples = physicalQuantizedSamples()
+        let result = H264CompositionOffsetRepair.classify(
+            samples: samples,
+            videoDelay: 1,
+            streamStartTime: 0,
+            ladderStart: -40040,
+            cadenceCandidates: [
+                H264CompositionOffsetRepair.Cadence(numerator: 40040, denominator: 1)!,
+                physicalAverageCadence,
+            ]
+        )
+        guard case .repair(let physicalPlan) = result else {
+            #expect(Bool(false), "the repeated physical STTS phase must be repairable")
+            return
+        }
+        #expect(physicalPlan.cadence == quantizedCadence)
+        #expect(physicalPlan.rawFrameOffset == -1)
+
+        var rewriter = H264CompositionOffsetRepair.Rewriter(plan: physicalPlan)
+        let first = rewriter.rewrite(
+            dts: samples[0].dts,
+            pictureOrderCount: samples[0].pictureOrderCount,
+            isKeyframe: true
+        )
+        #expect(first?.pts == 0)
+        #expect(first?.dts == -40040)
+        for sample in samples.dropFirst() {
+            #expect(rewriter.rewrite(
+                dts: sample.dts,
+                pictureOrderCount: sample.pictureOrderCount,
+                isKeyframe: sample.isKeyframe
+            ) != nil)
+        }
+        #expect(rewriter.repairedPictures == 12)
+        #expect(rewriter.unrepairedPictures == 0)
+    }
+
+    @Test("classification refuses a POC depth that the declared reorder delay cannot rewrite")
+    func rejectsUnsafePhysicalPlanBeforeRepairStarts() {
+        var samples = physicalQuantizedSamples()
+        let tooDeepPOCs: [Int64] = [0, 8, 4, 2, 6, 16, 12, 10, 14, 24, 20, 18]
+        for index in samples.indices {
+            samples[index].pictureOrderCount = tooDeepPOCs[index]
+        }
+        #expect(H264CompositionOffsetRepair.classify(
+            samples: samples,
+            videoDelay: 1,
+            streamStartTime: 0,
+            ladderStart: -40040,
+            cadenceCandidates: [physicalAverageCadence]
+        ) == .inconclusive("sample cannot be rewritten safely"))
+    }
+
+    @Test(
+        "a one-tick timestamp error stays on the repaired axis in either direction",
+        arguments: [Int64(-1), Int64(1)]
+    )
+    func rationalRepairRectifiesLateTimestampNoise(offset: Int64) {
+        let samples = physicalQuantizedSamples()
+        let result = H264CompositionOffsetRepair.classify(
+            samples: samples,
+            videoDelay: 1,
+            streamStartTime: 0,
+            ladderStart: -40040,
+            cadenceCandidates: [physicalAverageCadence]
+        )
+        guard case .repair(let physicalPlan) = result else {
+            #expect(Bool(false), "expected the physical rational plan")
+            return
+        }
+        var rewriter = H264CompositionOffsetRepair.Rewriter(plan: physicalPlan)
+        for sample in samples {
+            _ = rewriter.rewrite(
+                dts: sample.dts,
+                pictureOrderCount: 0,
+                isKeyframe: true
+            )
+        }
+
+        // Decode ordinal 12 should land on the CFR grid even when its container DTS is one tick off.
+        let noisyDTS: Int64 = 440445 + offset
+        let nextIDR = rewriter.rewrite(
+            dts: noisyDTS,
+            pictureOrderCount: 0,
+            isKeyframe: true
+        )
+        #expect(nextIDR?.pts == 480485)
+        #expect(nextIDR?.dts == 440445)
+        #expect(rewriter.unrepairedPictures == 0)
+    }
+
+    @Test("an unparsed packet is counted and the next exact timestamp resynchronizes decode order")
+    func rationalRepairResynchronizesAfterParserMiss() {
+        let samples = physicalQuantizedSamples()
+        let result = H264CompositionOffsetRepair.classify(
+            samples: samples,
+            videoDelay: 1,
+            streamStartTime: 0,
+            ladderStart: -40040,
+            cadenceCandidates: [physicalAverageCadence]
+        )
+        guard case .repair(let physicalPlan) = result else {
+            #expect(Bool(false), "expected the physical rational plan")
+            return
+        }
+        var rewriter = H264CompositionOffsetRepair.Rewriter(plan: physicalPlan)
+        _ = rewriter.rewrite(
+            dts: samples[0].dts,
+            pictureOrderCount: samples[0].pictureOrderCount,
+            isKeyframe: true
+        )
+        #expect(rewriter.rewrite(
+            dts: samples[1].dts,
+            pictureOrderCount: nil,
+            isKeyframe: false
+        ) == nil)
+
+        let resynchronized = rewriter.rewrite(
+            dts: samples[2].dts,
+            pictureOrderCount: samples[2].pictureOrderCount,
+            isKeyframe: false
+        )
+        #expect(resynchronized?.pts == 40041)
+        #expect(resynchronized?.dts == 40041)
+        #expect(rewriter.repairedPictures == 2)
+        #expect(rewriter.unrepairedPictures == 1)
+    }
+
+    @Test("a rejected exact forward jump does not poison the following normal timestamp")
+    func rationalRepairDoesNotCommitUnplaceableForwardJump() {
+        let samples = physicalQuantizedSamples()
+        let result = H264CompositionOffsetRepair.classify(
+            samples: samples,
+            videoDelay: 1,
+            streamStartTime: 0,
+            ladderStart: -40040,
+            cadenceCandidates: [physicalAverageCadence]
+        )
+        guard case .repair(let physicalPlan) = result else {
+            #expect(Bool(false), "expected the physical rational plan")
+            return
+        }
+        var rewriter = H264CompositionOffsetRepair.Rewriter(plan: physicalPlan)
+        _ = rewriter.rewrite(
+            dts: samples[0].dts,
+            pictureOrderCount: samples[0].pictureOrderCount,
+            isKeyframe: true
+        )
+
+        #expect(rewriter.rewrite(
+            dts: physicalPlan.rawTimestamp(decodeOrdinal: 100)!,
+            pictureOrderCount: 4,
+            isKeyframe: false
+        ) == nil)
+        let resumed = rewriter.rewrite(
+            dts: samples[2].dts,
+            pictureOrderCount: samples[2].pictureOrderCount,
+            isKeyframe: false
+        )
+        #expect(resumed?.pts == 40041)
+        #expect(resumed?.dts == 40041)
+        #expect(rewriter.repairedPictures == 2)
+        #expect(rewriter.unrepairedPictures == 1)
+    }
+
+    @Test(
+        "a timestamp beyond one tick is refused and a later exact timestamp resynchronizes",
+        arguments: [Int64(-10), Int64(-2), Int64(2), Int64(10)]
+    )
+    func rationalRepairRejectsLargeTimestampNoise(offset: Int64) {
+        let samples = physicalQuantizedSamples()
+        let result = H264CompositionOffsetRepair.classify(
+            samples: samples,
+            videoDelay: 1,
+            streamStartTime: 0,
+            ladderStart: -40040,
+            cadenceCandidates: [physicalAverageCadence]
+        )
+        guard case .repair(let physicalPlan) = result else {
+            #expect(Bool(false), "expected the physical rational plan")
+            return
+        }
+        var rewriter = H264CompositionOffsetRepair.Rewriter(plan: physicalPlan)
+        for sample in samples {
+            _ = rewriter.rewrite(
+                dts: sample.dts,
+                pictureOrderCount: 0,
+                isKeyframe: true
+            )
+        }
+
+        #expect(rewriter.rewrite(
+            dts: 440445 + offset,
+            pictureOrderCount: 0,
+            isKeyframe: false
+        ) == nil)
+        let nextExactDTS = physicalPlan.rawTimestamp(decodeOrdinal: 13)!
+        let resynchronized = rewriter.rewrite(
+            dts: nextExactDTS,
+            pictureOrderCount: 0,
+            isKeyframe: true
+        )
+        #expect(resynchronized?.dts == nextExactDTS)
+        #expect(rewriter.unrepairedPictures == 1)
+    }
+
+    @Test(
+        "a seek keyframe uniquely reanchors across a one-tick timestamp error",
+        arguments: [Int64(-1), Int64(1)]
+    )
+    func rationalSeekReanchorsWithinOneTick(offset: Int64) {
+        let samples = physicalQuantizedSamples()
+        let result = H264CompositionOffsetRepair.classify(
+            samples: samples,
+            videoDelay: 1,
+            streamStartTime: 0,
+            ladderStart: -40040,
+            cadenceCandidates: [physicalAverageCadence]
+        )
+        guard case .repair(let physicalPlan) = result else {
+            #expect(Bool(false), "expected the physical rational plan")
+            return
+        }
+        var rewriter = H264CompositionOffsetRepair.Rewriter(plan: physicalPlan)
+        _ = rewriter.rewrite(
+            dts: samples[0].dts,
+            pictureOrderCount: 0,
+            isKeyframe: true
+        )
+        rewriter.noteSeek()
+
+        let landing = rewriter.rewrite(
+            dts: 440445 + offset,
+            pictureOrderCount: 0,
+            isKeyframe: true
+        )
+        #expect(landing?.pts == 480485)
+        #expect(landing?.dts == 440445)
+        #expect(rewriter.unrepairedPictures == 0)
     }
 
     @Test("a sample that does not start on a picture-order origin cannot be anchored")
@@ -340,6 +609,15 @@ struct H264CompositionOffsetRepairTests {
         return result
     }
 
+    private static func indexedKeyframes(base64: String) throws -> [Int64] {
+        let data = try #require(Data(base64Encoded: base64, options: .ignoreUnknownCharacters))
+        let demuxer = Demuxer()
+        try demuxer.open(reader: DataIOReader(data: data), formatHint: "mp4")
+        defer { demuxer.close() }
+        demuxer.decideCompositionOffsetRepair()
+        return demuxer.indexedKeyframes(streamIndex: demuxer.videoStreamIndex)
+    }
+
     @Test("the repaired twin carries the healthy twin's timestamps, packet for packet")
     func repairedTwinMatchesHealthyTwin() throws {
         let healthy = try Self.videoTimestamps(base64: Self.healthyCTTSFixtureBase64)
@@ -360,6 +638,14 @@ struct H264CompositionOffsetRepairTests {
         let repaired = try Self.videoTimestamps(base64: Self.quantizedMissingCTTSFixtureBase64)
         #expect(healthy.count == 66)
         #expect(repaired.count == healthy.count)
+        #expect(repaired == healthy)
+    }
+
+    @Test("rational repair folds container keyframe indexes onto the healthy decode axis")
+    func quantizedRationalIndexesMatchHealthyTwin() throws {
+        let healthy = try Self.indexedKeyframes(base64: Self.quantizedHealthyCTTSFixtureBase64)
+        let repaired = try Self.indexedKeyframes(base64: Self.quantizedMissingCTTSFixtureBase64)
+        #expect(healthy.count == 3)
         #expect(repaired == healthy)
     }
 
