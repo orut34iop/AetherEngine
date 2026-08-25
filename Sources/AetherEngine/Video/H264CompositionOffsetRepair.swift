@@ -339,6 +339,19 @@ final class H264CompositionOffsetRepairSession {
     private var held: [(packet: UnsafeMutablePointer<AVPacket>, pictureOrderCount: Int64?)] = []
     private var heldBytes = 0
     private var verdictDescription = "sampling"
+    private var diagnosticOutcome: H264CompositionOffsetRepairOutcome = .sampling
+    private var diagnosticReason: H264CompositionOffsetRepairReason = .sampling
+    private var diagnosticPlan: H264CompositionOffsetRepair.Plan?
+    private var decidedSampleCount = 0
+    private var decidedHeldPacketCount = 0
+    private var decidedHeldBytes = 0
+    private var decidedPTSEqualsDTSCount = 0
+    private var decidedParserMissCount = 0
+    private var decidedFirstKeyframe: Bool?
+    private var decidedFirstPictureOrderCount: Int64?
+    private var decidedMinimumDecodeStep: Int64?
+    private var decidedMaximumDecodeStep: Int64?
+    private var decidedPictureOrderRegressionCount = 0
 
     /// nil unless this stream is the exact shape the defect needs: ISO-BMFF, H.264, and a bitstream
     /// that declares reordered pictures. Everything else never sees a parser or a held packet.
@@ -481,7 +494,39 @@ final class H264CompositionOffsetRepairSession {
         return text
     }
 
+    func diagnostic(
+        sourceSeekable: Bool,
+        isISOBaseMediaFile: Bool,
+        isH264: Bool
+    ) -> H264CompositionOffsetRepairDiagnostic {
+        H264CompositionOffsetRepairDiagnostic(
+            outcome: diagnosticOutcome,
+            reason: diagnosticReason,
+            sourceSeekable: sourceSeekable,
+            isISOBaseMediaFile: isISOBaseMediaFile,
+            isH264: isH264,
+            videoDelay: videoDelay,
+            sampleCount: decidedSampleCount,
+            heldPacketCount: decidedHeldPacketCount,
+            heldBytes: decidedHeldBytes,
+            ptsEqualsDTSCount: decidedPTSEqualsDTSCount,
+            parserMissCount: decidedParserMissCount,
+            firstKeyframe: decidedFirstKeyframe,
+            firstPictureOrderCount: decidedFirstPictureOrderCount,
+            minimumDecodeStep: decidedMinimumDecodeStep,
+            maximumDecodeStep: decidedMaximumDecodeStep,
+            pictureOrderRegressionCount: decidedPictureOrderRegressionCount,
+            planStep: diagnosticPlan?.step,
+            planDecodeLead: diagnosticPlan?.decodeLead,
+            planShift: diagnosticPlan?.shift,
+            planPictureOrderStep: diagnosticPlan?.pocStep,
+            repairedPictures: rewriter?.repairedPictures ?? 0,
+            unrepairedPictures: rewriter?.unrepairedPictures ?? 0
+        )
+    }
+
     private func decide() {
+        captureDiagnosticEvidence()
         let verdict = H264CompositionOffsetRepair.classify(
             samples: samples,
             videoDelay: videoDelay,
@@ -490,6 +535,9 @@ final class H264CompositionOffsetRepairSession {
         )
         switch verdict {
         case .repair(let plan):
+            diagnosticOutcome = .repairing
+            diagnosticReason = .confirmedMissingOffsets
+            diagnosticPlan = plan
             verdictDescription = "repair step=\(plan.step) lead=\(plan.decodeLead) "
                 + "shift=\(plan.shift) pocStep=\(plan.pocStep)"
             phase = .repairing
@@ -504,9 +552,13 @@ final class H264CompositionOffsetRepairSession {
                 category: .demux
             )
         case .healthy:
+            diagnosticOutcome = .healthy
+            diagnosticReason = .compositionOffsetsPresent
             verdictDescription = "healthy"
             disarm()
         case .inconclusive(let reason):
+            diagnosticOutcome = .inconclusive
+            diagnosticReason = Self.reasonCode(for: reason)
             verdictDescription = "inconclusive (\(reason))"
             // Only worth a line when the stream looked like a candidate: a file that simply carries
             // composition offsets is the normal case and says nothing.
@@ -518,6 +570,65 @@ final class H264CompositionOffsetRepairSession {
             disarm()
         }
         samples.removeAll(keepingCapacity: false)
+    }
+
+    private func captureDiagnosticEvidence() {
+        decidedSampleCount = samples.count
+        decidedHeldPacketCount = held.count
+        decidedHeldBytes = heldBytes
+        decidedPTSEqualsDTSCount = samples.filter {
+            $0.pts != Int64.min && $0.dts != Int64.min && $0.pts == $0.dts
+        }.count
+        decidedParserMissCount = samples.filter { $0.pictureOrderCount < 0 }.count
+        decidedFirstKeyframe = samples.first?.isKeyframe
+        if let firstPOC = samples.first?.pictureOrderCount, firstPOC >= 0 {
+            decidedFirstPictureOrderCount = firstPOC
+        } else {
+            decidedFirstPictureOrderCount = nil
+        }
+
+        let decodeSteps = zip(samples, samples.dropFirst()).compactMap { previous, current -> Int64? in
+            guard previous.dts != Int64.min, current.dts != Int64.min else { return nil }
+            let (step, overflow) = current.dts.subtractingReportingOverflow(previous.dts)
+            return overflow ? nil : step
+        }
+        decidedMinimumDecodeStep = decodeSteps.min()
+        decidedMaximumDecodeStep = decodeSteps.max()
+        decidedPictureOrderRegressionCount = zip(samples, samples.dropFirst()).filter {
+            $0.pictureOrderCount >= 0 && $1.pictureOrderCount >= 0
+                && $1.pictureOrderCount < $0.pictureOrderCount
+        }.count
+    }
+
+    private static func reasonCode(for reason: String) -> H264CompositionOffsetRepairReason {
+        if reason.hasPrefix("reorder delay ") { return .reorderDelayOutOfRange }
+        if reason.hasPrefix("only ") { return .insufficientSamples }
+        switch reason {
+        case "timestamps are not uniformly PTS == DTS":
+            return .timestampsNotUniformPTSEqualsDTS
+        case "sample does not start on a picture-order origin":
+            return .sampleNotPictureOrderOrigin
+        case "decode timestamps do not advance":
+            return .decodeTimestampsNotAdvancing
+        case "decode ladder is not uniform":
+            return .nonuniformDecodeLadder
+        case "no ladder step":
+            return .noDecodeStep
+        case "picture order never regresses":
+            return .noPictureOrderRegression
+        case "negative picture order count":
+            return .negativePictureOrderCount
+        case "picture order does not advance":
+            return .noPictureOrderStep
+        case "picture order is not a multiple of its step":
+            return .pictureOrderNotAligned
+        case let value where value.hasPrefix("two pictures share display index "):
+            return .pictureOrderCollision
+        case "display indices do not fill the sampled window":
+            return .pictureOrderWindowNotFilled
+        default:
+            return .unclassifiedInconclusive
+        }
     }
 
     private func disarm() {

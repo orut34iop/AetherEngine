@@ -4642,6 +4642,7 @@ public final class AetherEngine: ObservableObject {
         liveTelemetrySampler = nil
         diagnostics.liveTelemetry = nil
         diagnostics.displayModeDiagnostic = nil
+        diagnostics.h264CompositionOffsetRepairDiagnostic = nil
         nativeCancellables.removeAll()
         // AE#158: keepCurrentItem defers the item detach to the next host.load(inPlaceSwap:) so a
         // system PiP window never sees a nil-item gap across a native->native load. Only meaningful

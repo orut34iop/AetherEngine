@@ -168,6 +168,11 @@ public final class Demuxer: @unchecked Sendable {
     /// that is not the exact defect shape, which is decided once, on the first read.
     private var compositionRepair: H264CompositionOffsetRepairSession?
     private var compositionRepairEvaluated = false
+    private var compositionRepairReason: H264CompositionOffsetRepairReason = .notEvaluated
+    private var compositionRepairSourceSeekable = true
+    private var compositionRepairIsISOBaseMediaFile = false
+    private var compositionRepairIsH264 = false
+    private var compositionRepairVideoDelay: Int?
 
     /// #112 round 11: whether `seekByteEstimate` has what it needs (a resolved byte size and a positive
     /// duration). The side reader caps the timestamp-seek attempt tight when this is true, because the
@@ -1048,6 +1053,28 @@ public final class Demuxer: @unchecked Sendable {
         decideCompositionRepairLocked()
     }
 
+    /// Structured, identity-free evidence for the one composition-offset decision made by this
+    /// demuxer. The access lock makes the repair counters safe to sample while a producer is reading.
+    func h264CompositionOffsetRepairDiagnostic() -> H264CompositionOffsetRepairDiagnostic {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        if let compositionRepair {
+            return compositionRepair.diagnostic(
+                sourceSeekable: compositionRepairSourceSeekable,
+                isISOBaseMediaFile: compositionRepairIsISOBaseMediaFile,
+                isH264: compositionRepairIsH264
+            )
+        }
+        return H264CompositionOffsetRepairDiagnostic(
+            outcome: compositionRepairEvaluated ? .notEligible : .notEvaluated,
+            reason: compositionRepairReason,
+            sourceSeekable: compositionRepairSourceSeekable,
+            isISOBaseMediaFile: compositionRepairIsISOBaseMediaFile,
+            isH264: compositionRepairIsH264,
+            videoDelay: compositionRepairVideoDelay
+        )
+    }
+
     /// #409: reads far enough into the source for the verdict, holding every
     /// packet it consumed so nothing is lost. Called before anything reads a timestamp axis off this
     /// demuxer: the container index and the packets must describe the same ladder, and only the
@@ -1074,24 +1101,63 @@ public final class Demuxer: @unchecked Sendable {
     private func armCompositionRepairIfNeeded() -> H264CompositionOffsetRepairSession? {
         if compositionRepairEvaluated { return compositionRepair }
         compositionRepairEvaluated = true
-        guard let ctx = formatContext else { return nil }
+        guard let ctx = formatContext else {
+            compositionRepairReason = .formatContextUnavailable
+            return nil
+        }
+        compositionRepairSourceSeekable = isSourceSeekable
+        let containerNames = containerFormatName?.split(separator: ",") ?? []
+        compositionRepairIsISOBaseMediaFile =
+            containerNames.contains("mov") || containerNames.contains("mp4")
         // Three sources pay a sample they have no use for: a still extraction decodes one keyframe
         // per open and publishes no axis, a demuxer whose video is discarded (the subtitle side
         // reader, #104) has no pictures to sample at all, and a non-seekable source is a live feed,
         // where holding a dozen packets for a defect that lives in a VOD sample table is latency
         // spent for nothing.
-        guard openProfile.readerLabel != DemuxerOpenProfile.stillExtraction.readerLabel,
-              isSourceSeekable else { return nil }
+        guard openProfile.readerLabel != DemuxerOpenProfile.stillExtraction.readerLabel else {
+            compositionRepairReason = .stillExtraction
+            return nil
+        }
+        guard compositionRepairSourceSeekable else {
+            compositionRepairReason = .sourceNotSeekable
+            return nil
+        }
         let index = max(-1, av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0))
         guard index >= 0, index < Int32(ctx.pointee.nb_streams),
-              let stream = ctx.pointee.streams[Int(index)] else { return nil }
-        guard stream.pointee.discard != AVDISCARD_ALL else { return nil }
-        compositionRepair = H264CompositionOffsetRepairSession(
+              let stream = ctx.pointee.streams[Int(index)] else {
+            compositionRepairReason = .noVideoStream
+            return nil
+        }
+        guard stream.pointee.discard != AVDISCARD_ALL else {
+            compositionRepairReason = .videoStreamDiscarded
+            return nil
+        }
+        guard compositionRepairIsISOBaseMediaFile else {
+            compositionRepairReason = .unsupportedContainer
+            return nil
+        }
+        guard let codecpar = stream.pointee.codecpar,
+              codecpar.pointee.codec_id == AV_CODEC_ID_H264 else {
+            compositionRepairReason = .nonH264
+            return nil
+        }
+        compositionRepairIsH264 = true
+        compositionRepairVideoDelay = Int(codecpar.pointee.video_delay)
+        guard codecpar.pointee.video_delay > 0 else {
+            compositionRepairReason = .noReorderDelay
+            return nil
+        }
+        guard let repair = H264CompositionOffsetRepairSession(
             containerFormatName: containerFormatName,
             stream: stream,
             streamIndex: index,
             ladderStart: firstIndexedTimestamp(of: stream)
-        )
+        ) else {
+            compositionRepairReason = .parserUnavailable
+            return nil
+        }
+        compositionRepairReason = .sampling
+        compositionRepair = repair
         return compositionRepair
     }
 
@@ -1643,6 +1709,11 @@ public final class Demuxer: @unchecked Sendable {
         formatContext = nil
         compositionRepair = nil
         compositionRepairEvaluated = false
+        compositionRepairReason = .notEvaluated
+        compositionRepairSourceSeekable = true
+        compositionRepairIsISOBaseMediaFile = false
+        compositionRepairIsH264 = false
+        compositionRepairVideoDelay = nil
         accessLock.unlock()
 
         avioProvider?.close()

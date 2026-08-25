@@ -235,6 +235,55 @@ struct H264CompositionOffsetRepairTests {
         #expect(repaired == healthy)
     }
 
+    private static func diagnostic(base64: String) throws
+        -> H264CompositionOffsetRepairDiagnostic
+    {
+        let data = try #require(Data(base64Encoded: base64, options: .ignoreUnknownCharacters))
+        let demuxer = Demuxer()
+        try demuxer.open(reader: DataIOReader(data: data), formatHint: "mp4")
+        defer { demuxer.close() }
+        demuxer.decideCompositionOffsetRepair()
+        return demuxer.h264CompositionOffsetRepairDiagnostic()
+    }
+
+    @Test("the missing-ctts verdict is available as one identity-free structured diagnostic")
+    func repairDiagnostic() throws {
+        let diagnostic = try Self.diagnostic(base64: Self.missingCTTSFixtureBase64)
+        #expect(diagnostic.outcome == .repairing)
+        #expect(diagnostic.reason == .confirmedMissingOffsets)
+        #expect(diagnostic.sourceSeekable)
+        #expect(diagnostic.isISOBaseMediaFile)
+        #expect(diagnostic.isH264)
+        #expect(diagnostic.videoDelay == 2)
+        #expect(diagnostic.sampleCount == 12)
+        #expect(diagnostic.ptsEqualsDTSCount == 12)
+        #expect(diagnostic.parserMissCount == 0)
+        #expect(diagnostic.firstKeyframe == true)
+        #expect(diagnostic.firstPictureOrderCount == 0)
+        #expect(diagnostic.minimumDecodeStep == 1001)
+        #expect(diagnostic.maximumDecodeStep == 1001)
+        #expect(diagnostic.pictureOrderRegressionCount > 0)
+        #expect(diagnostic.planStep == 1001)
+        #expect(diagnostic.planDecodeLead == 2002)
+        #expect(diagnostic.planShift == 2002)
+        #expect(diagnostic.planPictureOrderStep == 2)
+        #expect(diagnostic.repairedPictures == 12)
+        #expect(diagnostic.unrepairedPictures == 0)
+    }
+
+    @Test("the healthy verdict is observable without exposing source identity")
+    func healthyDiagnostic() throws {
+        let diagnostic = try Self.diagnostic(base64: Self.healthyCTTSFixtureBase64)
+        #expect(diagnostic.outcome == .healthy)
+        #expect(diagnostic.reason == .compositionOffsetsPresent)
+        #expect(diagnostic.sampleCount == 1)
+        #expect(diagnostic.ptsEqualsDTSCount == 0)
+        #expect(diagnostic.parserMissCount == 0)
+        #expect(diagnostic.planStep == nil)
+        #expect(diagnostic.repairedPictures == 0)
+        #expect(diagnostic.unrepairedPictures == 0)
+    }
+
     @Test("the healthy twin is delivered exactly as the container wrote it")
     func healthyTwinIsUntouched() throws {
         let healthy = try Self.videoTimestamps(base64: Self.healthyCTTSFixtureBase64)
