@@ -92,6 +92,7 @@ public struct H264CompositionOffsetRepairDiagnostic: Equatable, Sendable {
     public let codedFrameRateDenominator: Int32?
     public let averageFrameRateNumerator: Int32?
     public let averageFrameRateDenominator: Int32?
+    public let streamFrameCount: Int64?
     public let codedCadenceNumerator: Int64?
     public let codedCadenceDenominator: Int64?
     public let averageCadenceNumerator: Int64?
@@ -130,6 +131,7 @@ public struct H264CompositionOffsetRepairDiagnostic: Equatable, Sendable {
         codedFrameRateDenominator: Int32? = nil,
         averageFrameRateNumerator: Int32? = nil,
         averageFrameRateDenominator: Int32? = nil,
+        streamFrameCount: Int64? = nil,
         codedCadenceNumerator: Int64? = nil,
         codedCadenceDenominator: Int64? = nil,
         averageCadenceNumerator: Int64? = nil,
@@ -167,6 +169,7 @@ public struct H264CompositionOffsetRepairDiagnostic: Equatable, Sendable {
         self.codedFrameRateDenominator = codedFrameRateDenominator
         self.averageFrameRateNumerator = averageFrameRateNumerator
         self.averageFrameRateDenominator = averageFrameRateDenominator
+        self.streamFrameCount = streamFrameCount
         self.codedCadenceNumerator = codedCadenceNumerator
         self.codedCadenceDenominator = codedCadenceDenominator
         self.averageCadenceNumerator = averageCadenceNumerator

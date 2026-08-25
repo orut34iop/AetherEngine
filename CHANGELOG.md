@@ -32,13 +32,15 @@ the public-API contract.
   ordinary integer-tick quantization as VFR: a repeated STTS cycle (including the observed
   40040/40041 five-picture cycle in a 1/1200000 time base) recovers the exact rational cadence and
   its sampling phase independently of the edit-list/reorder offset. Declared and average frame rates
-  are consistency evidence only; they never construct timestamps. Once anchored, decode order
-  advances continuously so a later one-tick container anomaly is folded back onto the repaired
-  lattice instead of mixing raw and repaired axes. Detection remains fail-closed and cheap, a
-  healthy file leaves on its first composition offset, and anything unproven (variable frame timing,
-  a picture order that does not advance one rank per picture, a non-repeating cadence, or a sample
-  that cannot be anchored) is delivered exactly as the container wrote it. Reported by @orut34iop,
-  whose fixture pair and Apple TV timing signature are regression tests.
+  are consistency evidence only; they never construct timestamps, average evidence takes precedence
+  over a nominal short-period alias, and any approximate mismatch must stay within half a tick across
+  the known full-stream frame count. Once anchored, decode order advances continuously so a uniquely
+  placeable one-tick container anomaly is folded back onto the repaired lattice instead of mixing raw
+  and repaired axes. Detection remains fail-closed and cheap, a healthy file leaves on its first
+  composition offset, and anything unproven (variable frame timing, an ambiguous dense cadence, a
+  picture order that does not advance one rank per picture, a non-repeating cadence, or a sample that
+  cannot be anchored) is delivered exactly as the container wrote it. Reported by @orut34iop, whose
+  fixture pair and Apple TV timing signature are regression tests.
 
 ### Added
 
