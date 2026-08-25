@@ -72,12 +72,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// applied to the filter there (mutating it mid-stream would need a graph rebuild).
     var deinterlaceConfig = DeinterlaceConfig()
 
-    /// Normally decoded `AVFrame.pts` is already the presentation timestamp. A fail-closed MP4/H.264
-    /// probe may opt one session into libavcodec's repaired `best_effort_timestamp` instead. Applied
-    /// before captions, deinterlacing, seek filtering, and rendering so every consumer shares one axis.
-    var frameTimestampPolicy: SoftwareFrameTimestampPolicy = .decodedPTS
-    private var loggedBestEffortTimestampRepair = false
-
     /// Deinterlaced frames dropped for carrying no PTS (see the drop site in decode()). Guarded by `lock`.
     private var droppedUntimestampedFields = 0
 
@@ -94,7 +88,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws {
         self.onFrame = onFrame
         deinterlacer.config = deinterlaceConfig
-        loggedBestEffortTimestampRepair = false
 
         guard let codecpar = stream.pointee.codecpar else {
             throw VideoDecoderError.noCodecParameters
@@ -181,15 +174,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         return ret == FFmpegErr.eagain ? .drainAndRetry : .dropped
     }
 
-    nonisolated static func resolvedFramePTS(
-        decodedPTS: Int64,
-        bestEffortPTS: Int64,
-        policy: SoftwareFrameTimestampPolicy
-    ) -> Int64 {
-        guard policy == .bestEffort, bestEffortPTS != Int64.min else { return decodedPTS }
-        return bestEffortPTS
-    }
-
     /// Feed one packet and deliver whatever the decoder produces.
     ///
     /// #220: this used to `return` on any negative send result without draining. EAGAIN is not
@@ -234,24 +218,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             guard codecContext != nil else { lock.unlock(); break }
             let ret = avcodec_receive_frame(ctx, f)
             guard ret >= 0 else { lock.unlock(); break }
-
-            let decodedPTS = f.pointee.pts
-            let resolvedPTS = Self.resolvedFramePTS(
-                decodedPTS: decodedPTS,
-                bestEffortPTS: f.pointee.best_effort_timestamp,
-                policy: frameTimestampPolicy
-            )
-            if resolvedPTS != decodedPTS {
-                f.pointee.pts = resolvedPTS
-                if !loggedBestEffortTimestampRepair {
-                    loggedBestEffortTimestampRepair = true
-                    EngineLog.emit(
-                        "[SWDecoder] frame timestamp mode=best_effort repaired first decoded PTS "
-                        + "raw=\(decodedPTS) best=\(resolvedPTS)",
-                        category: .swPlayback
-                    )
-                }
-            }
 
             // #131: A53 captions surface as decoded-frame side data on the FFmpeg path (MPEG-2
             // picture user data and friends). Presentation order by construction of decoder output.

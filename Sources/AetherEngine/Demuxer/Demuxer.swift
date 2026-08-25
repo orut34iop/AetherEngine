@@ -195,16 +195,6 @@ public final class Demuxer: @unchecked Sendable {
         guard let rawName = formatContext?.pointee.iformat?.pointee.name else { return nil }
         return String(cString: rawName)
     }
-
-    /// True when libavformat opened an ISO Base Media File family demuxer (mov/mp4/m4a/3gp/3g2/mj2).
-    /// Used by narrowly-scoped container integrity probes; codec-private data alone cannot distinguish
-    /// MP4 from Matroska because both may carry H.264 as an AVCDecoderConfigurationRecord.
-    var isISOBaseMediaFile: Bool {
-        guard let rawName = formatContext?.pointee.iformat?.pointee.name else { return false }
-        let names = String(cString: rawName).split(separator: ",")
-        return names.contains("mov") || names.contains("mp4")
-    }
-
     /// Timestamp of last unplanned reconnect (drop/stall, not a seek).
     /// Live producer correlates with backward source-PTS reset to detect
     /// Jellyfin transcode respawn. See `AVIOReader.lastUnplannedReconnectAt`.

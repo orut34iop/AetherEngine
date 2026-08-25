@@ -2377,8 +2377,6 @@ public final class AetherEngine: ObservableObject {
         }
         loadedURL = url
         loadedOptions = options
-        loadedOptions.resolvedSoftwareFrameTimestampPolicy = .decodedPTS
-        diagnostics.h264CompositionTimestampDiagnostic = nil
         // #170: the carryover is consumed by THIS load only (registration site below, or never on
         // the branches that return before it); it must not persist into loadedOptions where a later
         // host-initiated reload would resurrect a stale session snapshot.
@@ -2901,78 +2899,6 @@ public final class AetherEngine: ObservableObject {
                 EngineLog.emit(
                     "[AetherEngine] declared interlaced and the frame sample agrees (\(verdict)); "
                     + "keeping the software deinterlace path (#232)",
-                    category: .engine
-                )
-            }
-        }
-        // Some MP4 writers omit the ctts/composition offsets even though H.264 picture order uses
-        // B-frame reordering. Stream-copy then gives AVPlayer decode-order timestamps as presentation
-        // timestamps, visibly stepping forward and backward every B-frame group. Hosts opt into a
-        // fail-closed probe: only a seekable progressive H.264 ISO-BMFF VOD with video_delay > 0 is
-        // sampled, and only decoded evidence of raw-PTS regression on a monotonic best-effort clock
-        // routes to the software host. Healthy MP4s normally exit on their second packet's PTS-DTS
-        // offset. The same preopened demuxer is rewound before either backend adopts it.
-        if options.recoverMissingH264CompositionTimestamps,
-           !options.isLive, probeOpened, probe.isSourceSeekable,
-           probe.isISOBaseMediaFile,
-           detectedCodecID == AV_CODEC_ID_H264, probe.videoStreamIndex >= 0 {
-            let videoIndex = probe.videoStreamIndex
-            let timestampProbe = await Task.detached(priority: .userInitiated) { [probe] in
-                let result = H264CompositionTimestampProbe.run(
-                    demuxer: probe, streamIndex: videoIndex)
-                let rewindSucceeded = !result.consumedInput || probe.seek(to: 0)
-                return (result, rewindSucceeded)
-            }.value
-            if loadGeneration != gen {
-                probe.markClosed()
-                Task.detached { [probe] in probe.close() }
-                try checkLoadCurrent(gen)
-            }
-            EngineLog.emit(
-                "[AetherEngine] H.264 composition timestamp probe: \(timestampProbe.0.summary) "
-                + "rewound=\(timestampProbe.1)",
-                category: .engine
-            )
-            let timestampEvidence = timestampProbe.0.evidence
-            diagnostics.h264CompositionTimestampDiagnostic =
-                H264CompositionTimestampDiagnostic(
-                    verdict: String(describing: timestampProbe.0.verdict),
-                    videoPackets: timestampEvidence.videoPackets,
-                    validTimestampPairs: timestampEvidence.validTimestampPairs,
-                    nonKeyPackets: timestampEvidence.nonKeyPackets,
-                    decodedFrames: timestampEvidence.decodedFrames,
-                    bestEffortAdvances: timestampEvidence.bestEffortAdvances,
-                    bestEffortRegressions: timestampEvidence.bestEffortRegressions,
-                    rawPTSRegressions: timestampEvidence.rawPTSRegressions,
-                    rawPTSDiffersFromBestEffort:
-                        timestampEvidence.rawPTSDiffersFromBestEffort,
-                    rewound: timestampProbe.1,
-                    frameTimestampMode:
-                        timestampProbe.0.verdict == .repairWithBestEffortPTS
-                            ? "best_effort" : "decoded_pts"
-                )
-            if !timestampProbe.1 {
-                // Never hand a sampled demuxer to a backend at packet 65. URL sources can reopen
-                // cleanly; a custom source cannot be recreated, so fail rather than start mid-file.
-                probe.markClosed()
-                await Task.detached(priority: .utility) { [probe] in probe.close() }.value
-                probeOpened = false
-                if isCustomSource {
-                    state = .error("Failed to rewind source after timestamp integrity probe")
-                    throw DemuxerError.openFailed(code: -1)
-                }
-                EngineLog.emit(
-                    "[AetherEngine] timestamp-probe rewind failed; discarded sampled demuxer "
-                    + "and will reopen the URL for playback",
-                    category: .engine
-                )
-            }
-            if timestampProbe.0.verdict == .repairWithBestEffortPTS {
-                useSoftwarePath = true
-                loadedOptions.resolvedSoftwareFrameTimestampPolicy = .bestEffort
-                EngineLog.emit(
-                    "[AetherEngine] confirmed missing H.264 composition timestamps; "
-                    + "routing software with frame timestamp mode=best_effort",
                     category: .engine
                 )
             }

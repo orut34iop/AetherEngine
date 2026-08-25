@@ -284,12 +284,6 @@ public struct LoadOptions: Sendable, Equatable {
     /// Treat the source as a live stream. `seek(to:)` becomes a no-op; `isLive` surface reflects this for host UIs. Set explicitly: auto-detection from `probe.durationSeconds == 0` is too noisy (VOD MKVs with broken duration headers). Default `false`.
     public var isLive: Bool
 
-    /// Recover seekable MP4/H.264 VOD whose container omitted B-frame composition timestamps. The
-    /// option only enables a fail-closed integrity probe; healthy sources keep the native AVPlayer
-    /// path. A confirmed source routes through libavcodec and schedules decoded frames on
-    /// `best_effort_timestamp`. Default `false` so hosts opt into the CPU-decode fallback explicitly.
-    public var recoverMissingH264CompositionTimestamps: Bool
-
     /// Lean audio-only path (FFmpeg + AVSampleBufferAudioRenderer): skips video probe, display-criteria handshake, HLS/muxer/loopback stack. Also set automatically when the probe finds no video stream. Default `false`.
     public var audioOnly: Bool
 
@@ -452,11 +446,6 @@ public struct LoadOptions: Sendable, Equatable {
     /// host's subtitle authority flag carries over. Consumed by the load; never persisted.
     var subtitleSessionCarryover: SubtitleSessionCarryover? = nil
 
-    /// ENGINE-INTERNAL: resolved from the bounded H.264 composition-timestamp probe. Persisted in
-    /// `loadedOptions` so audio switches and lifecycle reloads keep one frame clock for the media;
-    /// a new public LoadOptions value resets it to `.decodedPTS`.
-    var resolvedSoftwareFrameTimestampPolicy: SoftwareFrameTimestampPolicy = .decodedPTS
-
     public init(
         omitCriteriaColorExtensions: Bool = false,
         suppressDisplayCriteria: Bool = false,
@@ -466,7 +455,6 @@ public struct LoadOptions: Sendable, Equatable {
         panelIsInHDRMode: Bool = false,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         isLive: Bool = false,
-        recoverMissingH264CompositionTimestamps: Bool = false,
         audioOnly: Bool = false,
         dvrWindowSeconds: Double? = nil,
         liveBlockingReload: Bool? = nil,
@@ -498,7 +486,6 @@ public struct LoadOptions: Sendable, Equatable {
         self.panelIsInHDRMode = panelIsInHDRMode
         self.audioBridgeMode = audioBridgeMode
         self.isLive = isLive
-        self.recoverMissingH264CompositionTimestamps = recoverMissingH264CompositionTimestamps
         self.audioOnly = audioOnly
         self.dvrWindowSeconds = dvrWindowSeconds
         self.liveBlockingReload = liveBlockingReload
@@ -522,11 +509,6 @@ public struct LoadOptions: Sendable, Equatable {
         self.deinterlaceMode = deinterlaceMode
         self.deinterlaceFieldRate = deinterlaceFieldRate
     }
-}
-
-enum SoftwareFrameTimestampPolicy: Sendable, Equatable {
-    case decodedPTS
-    case bestEffort
 }
 
 /// Detected video dynamic range format. `hdr10Plus` shares the HDR10 base layer with `hdr10`; the distinction is the per-frame ST 2094-40 metadata forwarded via `kCMSampleAttachmentKey_HDR10PlusPerFrameData`. Both map to PQ + BT.2020 in AVDisplayCriteria; the split is for badge accuracy.

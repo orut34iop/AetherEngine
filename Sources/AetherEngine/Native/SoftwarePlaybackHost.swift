@@ -517,17 +517,8 @@ final class SoftwarePlaybackHost {
             }
         }
 
-        // Applied here (not init) so both settings cover a decoder replaced above.
-        if let softwareDecoder = videoDecoder as? SoftwareVideoDecoder {
-            softwareDecoder.deinterlaceConfig = deinterlaceConfig
-            softwareDecoder.frameTimestampPolicy = frameTimestampPolicy
-            if frameTimestampPolicy == .bestEffort {
-                EngineLog.emit(
-                    "[SWHost] frame timestamp mode=best_effort (confirmed missing H.264 composition timestamps)",
-                    category: .swPlayback
-                )
-            }
-        }
+        // Applied here (not init) so it also covers a decoder replaced above.
+        (videoDecoder as? SoftwareVideoDecoder)?.deinterlaceConfig = deinterlaceConfig
 
         try videoDecoder.open(stream: vStream) { [weak self] pixelBuffer, pts, hdr10PlusData in
             // Decoder callback is off-main; SampleBufferRenderer is internally locked.
@@ -678,7 +669,6 @@ final class SoftwarePlaybackHost {
     var preserveASSMarkupForSubtitleTap = false
     var teletextPageForSubtitleTap: Int? = nil
     var deinterlaceConfig = DeinterlaceConfig()
-    var frameTimestampPolicy: SoftwareFrameTimestampPolicy = .decodedPTS
 
     /// #112 rework: build an overlay decoder for any embedded subtitle stream, seeded from the
     /// session's video dims like the HLS tap routes. The drainer owns the returned decoder.
