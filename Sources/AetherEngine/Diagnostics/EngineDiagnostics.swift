@@ -84,23 +84,6 @@ public struct H264CompositionOffsetRepairDiagnostic: Equatable, Sendable {
     public let firstPictureOrderCount: Int64?
     public let minimumDecodeStep: Int64?
     public let maximumDecodeStep: Int64?
-    /// Exact stream metadata and the bounded sampled decode-step pattern. These numeric fields make
-    /// a rejected fractional cadence diagnosable without exposing source identity or packet data.
-    public let streamTimeBaseNumerator: Int32?
-    public let streamTimeBaseDenominator: Int32?
-    public let codedFrameRateNumerator: Int32?
-    public let codedFrameRateDenominator: Int32?
-    public let averageFrameRateNumerator: Int32?
-    public let averageFrameRateDenominator: Int32?
-    public let streamFrameCount: Int64?
-    public let codedCadenceNumerator: Int64?
-    public let codedCadenceDenominator: Int64?
-    public let averageCadenceNumerator: Int64?
-    public let averageCadenceDenominator: Int64?
-    public let streamStartTime: Int64?
-    public let ladderStartTime: Int64?
-    public let firstDecodeTimestamp: Int64?
-    public let decodeStepPattern: [Int64]
     public let pictureOrderRegressionCount: Int
     public let planStep: Int64?
     public let planDecodeLead: Int64?
@@ -125,21 +108,6 @@ public struct H264CompositionOffsetRepairDiagnostic: Equatable, Sendable {
         firstPictureOrderCount: Int64? = nil,
         minimumDecodeStep: Int64? = nil,
         maximumDecodeStep: Int64? = nil,
-        streamTimeBaseNumerator: Int32? = nil,
-        streamTimeBaseDenominator: Int32? = nil,
-        codedFrameRateNumerator: Int32? = nil,
-        codedFrameRateDenominator: Int32? = nil,
-        averageFrameRateNumerator: Int32? = nil,
-        averageFrameRateDenominator: Int32? = nil,
-        streamFrameCount: Int64? = nil,
-        codedCadenceNumerator: Int64? = nil,
-        codedCadenceDenominator: Int64? = nil,
-        averageCadenceNumerator: Int64? = nil,
-        averageCadenceDenominator: Int64? = nil,
-        streamStartTime: Int64? = nil,
-        ladderStartTime: Int64? = nil,
-        firstDecodeTimestamp: Int64? = nil,
-        decodeStepPattern: [Int64] = [],
         pictureOrderRegressionCount: Int = 0,
         planStep: Int64? = nil,
         planDecodeLead: Int64? = nil,
@@ -163,21 +131,6 @@ public struct H264CompositionOffsetRepairDiagnostic: Equatable, Sendable {
         self.firstPictureOrderCount = firstPictureOrderCount
         self.minimumDecodeStep = minimumDecodeStep
         self.maximumDecodeStep = maximumDecodeStep
-        self.streamTimeBaseNumerator = streamTimeBaseNumerator
-        self.streamTimeBaseDenominator = streamTimeBaseDenominator
-        self.codedFrameRateNumerator = codedFrameRateNumerator
-        self.codedFrameRateDenominator = codedFrameRateDenominator
-        self.averageFrameRateNumerator = averageFrameRateNumerator
-        self.averageFrameRateDenominator = averageFrameRateDenominator
-        self.streamFrameCount = streamFrameCount
-        self.codedCadenceNumerator = codedCadenceNumerator
-        self.codedCadenceDenominator = codedCadenceDenominator
-        self.averageCadenceNumerator = averageCadenceNumerator
-        self.averageCadenceDenominator = averageCadenceDenominator
-        self.streamStartTime = streamStartTime
-        self.ladderStartTime = ladderStartTime
-        self.firstDecodeTimestamp = firstDecodeTimestamp
-        self.decodeStepPattern = decodeStepPattern
         self.pictureOrderRegressionCount = pictureOrderRegressionCount
         self.planStep = planStep
         self.planDecodeLead = planDecodeLead

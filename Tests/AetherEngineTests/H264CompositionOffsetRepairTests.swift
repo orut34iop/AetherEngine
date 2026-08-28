@@ -26,51 +26,6 @@ struct H264CompositionOffsetRepairTests {
         }
     }
 
-    private var quantizedCadence: H264CompositionOffsetRepair.Cadence {
-        H264CompositionOffsetRepair.Cadence(numerator: 200202, denominator: 5)!
-    }
-
-    private func quantizedMalformedSamples(videoDelay: Int64 = 2)
-        -> [H264CompositionOffsetRepair.Sample]
-    {
-        let pocs: [Int64] = [0, 8, 4, 2, 6, 16, 12, 10, 14, 24, 20, 18]
-        return pocs.enumerated().map { index, poc in
-            let dts = quantizedCadence.timestamp(at: Int64(index) - videoDelay)!
-            return H264CompositionOffsetRepair.Sample(
-                dts: dts, pts: dts, pictureOrderCount: poc, isKeyframe: index == 0)
-        }
-    }
-
-    /// Identity-free timing evidence from the affected physical Apple TV source. The DTS ladder is
-    /// exact; the POC ranks model the logged videoDelay=1 and three regressions without exposing the
-    /// source's full bitstream order. The nominal coded rate rounds to a 40040-tick integer cadence,
-    /// while the duration-derived average rate is nearly 200202/5 and the actual STTS pattern repeats
-    /// that five-frame quantization twice.
-    private func physicalQuantizedSamples() -> [H264CompositionOffsetRepair.Sample] {
-        let pocs: [Int64] = [0, 4, 2, 6, 8, 12, 10, 14, 16, 20, 18, 22]
-        let steps: [Int64] = [
-            40040, 40041, 40040, 40040, 40041,
-            40040, 40041, 40040, 40040, 40041, 40040,
-        ]
-        var dts: Int64 = -40040
-        return pocs.enumerated().map { index, poc in
-            defer { if index < steps.count { dts += steps[index] } }
-            return H264CompositionOffsetRepair.Sample(
-                dts: dts, pts: dts, pictureOrderCount: poc, isKeyframe: index == 0)
-        }
-    }
-
-    private var physicalAverageCadence: H264CompositionOffsetRepair.Cadence {
-        H264CompositionOffsetRepair.Cadence(
-            numerator: 34_597_562_400_000,
-            denominator: 864_066_353
-        )!
-    }
-
-    /// A conservative, identity-free upper bound for the affected source. Even across this many
-    /// frames, the duration-derived rate and the recovered five-frame cadence differ by < 0.5 tick.
-    private var physicalValidationFrameCount: Int64 { 600_000 }
-
     private func verdict(
         _ samples: [H264CompositionOffsetRepair.Sample],
         videoDelay: Int = 2,
@@ -111,383 +66,6 @@ struct H264CompositionOffsetRepairTests {
         var samples = malformedSamples()
         for index in 6..<samples.count { samples[index].dts += 500; samples[index].pts += 500 }
         #expect(verdict(samples) == .inconclusive("decode ladder is not uniform"))
-    }
-
-    @Test("nearest rounding is symmetric across the negative decode head and exactly invertible")
-    func rationalCadenceRoundingAndInverse() {
-        let expected: [(Int64, Int64)] = [
-            (-2, -80081), (-1, -40040), (0, 0), (1, 40040),
-            (2, 80081), (3, 120121), (4, 160162),
-        ]
-        for (ordinal, timestamp) in expected {
-            #expect(quantizedCadence.timestamp(at: ordinal) == timestamp)
-            #expect(quantizedCadence.frameOrdinal(forTimestamp: timestamp) == ordinal)
-        }
-        #expect(quantizedCadence.frameOrdinal(forTimestamp: 40041) == nil)
-    }
-
-    @Test("an exact two-period adjacent-tick ladder uses the declared rational cadence")
-    func quantizedLadderClassification() {
-        let samples = quantizedMalformedSamples()
-        let result = H264CompositionOffsetRepair.classify(
-            samples: samples, videoDelay: 2,
-            streamStartTime: 0, ladderStart: samples[0].dts,
-            averageCadence: quantizedCadence)
-        if case .repair(let plan) = result {
-            #expect(plan.cadence == quantizedCadence)
-            #expect(plan.rawFrameOffset == -2)
-            #expect(plan.step == 40040)
-            #expect(plan.decodeLead == 80081)
-            #expect(plan.shift == 80081)
-        } else {
-            #expect(Bool(false), "the exact rational lattice must be repairable")
-        }
-    }
-
-    @Test("adjacent steps in the wrong phase remain inconclusive")
-    func rejectsWrongQuantizationPattern() {
-        var samples = quantizedMalformedSamples()
-        let originalSteps = zip(samples, samples.dropFirst()).map { $1.dts - $0.dts }
-        var wrongSteps = originalSteps
-        wrongSteps.swapAt(0, 1)
-        var timestamp = samples[0].dts
-        for index in 1..<samples.count {
-            timestamp += wrongSteps[index - 1]
-            samples[index].dts = timestamp
-            samples[index].pts = timestamp
-        }
-        #expect(Set(wrongSteps) == Set([40040, 40041]))
-        #expect(H264CompositionOffsetRepair.classify(
-            samples: samples, videoDelay: 2,
-            streamStartTime: 0, ladderStart: samples[0].dts,
-            averageCadence: quantizedCadence)
-            == .inconclusive("decode ladder is not uniform"))
-    }
-
-    @Test("an adjacent ladder without matching frame-rate metadata is not guessed")
-    func quantizedLadderRequiresMetadata() {
-        let samples = quantizedMalformedSamples()
-        #expect(H264CompositionOffsetRepair.classify(
-            samples: samples, videoDelay: 2,
-            streamStartTime: 0, ladderStart: samples[0].dts)
-            == .inconclusive("decode ladder is not uniform"))
-    }
-
-    @Test("the physical five-frame phase is recovered independently of nominal frame-rate metadata")
-    func physicalQuantizationPhaseClassification() {
-        let samples = physicalQuantizedSamples()
-        let result = H264CompositionOffsetRepair.classify(
-            samples: samples,
-            videoDelay: 1,
-            streamStartTime: 0,
-            ladderStart: -40040,
-            streamFrameCount: physicalValidationFrameCount,
-            averageCadence: physicalAverageCadence,
-            nominalCadence: H264CompositionOffsetRepair.Cadence(
-                numerator: 40040,
-                denominator: 1
-            )!
-        )
-        guard case .repair(let physicalPlan) = result else {
-            #expect(Bool(false), "the repeated physical STTS phase must be repairable")
-            return
-        }
-        #expect(physicalPlan.cadence == quantizedCadence)
-        #expect(physicalPlan.rawFrameOffset == -1)
-
-        var rewriter = H264CompositionOffsetRepair.Rewriter(plan: physicalPlan)
-        let first = rewriter.rewrite(
-            dts: samples[0].dts,
-            pictureOrderCount: samples[0].pictureOrderCount,
-            isKeyframe: true
-        )
-        #expect(first?.pts == 0)
-        #expect(first?.dts == -40040)
-        for sample in samples.dropFirst() {
-            #expect(rewriter.rewrite(
-                dts: sample.dts,
-                pictureOrderCount: sample.pictureOrderCount,
-                isKeyframe: sample.isKeyframe
-            ) != nil)
-        }
-        #expect(rewriter.repairedPictures == 12)
-        #expect(rewriter.unrepairedPictures == 0)
-    }
-
-    @Test("a long-period cadence prefix cannot masquerade as a shorter repeated cycle")
-    func rejectsLongPeriodCadenceAlias() {
-        let declaredCadence = H264CompositionOffsetRepair.Cadence(
-            numerator: 335_344_009,
-            denominator: 10_000
-        )!
-        let phase: Int64 = 2
-        let phaseTimestamp = declaredCadence.timestamp(at: phase)!
-        let pocs: [Int64] = [0, 4, 2, 6, 8, 12, 10, 14, 16, 20, 18, 22]
-        let samples = pocs.enumerated().map { index, poc in
-            let timestamp = declaredCadence.timestamp(at: phase + Int64(index))! - phaseTimestamp
-            return H264CompositionOffsetRepair.Sample(
-                dts: timestamp,
-                pts: timestamp,
-                pictureOrderCount: poc,
-                isKeyframe: index == 0
-            )
-        }
-        let observedSteps = zip(samples, samples.dropFirst()).map { $1.dts - $0.dts }
-        #expect(Array(observedSteps.prefix(10)) == [
-            33534, 33535, 33534, 33534, 33535,
-            33534, 33535, 33534, 33534, 33535,
-        ])
-        let aliasedNominalCadence = H264CompositionOffsetRepair.Cadence(
-            numerator: 167_672,
-            denominator: 5
-        )!
-        #expect(H264CompositionOffsetRepair.classify(
-            samples: samples,
-            videoDelay: 1,
-            streamStartTime: 0,
-            ladderStart: 0,
-            streamFrameCount: 2_000,
-            averageCadence: declaredCadence,
-            nominalCadence: aliasedNominalCadence
-        ) == .inconclusive("decode ladder is not uniform"))
-    }
-
-    @Test("cadence corroboration uses an exact half-tick full-stream drift bound")
-    func cadenceConsistencyUsesCumulativeBound() {
-        let shortAlias = H264CompositionOffsetRepair.Cadence(
-            numerator: 167_672,
-            denominator: 5
-        )!
-        let longPeriodRate = H264CompositionOffsetRepair.Cadence(
-            numerator: 335_344_009,
-            denominator: 10_000
-        )!
-        #expect(shortAlias.isConsistent(with: longPeriodRate, maximumFrameSpan: 555))
-        #expect(!shortAlias.isConsistent(with: longPeriodRate, maximumFrameSpan: 556))
-        #expect(!shortAlias.isConsistent(with: longPeriodRate, maximumFrameSpan: nil))
-        #expect(shortAlias.isConsistent(with: shortAlias, maximumFrameSpan: nil))
-    }
-
-    @Test("an approximate cadence without a reliable stream span fails closed")
-    func approximateCadenceRequiresStreamSpan() {
-        let samples = physicalQuantizedSamples()
-        #expect(H264CompositionOffsetRepair.classify(
-            samples: samples,
-            videoDelay: 1,
-            streamStartTime: 0,
-            ladderStart: -40040,
-            averageCadence: physicalAverageCadence
-        ) == .inconclusive("decode ladder is not uniform"))
-    }
-
-    @Test("classification refuses a POC depth that the declared reorder delay cannot rewrite")
-    func rejectsUnsafePhysicalPlanBeforeRepairStarts() {
-        var samples = physicalQuantizedSamples()
-        let tooDeepPOCs: [Int64] = [0, 8, 4, 2, 6, 16, 12, 10, 14, 24, 20, 18]
-        for index in samples.indices {
-            samples[index].pictureOrderCount = tooDeepPOCs[index]
-        }
-        #expect(H264CompositionOffsetRepair.classify(
-            samples: samples,
-            videoDelay: 1,
-            streamStartTime: 0,
-            ladderStart: -40040,
-            streamFrameCount: physicalValidationFrameCount,
-            averageCadence: physicalAverageCadence
-        ) == .inconclusive("sample cannot be rewritten safely"))
-    }
-
-    @Test(
-        "a one-tick timestamp error stays on the repaired axis in either direction",
-        arguments: [Int64(-1), Int64(1)]
-    )
-    func rationalRepairRectifiesLateTimestampNoise(offset: Int64) {
-        let samples = physicalQuantizedSamples()
-        let result = H264CompositionOffsetRepair.classify(
-            samples: samples,
-            videoDelay: 1,
-            streamStartTime: 0,
-            ladderStart: -40040,
-            streamFrameCount: physicalValidationFrameCount,
-            averageCadence: physicalAverageCadence
-        )
-        guard case .repair(let physicalPlan) = result else {
-            #expect(Bool(false), "expected the physical rational plan")
-            return
-        }
-        var rewriter = H264CompositionOffsetRepair.Rewriter(plan: physicalPlan)
-        for sample in samples {
-            _ = rewriter.rewrite(
-                dts: sample.dts,
-                pictureOrderCount: 0,
-                isKeyframe: true
-            )
-        }
-
-        // Decode ordinal 12 should land on the CFR grid even when its container DTS is one tick off.
-        let noisyDTS: Int64 = 440445 + offset
-        let nextIDR = rewriter.rewrite(
-            dts: noisyDTS,
-            pictureOrderCount: 0,
-            isKeyframe: true
-        )
-        #expect(nextIDR?.pts == 480485)
-        #expect(nextIDR?.dts == 440445)
-        #expect(rewriter.unrepairedPictures == 0)
-    }
-
-    @Test("an unparsed packet is counted and the next exact timestamp resynchronizes decode order")
-    func rationalRepairResynchronizesAfterParserMiss() {
-        let samples = physicalQuantizedSamples()
-        let result = H264CompositionOffsetRepair.classify(
-            samples: samples,
-            videoDelay: 1,
-            streamStartTime: 0,
-            ladderStart: -40040,
-            streamFrameCount: physicalValidationFrameCount,
-            averageCadence: physicalAverageCadence
-        )
-        guard case .repair(let physicalPlan) = result else {
-            #expect(Bool(false), "expected the physical rational plan")
-            return
-        }
-        var rewriter = H264CompositionOffsetRepair.Rewriter(plan: physicalPlan)
-        _ = rewriter.rewrite(
-            dts: samples[0].dts,
-            pictureOrderCount: samples[0].pictureOrderCount,
-            isKeyframe: true
-        )
-        #expect(rewriter.rewrite(
-            dts: samples[1].dts,
-            pictureOrderCount: nil,
-            isKeyframe: false
-        ) == nil)
-
-        let resynchronized = rewriter.rewrite(
-            dts: samples[2].dts,
-            pictureOrderCount: samples[2].pictureOrderCount,
-            isKeyframe: false
-        )
-        #expect(resynchronized?.pts == 40041)
-        #expect(resynchronized?.dts == 40041)
-        #expect(rewriter.repairedPictures == 2)
-        #expect(rewriter.unrepairedPictures == 1)
-    }
-
-    @Test("a rejected exact forward jump does not poison the following normal timestamp")
-    func rationalRepairDoesNotCommitUnplaceableForwardJump() {
-        let samples = physicalQuantizedSamples()
-        let result = H264CompositionOffsetRepair.classify(
-            samples: samples,
-            videoDelay: 1,
-            streamStartTime: 0,
-            ladderStart: -40040,
-            streamFrameCount: physicalValidationFrameCount,
-            averageCadence: physicalAverageCadence
-        )
-        guard case .repair(let physicalPlan) = result else {
-            #expect(Bool(false), "expected the physical rational plan")
-            return
-        }
-        var rewriter = H264CompositionOffsetRepair.Rewriter(plan: physicalPlan)
-        _ = rewriter.rewrite(
-            dts: samples[0].dts,
-            pictureOrderCount: samples[0].pictureOrderCount,
-            isKeyframe: true
-        )
-
-        #expect(rewriter.rewrite(
-            dts: physicalPlan.rawTimestamp(decodeOrdinal: 100)!,
-            pictureOrderCount: 4,
-            isKeyframe: false
-        ) == nil)
-        let resumed = rewriter.rewrite(
-            dts: samples[2].dts,
-            pictureOrderCount: samples[2].pictureOrderCount,
-            isKeyframe: false
-        )
-        #expect(resumed?.pts == 40041)
-        #expect(resumed?.dts == 40041)
-        #expect(rewriter.repairedPictures == 2)
-        #expect(rewriter.unrepairedPictures == 1)
-    }
-
-    @Test(
-        "a timestamp beyond one tick is refused and a later exact timestamp resynchronizes",
-        arguments: [Int64(-10), Int64(-2), Int64(2), Int64(10)]
-    )
-    func rationalRepairRejectsLargeTimestampNoise(offset: Int64) {
-        let samples = physicalQuantizedSamples()
-        let result = H264CompositionOffsetRepair.classify(
-            samples: samples,
-            videoDelay: 1,
-            streamStartTime: 0,
-            ladderStart: -40040,
-            streamFrameCount: physicalValidationFrameCount,
-            averageCadence: physicalAverageCadence
-        )
-        guard case .repair(let physicalPlan) = result else {
-            #expect(Bool(false), "expected the physical rational plan")
-            return
-        }
-        var rewriter = H264CompositionOffsetRepair.Rewriter(plan: physicalPlan)
-        for sample in samples {
-            _ = rewriter.rewrite(
-                dts: sample.dts,
-                pictureOrderCount: 0,
-                isKeyframe: true
-            )
-        }
-
-        #expect(rewriter.rewrite(
-            dts: 440445 + offset,
-            pictureOrderCount: 0,
-            isKeyframe: false
-        ) == nil)
-        let nextExactDTS = physicalPlan.rawTimestamp(decodeOrdinal: 13)!
-        let resynchronized = rewriter.rewrite(
-            dts: nextExactDTS,
-            pictureOrderCount: 0,
-            isKeyframe: true
-        )
-        #expect(resynchronized?.dts == nextExactDTS)
-        #expect(rewriter.unrepairedPictures == 1)
-    }
-
-    @Test(
-        "a seek keyframe uniquely reanchors across a one-tick timestamp error",
-        arguments: [Int64(-1), Int64(1)]
-    )
-    func rationalSeekReanchorsWithinOneTick(offset: Int64) {
-        let samples = physicalQuantizedSamples()
-        let result = H264CompositionOffsetRepair.classify(
-            samples: samples,
-            videoDelay: 1,
-            streamStartTime: 0,
-            ladderStart: -40040,
-            streamFrameCount: physicalValidationFrameCount,
-            averageCadence: physicalAverageCadence
-        )
-        guard case .repair(let physicalPlan) = result else {
-            #expect(Bool(false), "expected the physical rational plan")
-            return
-        }
-        var rewriter = H264CompositionOffsetRepair.Rewriter(plan: physicalPlan)
-        _ = rewriter.rewrite(
-            dts: samples[0].dts,
-            pictureOrderCount: 0,
-            isKeyframe: true
-        )
-        rewriter.noteSeek()
-
-        let landing = rewriter.rewrite(
-            dts: 440445 + offset,
-            pictureOrderCount: 0,
-            isKeyframe: true
-        )
-        #expect(landing?.pts == 480485)
-        #expect(landing?.dts == 440445)
-        #expect(rewriter.unrepairedPictures == 0)
     }
 
     @Test("a sample that does not start on a picture-order origin cannot be anchored")
@@ -599,76 +177,6 @@ struct H264CompositionOffsetRepairTests {
         #expect(landingDTS == 498498)
     }
 
-    @Test("a rational seek landing recovers global cadence phase from raw DTS")
-    func rationalSeekReanchorsWithoutPhaseReset() {
-        let samples = quantizedMalformedSamples()
-        let result = H264CompositionOffsetRepair.classify(
-            samples: samples, videoDelay: 2,
-            streamStartTime: 0, ladderStart: samples[0].dts,
-            averageCadence: quantizedCadence)
-        guard case .repair(let rationalPlan) = result else {
-            #expect(Bool(false), "expected a rational repair plan")
-            return
-        }
-        var rewriter = H264CompositionOffsetRepair.Rewriter(plan: rationalPlan)
-        _ = rewriter.rewrite(dts: samples[0].dts, pictureOrderCount: 0, isKeyframe: true)
-        rewriter.noteSeek()
-
-        // Decode ordinal 7 is not a period boundary. An open-GOP landing picture with display rank
-        // 2 must map to global presentation ordinal 7, not restart a fresh phase at this keyframe.
-        let rawDTS = quantizedCadence.timestamp(at: 5)!
-        let landing = rewriter.rewrite(dts: rawDTS, pictureOrderCount: 4, isKeyframe: true)
-        #expect(landing?.pts == quantizedCadence.timestamp(at: 7))
-        #expect(landing?.dts == quantizedCadence.timestamp(at: 5))
-        #expect(rewriter.unrepairedPictures == 0)
-    }
-
-    @Test("a dense cadence whose adjacent ordinals overlap one-tick tolerance is not repairable")
-    func denseCadenceAmbiguityFailsClosed() {
-        let denseCadence = H264CompositionOffsetRepair.Cadence(numerator: 3, denominator: 2)!
-        #expect(H264CompositionOffsetRepair.Plan(
-            cadence: denseCadence,
-            rawTimestampAnchor: 0,
-            rawPhase: 0,
-            rawFrameOffset: 0,
-            videoDelay: 1,
-            pocStep: 2
-        ) == nil)
-
-        let pocs: [Int64] = [0, 4, 2, 6, 8, 12, 10, 14, 16, 20, 18, 22]
-        let samples = pocs.enumerated().map { index, poc in
-            let timestamp = denseCadence.timestamp(at: Int64(index))!
-            return H264CompositionOffsetRepair.Sample(
-                dts: timestamp,
-                pts: timestamp,
-                pictureOrderCount: poc,
-                isKeyframe: index == 0
-            )
-        }
-        #expect(H264CompositionOffsetRepair.classify(
-            samples: samples,
-            videoDelay: 1,
-            streamStartTime: 0,
-            ladderStart: 0,
-            averageCadence: denseCadence
-        ) == .inconclusive("decode ladder is not uniform"))
-    }
-
-    @Test("a rational presentation-axis ladder maps indexes with the same phase as packets")
-    func rationalIndexTimestampMapping() {
-        let presentationAxisPlan = H264CompositionOffsetRepair.Plan(
-            cadence: quantizedCadence,
-            presentationOrigin: 0,
-            ladderStart: 0,
-            rawFrameOffset: 0,
-            videoDelay: 2,
-            pocStep: 2)!
-        let rawIndexTimestamp = quantizedCadence.timestamp(at: 7)!
-        #expect(presentationAxisPlan.repairedDecodeTimestamp(rawIndexTimestamp)
-            == quantizedCadence.timestamp(at: 5))
-        #expect(presentationAxisPlan.repairedDecodeTimestamp(rawIndexTimestamp + 1) == nil)
-    }
-
     @Test("without an anchor a picture is emitted untouched rather than guessed at")
     func passesThroughWithoutAnchor() {
         var rewriter = H264CompositionOffsetRepair.Rewriter(plan: plan)
@@ -718,15 +226,6 @@ struct H264CompositionOffsetRepairTests {
         return result
     }
 
-    private static func indexedKeyframes(base64: String) throws -> [Int64] {
-        let data = try #require(Data(base64Encoded: base64, options: .ignoreUnknownCharacters))
-        let demuxer = Demuxer()
-        try demuxer.open(reader: DataIOReader(data: data), formatHint: "mp4")
-        defer { demuxer.close() }
-        demuxer.decideCompositionOffsetRepair()
-        return demuxer.indexedKeyframes(streamIndex: demuxer.videoStreamIndex)
-    }
-
     @Test("the repaired twin carries the healthy twin's timestamps, packet for packet")
     func repairedTwinMatchesHealthyTwin() throws {
         let healthy = try Self.videoTimestamps(base64: Self.healthyCTTSFixtureBase64)
@@ -734,56 +233,6 @@ struct H264CompositionOffsetRepairTests {
         #expect(healthy.count == 66)
         #expect(repaired.count == healthy.count)
         #expect(repaired == healthy)
-    }
-
-    /// Physical-device regression: a rational frame cadence may quantize to two adjacent integer
-    /// DTS steps even though it is constant-frame-rate. This twin uses 30 fps in a 1/1,201,212
-    /// timebase, so one frame is exactly 200202/5 ticks and the packet ladder alternates between
-    /// 40040 and 40041. Treating that normal quantization as VFR leaves the missing-ctts file in
-    /// decode order and reproduces the visible judder from #409.
-    @Test("an adjacent-tick rational ladder is repaired exactly, across multiple IDRs")
-    func quantizedRationalTwinMatchesHealthyTwin() throws {
-        let healthy = try Self.videoTimestamps(base64: Self.quantizedHealthyCTTSFixtureBase64)
-        let repaired = try Self.videoTimestamps(base64: Self.quantizedMissingCTTSFixtureBase64)
-        #expect(healthy.count == 66)
-        #expect(repaired.count == healthy.count)
-        #expect(repaired == healthy)
-    }
-
-    @Test("rational repair folds container keyframe indexes onto the healthy decode axis")
-    func quantizedRationalIndexesMatchHealthyTwin() throws {
-        let healthy = try Self.indexedKeyframes(base64: Self.quantizedHealthyCTTSFixtureBase64)
-        let repaired = try Self.indexedKeyframes(base64: Self.quantizedMissingCTTSFixtureBase64)
-        #expect(healthy.count == 3)
-        #expect(repaired == healthy)
-    }
-
-    @Test("the rational-ladder verdict reports the two observed adjacent DTS steps")
-    func quantizedRationalDiagnostic() throws {
-        let diagnostic = try Self.diagnostic(base64: Self.quantizedMissingCTTSFixtureBase64)
-        #expect(diagnostic.outcome == .repairing)
-        #expect(diagnostic.reason == .confirmedMissingOffsets)
-        #expect(diagnostic.minimumDecodeStep == 40040)
-        #expect(diagnostic.maximumDecodeStep == 40041)
-        #expect(diagnostic.streamTimeBaseNumerator == 1)
-        #expect(diagnostic.streamTimeBaseDenominator == 1_201_212)
-        #expect(diagnostic.codedFrameRateNumerator == 30)
-        #expect(diagnostic.codedFrameRateDenominator == 1)
-        #expect(diagnostic.averageFrameRateNumerator != nil)
-        #expect(diagnostic.averageFrameRateDenominator != nil)
-        #expect(diagnostic.streamFrameCount == 66)
-        #expect(diagnostic.codedCadenceNumerator == 200202)
-        #expect(diagnostic.codedCadenceDenominator == 5)
-        #expect(diagnostic.averageCadenceNumerator != nil)
-        #expect(diagnostic.averageCadenceDenominator != nil)
-        #expect(diagnostic.streamStartTime != nil)
-        #expect(diagnostic.ladderStartTime != nil)
-        #expect(diagnostic.firstDecodeTimestamp != nil)
-        #expect(diagnostic.decodeStepPattern.count == 11)
-        #expect(Set(diagnostic.decodeStepPattern) == Set([40040, 40041]))
-        #expect(diagnostic.planDecodeLead == 80081)
-        #expect(diagnostic.repairedPictures == 12)
-        #expect(diagnostic.unrepairedPictures == 0)
     }
 
     private static func diagnostic(base64: String) throws
@@ -944,102 +393,260 @@ struct H264CompositionOffsetRepairTests {
         FSh1BmAAAAAHAZ49QG0GYAAAAAcBnj9AbQZgAAAACEGaITRAfQZg
         """
 
-    /// 96x64 H.264 Main, 30 fps, 66 frames, three IDR sequences. The deliberately unusual
-    /// 1,201,212 track timescale makes one frame 200202/5 ticks, so the valid CFR ladder uses both
-    /// 40040- and 40041-tick steps. Generated with:
+    // MARK: - a cadence that does not land on whole ticks
+
+    /// #409's retest asset. It is constant rate, but a picture is not a whole number of ticks long,
+    /// so the sample table alternates between the two neighbouring counts: at `time_base=1/1200000`
+    /// the pictures are `200202/5` ticks apart and the ladder repeats `40041,40040,40040,40041,40040`.
+    /// Nothing about the defect changed, only the ladder the repair has to read, and a classifier
+    /// that demanded one identical step left the file exactly as broken as it found it.
+    private func quantizedLadderSamples() -> [H264CompositionOffsetRepair.Sample] {
+        let ladder: [Int64] = [
+            -80081, -40040, 0, 40040, 80081, 120121, 160162, 200202, 240242, 280283, 320323, 360364,
+        ]
+        let pocs: [Int64] = [0, 8, 4, 2, 6, 16, 12, 10, 14, 24, 20, 18]
+        return zip(ladder, pocs).enumerated().map { index, pair in
+            H264CompositionOffsetRepair.Sample(
+                dts: pair.0, pts: pair.0, pictureOrderCount: pair.1, isKeyframe: index == 0)
+        }
+    }
+
+    @Test("a ladder quantized from a fractional cadence is repaired, not called nonuniform")
+    func quantizedLadderIsRepaired() {
+        let verdict = verdict(
+            quantizedLadderSamples(), videoDelay: 2, streamStartTime: 0, ladderStart: -80081)
+        guard case .repair(let plan) = verdict else {
+            Issue.record("expected a repair, got \(verdict)")
+            return
+        }
+        #expect(plan.cadence == H264CompositionOffsetRepair.Cadence(numerator: 200202, denominator: 5))
+        #expect(plan.decodeLead == 80081)
+        #expect(plan.shift == 80081)
+        #expect(plan.pocStep == 2)
+        // The ladder starts on phase 3 of the five-picture period, and the container's retained edit
+        // list puts presentation one whole reorder head above it.
+        #expect(plan.ladderPhase == 3)
+        #expect(plan.ladderOrdinalOffset == 2)
+        // Which lands the axis where the healthy twin writes it: the first picture at zero.
+        #expect(plan.presentationTimestamp(ordinal: 0) == 0)
+        #expect(plan.presentationTimestamp(ordinal: 1) == 40040)
+    }
+
+    @Test("the fractional plan reproduces the presentation lattice, including across a sequence")
+    func quantizedPlanFollowsTheLattice() {
+        guard case .repair(let plan) = verdict(
+            quantizedLadderSamples(), videoDelay: 2, streamStartTime: 0, ladderStart: -80081) else {
+            Issue.record("expected a repair")
+            return
+        }
+        var rewriter = H264CompositionOffsetRepair.Rewriter(plan: plan)
+        // The head, against the healthy twin's first pictures.
+        #expect(rewriter.rewrite(dts: -80081, pictureOrderCount: 0, isKeyframe: true).map(\.pts) == 0)
+        #expect(rewriter.rewrite(dts: -40040, pictureOrderCount: 8, isKeyframe: false).map(\.pts) == 160162)
+        #expect(rewriter.rewrite(dts: 0, pictureOrderCount: 4, isKeyframe: false).map(\.pts) == 80081)
+        // A second coded video sequence starts on a ladder point whose distance from the first is
+        // not a whole multiple of any integer step. Read back from the lattice it still lands on
+        // the twin's timestamp; counted in rounded steps it would be a tick out.
+        rewriter.noteSeek()
+        #expect(rewriter.rewrite(dts: 560566, pictureOrderCount: 0, isKeyframe: true).map(\.pts) == 640646)
+        #expect(rewriter.rewrite(dts: 600606, pictureOrderCount: 8, isKeyframe: false).map(\.pts) == 800808)
+    }
+
+    @Test("a sample taken away from the head describes the same axis as one taken at it")
+    func quantizedLadderClassifiesFromAnywhere() {
+        // The same fixture, sampled from its second IDR instead of its first. The ladder starts on a
+        // different phase of the five-picture cycle there, and a repair that assumed the head would
+        // place every picture a tick beside the twin, or refuse the file outright.
+        let ladder: [Int64] = [
+            560566, 600606, 640646, 680687, 720727, 760768, 800808, 840848, 880889, 920929, 960970,
+            1001010,
+        ]
+        let pocs: [Int64] = [0, 8, 4, 2, 6, 16, 12, 10, 14, 24, 20, 18]
+        let samples = zip(ladder, pocs).enumerated().map { index, pair in
+            H264CompositionOffsetRepair.Sample(
+                dts: pair.0, pts: pair.0, pictureOrderCount: pair.1, isKeyframe: index == 0)
+        }
+        guard case .repair(let plan) = verdict(
+            samples, videoDelay: 2, streamStartTime: 0, ladderStart: -80081) else {
+            Issue.record("a sample away from the head must still classify")
+            return
+        }
+        #expect(plan.ladderPhase == 4)
+        var rewriter = H264CompositionOffsetRepair.Rewriter(plan: plan)
+        // The healthy twin's timestamps for those same three pictures.
+        #expect(rewriter.rewrite(dts: 560566, pictureOrderCount: 0, isKeyframe: true).map(\.pts) == 640646)
+        #expect(rewriter.rewrite(dts: 600606, pictureOrderCount: 8, isKeyframe: false).map(\.pts) == 800808)
+        #expect(rewriter.rewrite(dts: 640646, pictureOrderCount: 4, isKeyframe: false).map(\.pts) == 720727)
+    }
+
+    @Test("a fractional ladder left on the presentation axis needs no shift either")
+    func quantizedLadderOnPresentationAxis() {
+        // The other writer shape, and the container is the only thing that says which one it is: the
+        // same ladder lifted to non-negative timestamps, reporting a start time on its own head.
+        let ladder: [Int64] = [
+            0, 40041, 80081, 120121, 160162, 200202, 240243, 280283, 320323, 360364, 400404, 440445,
+        ]
+        let pocs: [Int64] = [0, 8, 4, 2, 6, 16, 12, 10, 14, 24, 20, 18]
+        let samples = zip(ladder, pocs).enumerated().map { index, pair in
+            H264CompositionOffsetRepair.Sample(
+                dts: pair.0, pts: pair.0, pictureOrderCount: pair.1, isKeyframe: index == 0)
+        }
+        guard case .repair(let plan) = verdict(
+            samples, videoDelay: 2, streamStartTime: 0, ladderStart: 0) else {
+            Issue.record("expected a repair")
+            return
+        }
+        #expect(plan.shift == 0)
+        #expect(plan.ladderOrdinalOffset == 0)
+        #expect(plan.decodeLead == 80081)
+        var rewriter = H264CompositionOffsetRepair.Rewriter(plan: plan)
+        let head = rewriter.rewrite(dts: 0, pictureOrderCount: 0, isKeyframe: true)
+        #expect(head?.pts == 0)
+        #expect(head?.dts == -80081)
+    }
+
+    @Test("a ladder that wobbles by a tick without repeating is left alone")
+    func nonRepeatingWobbleIsNotACadence() {
+        let ladder: [Int64] = [0, 40040, 80081, 120121, 160161, 200202, 240242, 280282, 320323, 360364, 400404, 440445]
+        let pocs: [Int64] = [0, 8, 4, 2, 6, 16, 12, 10, 14, 24, 20, 18]
+        let samples = zip(ladder, pocs).enumerated().map { index, pair in
+            H264CompositionOffsetRepair.Sample(
+                dts: pair.0, pts: pair.0, pictureOrderCount: pair.1, isKeyframe: index == 0)
+        }
+        guard case .inconclusive = verdict(samples, videoDelay: 2, streamStartTime: 0, ladderStart: 0) else {
+            Issue.record("a ladder with no repeating cycle must not be repaired")
+            return
+        }
+    }
+
+    @Test("a ladder with a dropped picture is left alone")
+    func droppedPictureIsNotACadence() {
+        let ladder: [Int64] = [0, 40040, 80081, 120121, 160162, 240242, 280283, 320323, 360364, 400404, 440444, 480485]
+        let pocs: [Int64] = [0, 8, 4, 2, 6, 16, 12, 10, 14, 24, 20, 18]
+        let samples = zip(ladder, pocs).enumerated().map { index, pair in
+            H264CompositionOffsetRepair.Sample(
+                dts: pair.0, pts: pair.0, pictureOrderCount: pair.1, isKeyframe: index == 0)
+        }
+        guard case .inconclusive = verdict(samples, videoDelay: 2, streamStartTime: 0, ladderStart: 0) else {
+            Issue.record("a two-tick gap is not a quantization")
+            return
+        }
+    }
+
+    @Test("the fractional twin carries the healthy twin's timestamps, packet for packet")
+    func repairedRationalTwinMatchesHealthyTwin() throws {
+        let healthy = try Self.videoTimestamps(base64: Self.healthyRationalFixtureBase64)
+        let repaired = try Self.videoTimestamps(base64: Self.missingRationalFixtureBase64)
+        #expect(healthy.count == 33)
+        #expect(repaired.count == healthy.count)
+        #expect(repaired == healthy)
+    }
+
+    @Test("the fractional healthy twin is delivered exactly as the container wrote it")
+    func rationalHealthyTwinIsUntouched() throws {
+        let healthy = try Self.videoTimestamps(base64: Self.healthyRationalFixtureBase64)
+        #expect(healthy.first == Timestamps(pts: 0, dts: -80081))
+        #expect(healthy.contains { $0.pts != $0.dts })
+        // The point of this pair: the decode ladder does not advance by one constant.
+        let steps = Set(zip(healthy, healthy.dropFirst()).map { $1.dts - $0.dts })
+        #expect(steps == [40040, 40041])
+    }
+
+    @Test("the repaired fractional stream presents every picture exactly once, in order")
+    func repairedRationalStreamIsABijection() throws {
+        let repaired = try Self.videoTimestamps(base64: Self.missingRationalFixtureBase64)
+        let presentation = repaired.map(\.pts).sorted()
+        #expect(Set(presentation).count == repaired.count)
+        #expect(Set(zip(presentation, presentation.dropFirst()).map { $1 - $0 }) == [40040, 40041])
+        #expect(repaired.allSatisfy { $0.pts >= $0.dts })
+        #expect(zip(repaired, repaired.dropFirst()).allSatisfy { $1.dts > $0.dts })
+    }
+
+    /// 96x64 H.264, 33 frames at 1000000/33367 fps in a 1200000 timescale, so a picture is 200202/5
+    /// ticks long and the sample table has to quantize it. Three B pictures per group, a keyframe
+    /// every 16, and the composition offsets stream-copied away in the second file, the same way
+    /// @orut34iop's original pair was made.
     ///
-    ///     ffmpeg -f lavfi -i 'color=c=red:s=96x64:r=30:d=2.2' -frames:v 66 \
-    ///       -c:v libx264 -preset ultrafast -pix_fmt yuv420p -bf 3 -b_strategy 0 \
-    ///       -g 22 -keyint_min 22 -sc_threshold 0 -video_track_timescale 1201212 \
+    ///     ffmpeg -f lavfi -i 'color=c=gray:s=96x64:rate=1000000/33367' -frames:v 33 \
+    ///       -c:v libx264 -preset ultrafast -pix_fmt yuv420p -bf 3 -b_strategy 0 -g 16 \
+    ///       -sc_threshold 0 -crf 40 -video_track_timescale 1200000 -r 1000000/33367 \
     ///       -movflags +faststart healthy.mp4
     ///     ffmpeg -i healthy.mp4 -map 0:v:0 -c:v copy -bsf:v 'setts=pts=DTS' \
     ///       -movflags +faststart missing.mp4
-    private static let quantizedHealthyCTTSFixtureBase64 = """
-        AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAfjbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAACJgAAQAAAQAAAAAAAAAA
-        AAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAABw10cmFrAAAAXHRr
-        aGQAAAADAAAAAAAAAAAAAAABAAAAAAAACJgAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAGAA
-        AABAAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAiYAAE40QABAAAAAAaFbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAABJUPAAoUupVxAAA
-        AAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAAGMG1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5m
-        AAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAABfBzdGJsAAAAuHN0c2QAAAAAAAAAAQAAAKhhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAA
-        AAAAAGAAQABIAAAASAAAAAAAAAABFUxhdmM2Mi4yOC4xMDIgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAALmF2Y0MBTUAK/+EAF2dNQArsoxNg
-        IgAAAwACAAADAHgeJEssAQAEaM4PyAAAABBwYXNwAAAAAQAAAAEAAAAUYnRydAAAAAAAABXKAAAAAAAAAbBzdHRzAAAAAAAAADQAAAABAACc
-        aQAAAAIAAJxoAAAAAQAAnGkAAAABAACcaAAAAAEAAJxpAAAAAgAAnGgAAAABAACcaQAAAAEAAJxoAAAAAQAAnGkAAAACAACcaAAAAAEAAJxp
-        AAAAAQAAnGgAAAABAACcaQAAAAIAAJxoAAAAAQAAnGkAAAABAACcaAAAAAEAAJxpAAAAAgAAnGgAAAABAACcaQAAAAEAAJxoAAAAAQAAnGkA
-        AAACAACcaAAAAAEAAJxpAAAAAQAAnGgAAAABAACcaQAAAAIAAJxoAAAAAQAAnGkAAAABAACcaAAAAAEAAJxpAAAAAgAAnGgAAAABAACcaQAA
-        AAEAAJxoAAAAAQAAnGkAAAACAACcaAAAAAEAAJxpAAAAAQAAnGgAAAABAACcaQAAAAIAAJxoAAAAAQAAnGkAAAABAACcaAAAAAEAAJxpAAAA
-        AgAAnGgAAAABAACcaQAAAAEAAJxoAAAAAQAAnGkAAAACAACcaAAAAAEAAJxpAAAAAQAAnGgAAAABAACcaQAAAAIAAJxoAAAAAQAAnGkAAAAC
-        AACcaAAAABxzdHNzAAAAAAAAAAMAAAABAAAAFwAAAC0AAAIYY3R0cwAAAAAAAABBAAAAAQABONEAAAABAAMOCgAAAAEAATjRAAAAAQAAAAAA
-        AAABAACcaAAAAAEAAw4KAAAAAQABONAAAAABAAAAAAAAAAEAAJxpAAAAAQADDgoAAAABAAE40QAAAAEAAAAAAAAAAQAAnGgAAAABAAMOCgAA
-        AAEAATjRAAAAAQAAAAAAAAABAACcaAAAAAEAAw4KAAAAAQABONEAAAABAAAAAAAAAAEAAJxpAAAAAQABONAAAAABAAE40QAAAAEAAw4KAAAA
-        AQABONEAAAABAAAAAAAAAAEAAJxoAAAAAQADDgoAAAABAAE40QAAAAEAAAAAAAAAAQAAnGkAAAABAAMOCgAAAAEAATjRAAAAAQAAAAAAAAAB
-        AACcaAAAAAEAAw4KAAAAAQABONAAAAABAAAAAAAAAAEAAJxpAAAAAQADDgoAAAABAAE40QAAAAEAAAAAAAAAAQAAnGgAAAACAAE40QAAAAEA
-        Aw4KAAAAAQABONAAAAABAAAAAAAAAAEAAJxpAAAAAQADDgoAAAABAAE40QAAAAEAAAAAAAAAAQAAnGgAAAABAAMOCgAAAAEAATjRAAAAAQAA
-        AAAAAAABAACcaAAAAAEAAw4KAAAAAQABONEAAAABAAAAAAAAAAEAAJxpAAAAAQADDgoAAAABAAE40QAAAAEAAAAAAAAAAQAAnGgAAAABAAE4
-        0QAAABxzdHNjAAAAAAAAAAEAAAABAAAAQgAAAAEAAAEcc3RzegAAAAAAAAAAAAAAQgAAAswAAAALAAAACwAAAAsAAAALAAAADAAAAA0AAAAL
-        AAAACwAAAAwAAAANAAAACwAAAAsAAAAMAAAADQAAAAsAAAALAAAADAAAAA0AAAALAAAACwAAAAwAAAArAAAACwAAAAsAAAALAAAACwAAAAwA
-        AAANAAAACwAAAAsAAAAMAAAADQAAAAsAAAALAAAADAAAAA0AAAALAAAACwAAAAwAAAANAAAACwAAAAsAAAAMAAAAKwAAAAsAAAALAAAACwAA
-        AAsAAAAMAAAADQAAAAsAAAALAAAADAAAAA0AAAALAAAACwAAAAwAAAANAAAACwAAAAsAAAAMAAAADQAAAAsAAAALAAAADAAAABRzdGNvAAAA
-        AAAAAAEAAAgTAAAAYnVkdGEAAABabWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAAAtaWxzdAAAACWpdG9vAAAA
-        HWRhdGEAAAABAAAAAExhdmY2Mi4xMi4xMDIAAAAIZnJlZQAABgZtZGF0AAACngYF//+a3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2
-        NSByMzIyMiBiMzU2MDVhIC0gSC4yNjQvTVBFRy00IEFWQyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAyNSAtIGh0dHA6Ly93d3cudmlkZW9s
-        YW4ub3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYmFjPTAgcmVmPTEgZGVibG9jaz0wOjA6MCBhbmFseXNlPTA6MCBtZT1kaWEgc3VibWU9
-        MCBwc3k9MSBwc3lfcmQ9MS4wMDowLjAwIG1peGVkX3JlZj0wIG1lX3JhbmdlPTE2IGNocm9tYV9tZT0xIHRyZWxsaXM9MCA4eDhkY3Q9MCBj
-        cW09MCBkZWFkem9uZT0yMSwxMSBmYXN0X3Bza2lwPTEgY2hyb21hX3FwX29mZnNldD0wIHRocmVhZHM9MiBsb29rYWhlYWRfdGhyZWFkcz0x
-        IHNsaWNlZF90aHJlYWRzPTAgbnI9MCBkZWNpbWF0ZT0xIGludGVybGFjZWQ9MCBibHVyYXlfY29tcGF0PTAgY29uc3RyYWluZWRfaW50cmE9
-        MCBiZnJhbWVzPTMgYl9weXJhbWlkPTIgYl9hZGFwdD0wIGJfYmlhcz0wIGRpcmVjdD0xIHdlaWdodGI9MCBvcGVuX2dvcD0wIHdlaWdodHA9
-        MCBrZXlpbnQ9MjIga2V5aW50X21pbj0xMiBzY2VuZWN1dD0wIGludHJhX3JlZnJlc2g9MCByYz1jcmYgbWJ0cmVlPTAgY3JmPTIzLjAgcWNv
-        bXA9MC42MCBxcG1pbj0wIHFwbWF4PTY5IHFwc3RlcD00IGlwX3JhdGlvPTEuNDAgcGJfcmF0aW89MS4zMCBhcT0wAIAAAAAmZYiEAOhGKAAI
-        Y8cAAQPY4AAh5ScnJycnXXXXXXXXXXXXXXXXXXgAAAAHQZokAOoMwAAAAAdBnkJANoMwAAAABwGeYUBdBmAAAAAHAZ5jQF0GYAAAAAhBmmg0
-        QHUGYAAAAAlBnoZFEShtBmAAAAAHAZ6lQGUGYAAAAAcBnqdAZQZgAAAACEGarDRAfQZgAAAACUGeykUVKG0GYAAAAAcBnulAZQZgAAAABwGe
-        60BlBmAAAAAIQZrwNEB9BmAAAAAJQZ8ORRUodQZgAAAABwGfLUBlBmAAAAAHAZ8vQG0GYAAAAAhBmzQ0QH0GYAAAAAlBn1JFFSh1BmAAAAAH
-        AZ9xQG0GYAAAAAcBn3NAbQZgAAAACEGbdTRAfQZgAAAAJ2WIggAEKEYoAAoSxwABGVjgACnhJycnJyddddddddddddddddddeAAAAAdBmiQA
-        6gzAAAAAB0GeQkA2gzAAAAAHAZ5hQGUGYAAAAAcBnmNAZQZgAAAACEGaaDRAdQZgAAAACUGehkURKG0GYAAAAAcBnqVAZQZgAAAABwGep0Bl
-        BmAAAAAIQZqsNEB9BmAAAAAJQZ7KRRUobQZgAAAABwGe6UBlBmAAAAAHAZ7rQGUGYAAAAAhBmvA0QH0GYAAAAAlBnw5FFSh1BmAAAAAHAZ8t
-        QGUGYAAAAAcBny9AbQZgAAAACEGbNDRAfQZgAAAACUGfUkUVKHUGYAAAAAcBn3FAbQZgAAAABwGfc0BtBmAAAAAIQZt1NEB9BmAAAAAnZYiE
-        ABChGKAAKEscAARlY4AAp4ScnJycnXXXXXXXXXXXXXXXXXXgAAAAB0GaJADqDMAAAAAHQZ5CQDaDMAAAAAcBnmFAZQZgAAAABwGeY0BlBmAA
-        AAAIQZpoNEB1BmAAAAAJQZ6GRREobQZgAAAABwGepUBlBmAAAAAHAZ6nQGUGYAAAAAhBmqw0QH0GYAAAAAlBnspFFShtBmAAAAAHAZ7pQGUG
-        YAAAAAcBnutAZQZgAAAACEGa8DRAfQZgAAAACUGfDkUVKHUGYAAAAAcBny1AZQZgAAAABwGfL0BtBmAAAAAIQZs0NEB9BmAAAAAJQZ9SRRUo
-        dQZgAAAABwGfcUBtBmAAAAAHAZ9zQG0GYAAAAAhBm3U0QH0GYA==
+
+    private static let healthyRationalFixtureBase64 = """
+        AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAWObW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAABE4AAQ
+        AAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+        AAAAAAAAAgAABLh0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAABE4AAAAAAAAAAAAAAAAAAAAAAAEAAAAAAA
+        AAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAGAAAABAAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAROAAE40QAB
+        AAAAAAQwbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAABJPgAAUKXVVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAA
+        AAAABWaWRlb0hhbmRsZXIAAAAD221pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAA
+        AAx1cmwgAAAAAQAAA5tzdGJsAAAAt3N0c2QAAAAAAAAAAQAAAKdhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAGAAQA
+        BIAAAASAAAAAAAAAABFUxhdmM2Mi4yOC4xMDEgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAALWF2Y0MBTUAK/+EAFWdNQArs
+        oxNgIgABBK4APQkAHiRLLAEABWjOA5yAAAAAEHBhc3AAAAABAAAAAQAAABRidHJ0AAAAAAAAH48AAAAAAAAA4HN0dHMAAA
+        AAAAAAGgAAAAEAAJxpAAAAAgAAnGgAAAABAACcaQAAAAEAAJxoAAAAAQAAnGkAAAACAACcaAAAAAEAAJxpAAAAAQAAnGgA
+        AAABAACcaQAAAAIAAJxoAAAAAQAAnGkAAAABAACcaAAAAAEAAJxpAAAAAgAAnGgAAAABAACcaQAAAAEAAJxoAAAAAQAAnG
+        kAAAACAACcaAAAAAEAAJxpAAAAAQAAnGgAAAABAACcaQAAAAIAAJxoAAAAAQAAnGkAAAABAACcaAAAAAEAAJxpAAAAAgAA
+        nGgAAAAcc3RzcwAAAAAAAAADAAAAAQAAABEAAAAhAAABGGN0dHMAAAAAAAAAIQAAAAEAATjRAAAAAQADDgoAAAABAAE40Q
+        AAAAEAAAAAAAAAAQAAnGgAAAABAAMOCgAAAAEAATjQAAAAAQAAAAAAAAABAACcaQAAAAEAAw4KAAAAAQABONEAAAABAAAA
+        AAAAAAEAAJxoAAAAAQACcaIAAAABAACcaAAAAAEAAJxpAAAAAQABONAAAAABAAMOCgAAAAEAATjRAAAAAQAAAAAAAAABAA
+        CcaQAAAAEAAw4KAAAAAQABONEAAAABAAAAAAAAAAEAAJxoAAAAAQADDgoAAAABAAE40AAAAAEAAAAAAAAAAQAAnGkAAAAB
+        AAJxoQAAAAEAAJxpAAAAAQAAnGgAAAABAAE40QAAABxzdHNjAAAAAAAAAAEAAAABAAAAIQAAAAEAAACYc3RzegAAAAAAAA
+        AAAAAAIQAAAr4AAAALAAAACwAAAAsAAAALAAAADAAAAA0AAAALAAAACwAAAAwAAAANAAAACwAAAAsAAAAMAAAADQAAAAsA
+        AAAfAAAACwAAAAsAAAALAAAACwAAAAwAAAANAAAACwAAAAsAAAAMAAAADQAAAAsAAAALAAAADAAAAA0AAAALAAAAHwAAAB
+        RzdGNvAAAAAAAAAAEAAAW+AAAAYnVkdGEAAABabWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAA
+        AAAtaWxzdAAAACWpdG9vAAAAHWRhdGEAAAABAAAAAExhdmY2Mi4xMi4xMDEAAAAIZnJlZQAABGBtZGF0AAACnQYF//+Z3E
+        XpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2NSByMzIyMiBiMzU2MDVhIC0gSC4yNjQvTVBFRy00IEFWQyBjb2RlYyAt
+        IENvcHlsZWZ0IDIwMDMtMjAyNSAtIGh0dHA6Ly93d3cudmlkZW9sYW4ub3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYm
+        FjPTAgcmVmPTEgZGVibG9jaz0wOjA6MCBhbmFseXNlPTA6MCBtZT1kaWEgc3VibWU9MCBwc3k9MSBwc3lfcmQ9MS4wMDow
+        LjAwIG1peGVkX3JlZj0wIG1lX3JhbmdlPTE2IGNocm9tYV9tZT0xIHRyZWxsaXM9MCA4eDhkY3Q9MCBjcW09MCBkZWFkem
+        9uZT0yMSwxMSBmYXN0X3Bza2lwPTEgY2hyb21hX3FwX29mZnNldD0wIHRocmVhZHM9MiBsb29rYWhlYWRfdGhyZWFkcz0x
+        IHNsaWNlZF90aHJlYWRzPTAgbnI9MCBkZWNpbWF0ZT0xIGludGVybGFjZWQ9MCBibHVyYXlfY29tcGF0PTAgY29uc3RyYW
+        luZWRfaW50cmE9MCBiZnJhbWVzPTMgYl9weXJhbWlkPTIgYl9hZGFwdD0wIGJfYmlhcz0wIGRpcmVjdD0xIHdlaWdodGI9
+        MCBvcGVuX2dvcD0wIHdlaWdodHA9MCBrZXlpbnQ9MTYga2V5aW50X21pbj0xIHNjZW5lY3V0PTAgaW50cmFfcmVmcmVzaD
+        0wIHJjPWNyZiBtYnRyZWU9MCBjcmY9NDAuMCBxY29tcD0wLjYwIHFwbWluPTAgcXBtYXg9NjkgcXBzdGVwPTQgaXBfcmF0
+        aW89MS40MCBwYl9yYXRpbz0xLjMwIGFxPTAAgAAAABlliIQA6JuTk5OTk6666666666666666668AAAAB0GaJADqDMAAAA
+        AHQZ5CQDaDMAAAAAcBnmFAXQZgAAAABwGeY0BdBmAAAAAIQZpoNEB1BmAAAAAJQZ6GRREobQZgAAAABwGepUBlBmAAAAAH
+        AZ6nQGUGYAAAAAhBmqw0QH0GYAAAAAlBnspFFShtBmAAAAAHAZ7pQGUGYAAAAAcBnutAZQZgAAAACEGa7zRAfQZgAAAACU
+        GfDUUVKHUGYAAAAAcBny5AZQZgAAAAG2WIggAPomKMnJycnJ1111111111111111114AAAAAdBmiQA6gzAAAAAB0GeQkA2
+        gzAAAAAHAZ5hQGUGYAAAAAcBnmNAZQZgAAAACEGaaDRAdQZgAAAACUGehkURKG0GYAAAAAcBnqVAZQZgAAAABwGep0BlBm
+        AAAAAIQZqsNEB9BmAAAAAJQZ7KRRUobQZgAAAABwGe6UBlBmAAAAAHAZ7rQGUGYAAAAAhBmu80QH0GYAAAAAlBnw1FFSh1
+        BmAAAAAHAZ8uQG0GYAAAABtliIQAEKJijJycnJyddddddddddddddddddeA=
         """
 
-    private static let quantizedMissingCTTSFixtureBase64 = """
-        AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAXLbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAACFYAAQAAAQAAAAAAAAAA
-        AAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAABPV0cmFrAAAAXHRr
-        aGQAAAADAAAAAAAAAAAAAAABAAAAAAAACFYAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAGAA
-        AABAAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAhVAAE40QABAAAAAARtbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAABJUPAAoUupVxAAA
-        AAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAAEGG1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5m
-        AAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAA9hzdGJsAAAAuHN0c2QAAAAAAAAAAQAAAKhhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAA
-        AAAAAGAAQABIAAAASAAAAAAAAAABFUxhdmM2Mi4yOC4xMDIgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAALmF2Y0MBTUAK/+EAF2dNQArsoxNg
-        IgAAAwACAAADAHgeJEssAQAEaM4PyAAAABBwYXNwAAAAAQAAAAEAAAAUYnRydAAAAAAAABXKAAAVygAAAbBzdHRzAAAAAAAAADQAAAABAACc
-        aQAAAAIAAJxoAAAAAQAAnGkAAAABAACcaAAAAAEAAJxpAAAAAgAAnGgAAAABAACcaQAAAAEAAJxoAAAAAQAAnGkAAAACAACcaAAAAAEAAJxp
-        AAAAAQAAnGgAAAABAACcaQAAAAIAAJxoAAAAAQAAnGkAAAABAACcaAAAAAEAAJxpAAAAAgAAnGgAAAABAACcaQAAAAEAAJxoAAAAAQAAnGkA
-        AAACAACcaAAAAAEAAJxpAAAAAQAAnGgAAAABAACcaQAAAAIAAJxoAAAAAQAAnGkAAAABAACcaAAAAAEAAJxpAAAAAgAAnGgAAAABAACcaQAA
-        AAEAAJxoAAAAAQAAnGkAAAACAACcaAAAAAEAAJxpAAAAAQAAnGgAAAABAACcaQAAAAIAAJxoAAAAAQAAnGkAAAABAACcaAAAAAEAAJxpAAAA
-        AgAAnGgAAAABAACcaQAAAAEAAJxoAAAAAQAAnGkAAAACAACcaAAAAAEAAJxpAAAAAQAAnGgAAAABAACcaQAAAAIAAJxoAAAAAQAAnGkAAAAC
-        AACcaAAAABxzdHNzAAAAAAAAAAMAAAABAAAAFwAAAC0AAAAcc3RzYwAAAAAAAAABAAAAAQAAAEIAAAABAAABHHN0c3oAAAAAAAAAAAAAAEIA
-        AALMAAAACwAAAAsAAAALAAAACwAAAAwAAAANAAAACwAAAAsAAAAMAAAADQAAAAsAAAALAAAADAAAAA0AAAALAAAACwAAAAwAAAANAAAACwAA
-        AAsAAAAMAAAAKwAAAAsAAAALAAAACwAAAAsAAAAMAAAADQAAAAsAAAALAAAADAAAAA0AAAALAAAACwAAAAwAAAANAAAACwAAAAsAAAAMAAAA
-        DQAAAAsAAAALAAAADAAAACsAAAALAAAACwAAAAsAAAALAAAADAAAAA0AAAALAAAACwAAAAwAAAANAAAACwAAAAsAAAAMAAAADQAAAAsAAAAL
-        AAAADAAAAA0AAAALAAAACwAAAAwAAAAUc3RjbwAAAAAAAAABAAAF+wAAAGJ1ZHRhAAAAWm1ldGEAAAAAAAAAIWhkbHIAAAAAAAAAAG1kaXJh
-        cHBsAAAAAAAAAAAAAAAALWlsc3QAAAAlqXRvbwAAAB1kYXRhAAAAAQAAAABMYXZmNjIuMTIuMTAyAAAACGZyZWUAAAYGbWRhdAAAAp4GBf//
-        mtxF6b3m2Ui3lizYINkj7u94MjY0IC0gY29yZSAxNjUgcjMyMjIgYjM1NjA1YSAtIEguMjY0L01QRUctNCBBVkMgY29kZWMgLSBDb3B5bGVm
-        dCAyMDAzLTIwMjUgLSBodHRwOi8vd3d3LnZpZGVvbGFuLm9yZy94MjY0Lmh0bWwgLSBvcHRpb25zOiBjYWJhYz0wIHJlZj0xIGRlYmxvY2s9
-        MDowOjAgYW5hbHlzZT0wOjAgbWU9ZGlhIHN1Ym1lPTAgcHN5PTEgcHN5X3JkPTEuMDA6MC4wMCBtaXhlZF9yZWY9MCBtZV9yYW5nZT0xNiBj
-        aHJvbWFfbWU9MSB0cmVsbGlzPTAgOHg4ZGN0PTAgY3FtPTAgZGVhZHpvbmU9MjEsMTEgZmFzdF9wc2tpcD0xIGNocm9tYV9xcF9vZmZzZXQ9
-        MCB0aHJlYWRzPTIgbG9va2FoZWFkX3RocmVhZHM9MSBzbGljZWRfdGhyZWFkcz0wIG5yPTAgZGVjaW1hdGU9MSBpbnRlcmxhY2VkPTAgYmx1
-        cmF5X2NvbXBhdD0wIGNvbnN0cmFpbmVkX2ludHJhPTAgYmZyYW1lcz0zIGJfcHlyYW1pZD0yIGJfYWRhcHQ9MCBiX2JpYXM9MCBkaXJlY3Q9
-        MSB3ZWlnaHRiPTAgb3Blbl9nb3A9MCB3ZWlnaHRwPTAga2V5aW50PTIyIGtleWludF9taW49MTIgc2NlbmVjdXQ9MCBpbnRyYV9yZWZyZXNo
-        PTAgcmM9Y3JmIG1idHJlZT0wIGNyZj0yMy4wIHFjb21wPTAuNjAgcXBtaW49MCBxcG1heD02OSBxcHN0ZXA9NCBpcF9yYXRpbz0xLjQwIHBi
-        X3JhdGlvPTEuMzAgYXE9MACAAAAAJmWIhADoRigACGPHAAED2OAAIeUnJycnJ1111111111111111114AAAAB0GaJADqDMAAAAAHQZ5CQDaD
-        MAAAAAcBnmFAXQZgAAAABwGeY0BdBmAAAAAIQZpoNEB1BmAAAAAJQZ6GRREobQZgAAAABwGepUBlBmAAAAAHAZ6nQGUGYAAAAAhBmqw0QH0G
-        YAAAAAlBnspFFShtBmAAAAAHAZ7pQGUGYAAAAAcBnutAZQZgAAAACEGa8DRAfQZgAAAACUGfDkUVKHUGYAAAAAcBny1AZQZgAAAABwGfL0Bt
-        BmAAAAAIQZs0NEB9BmAAAAAJQZ9SRRUodQZgAAAABwGfcUBtBmAAAAAHAZ9zQG0GYAAAAAhBm3U0QH0GYAAAACdliIIABChGKAAKEscAARlY
-        4AAp4ScnJycnXXXXXXXXXXXXXXXXXXgAAAAHQZokAOoMwAAAAAdBnkJANoMwAAAABwGeYUBlBmAAAAAHAZ5jQGUGYAAAAAhBmmg0QHUGYAAA
-        AAlBnoZFEShtBmAAAAAHAZ6lQGUGYAAAAAcBnqdAZQZgAAAACEGarDRAfQZgAAAACUGeykUVKG0GYAAAAAcBnulAZQZgAAAABwGe60BlBmAA
-        AAAIQZrwNEB9BmAAAAAJQZ8ORRUodQZgAAAABwGfLUBlBmAAAAAHAZ8vQG0GYAAAAAhBmzQ0QH0GYAAAAAlBn1JFFSh1BmAAAAAHAZ9xQG0G
-        YAAAAAcBn3NAbQZgAAAACEGbdTRAfQZgAAAAJ2WIhAAQoRigAChLHAAEZWOAAKeEnJycnJ1111111111111111114AAAAAdBmiQA6gzAAAAA
-        B0GeQkA2gzAAAAAHAZ5hQGUGYAAAAAcBnmNAZQZgAAAACEGaaDRAdQZgAAAACUGehkURKG0GYAAAAAcBnqVAZQZgAAAABwGep0BlBmAAAAAI
-        QZqsNEB9BmAAAAAJQZ7KRRUobQZgAAAABwGe6UBlBmAAAAAHAZ7rQGUGYAAAAAhBmvA0QH0GYAAAAAlBnw5FFSh1BmAAAAAHAZ8tQGUGYAAA
-        AAcBny9AbQZgAAAACEGbNDRAfQZgAAAACUGfUkUVKHUGYAAAAAcBn3FAbQZgAAAABwGfc0BtBmAAAAAIQZt1NEB9BmA=
+    private static let missingRationalFixtureBase64 = """
+        AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAR2bW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAABAsAAQ
+        AAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+        AAAAAAAAAgAAA6B0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAABAsAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAA
+        AAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAGAAAABAAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAQLAAE40QAB
+        AAAAAAMYbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAABJPgAAUKXVVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAA
+        AAAABWaWRlb0hhbmRsZXIAAAACw21pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAA
+        AAx1cmwgAAAAAQAAAoNzdGJsAAAAt3N0c2QAAAAAAAAAAQAAAKdhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAGAAQA
+        BIAAAASAAAAAAAAAABFUxhdmM2Mi4yOC4xMDEgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAALWF2Y0MBTUAK/+EAFWdNQArs
+        oxNgIgABBK4APQkAHiRLLAEABWjOA5yAAAAAEHBhc3AAAAABAAAAAQAAABRidHJ0AAAAAAAAH48AAB+PAAAA4HN0dHMAAA
+        AAAAAAGgAAAAEAAJxpAAAAAgAAnGgAAAABAACcaQAAAAEAAJxoAAAAAQAAnGkAAAACAACcaAAAAAEAAJxpAAAAAQAAnGgA
+        AAABAACcaQAAAAIAAJxoAAAAAQAAnGkAAAABAACcaAAAAAEAAJxpAAAAAgAAnGgAAAABAACcaQAAAAEAAJxoAAAAAQAAnG
+        kAAAACAACcaAAAAAEAAJxpAAAAAQAAnGgAAAABAACcaQAAAAIAAJxoAAAAAQAAnGkAAAABAACcaAAAAAEAAJxpAAAAAgAA
+        nGgAAAAcc3RzcwAAAAAAAAADAAAAAQAAABEAAAAhAAAAHHN0c2MAAAAAAAAAAQAAAAEAAAAhAAAAAQAAAJhzdHN6AAAAAA
+        AAAAAAAAAhAAACvgAAAAsAAAALAAAACwAAAAsAAAAMAAAADQAAAAsAAAALAAAADAAAAA0AAAALAAAACwAAAAwAAAANAAAA
+        CwAAAB8AAAALAAAACwAAAAsAAAALAAAADAAAAA0AAAALAAAACwAAAAwAAAANAAAACwAAAAsAAAAMAAAADQAAAAsAAAAfAA
+        AAFHN0Y28AAAAAAAAAAQAABKYAAABidWR0YQAAAFptZXRhAAAAAAAAACFoZGxyAAAAAAAAAABtZGlyYXBwbAAAAAAAAAAA
+        AAAAAC1pbHN0AAAAJal0b28AAAAdZGF0YQAAAAEAAAAATGF2ZjYyLjEyLjEwMQAAAAhmcmVlAAAEYG1kYXQAAAKdBgX//5
+        ncRem95tlIt5Ys2CDZI+7veDI2NCAtIGNvcmUgMTY1IHIzMjIyIGIzNTYwNWEgLSBILjI2NC9NUEVHLTQgQVZDIGNvZGVj
+        IC0gQ29weWxlZnQgMjAwMy0yMDI1IC0gaHR0cDovL3d3dy52aWRlb2xhbi5vcmcveDI2NC5odG1sIC0gb3B0aW9uczogY2
+        FiYWM9MCByZWY9MSBkZWJsb2NrPTA6MDowIGFuYWx5c2U9MDowIG1lPWRpYSBzdWJtZT0wIHBzeT0xIHBzeV9yZD0xLjAw
+        OjAuMDAgbWl4ZWRfcmVmPTAgbWVfcmFuZ2U9MTYgY2hyb21hX21lPTEgdHJlbGxpcz0wIDh4OGRjdD0wIGNxbT0wIGRlYW
+        R6b25lPTIxLDExIGZhc3RfcHNraXA9MSBjaHJvbWFfcXBfb2Zmc2V0PTAgdGhyZWFkcz0yIGxvb2thaGVhZF90aHJlYWRz
+        PTEgc2xpY2VkX3RocmVhZHM9MCBucj0wIGRlY2ltYXRlPTEgaW50ZXJsYWNlZD0wIGJsdXJheV9jb21wYXQ9MCBjb25zdH
+        JhaW5lZF9pbnRyYT0wIGJmcmFtZXM9MyBiX3B5cmFtaWQ9MiBiX2FkYXB0PTAgYl9iaWFzPTAgZGlyZWN0PTEgd2VpZ2h0
+        Yj0wIG9wZW5fZ29wPTAgd2VpZ2h0cD0wIGtleWludD0xNiBrZXlpbnRfbWluPTEgc2NlbmVjdXQ9MCBpbnRyYV9yZWZyZX
+        NoPTAgcmM9Y3JmIG1idHJlZT0wIGNyZj00MC4wIHFjb21wPTAuNjAgcXBtaW49MCBxcG1heD02OSBxcHN0ZXA9NCBpcF9y
+        YXRpbz0xLjQwIHBiX3JhdGlvPTEuMzAgYXE9MACAAAAAGWWIhADom5OTk5OTrrrrrrrrrrrrrrrrrrwAAAAHQZokAOoMwA
+        AAAAdBnkJANoMwAAAABwGeYUBdBmAAAAAHAZ5jQF0GYAAAAAhBmmg0QHUGYAAAAAlBnoZFEShtBmAAAAAHAZ6lQGUGYAAA
+        AAcBnqdAZQZgAAAACEGarDRAfQZgAAAACUGeykUVKG0GYAAAAAcBnulAZQZgAAAABwGe60BlBmAAAAAIQZrvNEB9BmAAAA
+        AJQZ8NRRUodQZgAAAABwGfLkBlBmAAAAAbZYiCAA+iYoycnJycnXXXXXXXXXXXXXXXXXXgAAAAB0GaJADqDMAAAAAHQZ5C
+        QDaDMAAAAAcBnmFAZQZgAAAABwGeY0BlBmAAAAAIQZpoNEB1BmAAAAAJQZ6GRREobQZgAAAABwGepUBlBmAAAAAHAZ6nQG
+        UGYAAAAAhBmqw0QH0GYAAAAAlBnspFFShtBmAAAAAHAZ7pQGUGYAAAAAcBnutAZQZgAAAACEGa7zRAfQZgAAAACUGfDUUV
+        KHUGYAAAAAcBny5AbQZgAAAAG2WIhAAQomKMnJycnJ1111111111111111114A==
         """
 }

@@ -12,6 +12,29 @@ the public-API contract.
 
 ### Fixed
 
+- **A picture that is not a whole number of ticks long left #409's repair with nothing to stand on,
+  so the reporting asset still juddered from the first frame (AE#409).** The repair reads a rank out
+  of the bitstream and puts it back on the ladder the container wrote, and it needed that ladder to
+  advance by one constant. A constant frame rate does not always produce one: at a 1200000 timescale
+  the retest asset's pictures are `200202/5` ticks apart, so its sample table can only alternate
+  between 40040 and 40041, and the classifier fell closed on a ladder it read as variable frame
+  timing. A two-valued ladder is now read as the quantization it is: the cycle it repeats names the
+  fraction (a cycle counts only when it is seen through twice), and the pattern it rounds to names
+  the phase of the lattice it was quantized from, which is the one thing a whole-tick ladder cannot
+  carry and this one can. Ranks are then placed on that lattice instead of on a step, so the repair
+  reproduces the muxer exactly rather than a tick beside it, and the whole-tick ladder stays the
+  special case it always was, untouched. The phase also makes the verdict independent of where the
+  sample was taken, so a session that starts inside the file describes the same axis as one that
+  starts at byte 0. Nothing else changed: how far the ladder runs ahead of presentation is still
+  read from the container header (the ladder fits every alignment equally well, so it cannot answer
+  that), the container index is still folded by one constant so an index entry can never disagree
+  with the packet it points at, and a picture the lattice cannot place still falls back to the
+  rounded step rather than being handed on in decode order. Genuine variable frame timing, a ladder
+  with a dropped picture, and a wobble that never repeats are all still left exactly as the container
+  delivered them. Verified against a fractional twin pair (33 packets, three coded video sequences,
+  both writer shapes, from the head and after a seek): every repaired packet carries the healthy
+  twin's PTS and DTS exactly. Reported and diagnosed by @orut34iop.
+
 - **An MP4 whose writer dropped the composition-offset table juddered from the first picture, and
   no seek was needed to provoke it (AE#409).** With `ctts` absent from a bitstream that still
   reorders pictures, every sample reports `PTS == DTS`, so the container hands decode order out as
@@ -28,19 +51,11 @@ the public-API contract.
   the served output presents all 301 frames at the same times as the healthy twin's does.
   Because the repair sits at the demuxer boundary, the fMP4 producer, the segment plan, the
   software decoder and the still extractor all read one axis, and hardware decode is kept:
-  a container defect no longer costs the native path. Fractional CFR is covered without treating
-  ordinary integer-tick quantization as VFR: a repeated STTS cycle (including the observed
-  40040/40041 five-picture cycle in a 1/1200000 time base) recovers the exact rational cadence and
-  its sampling phase independently of the edit-list/reorder offset. Declared and average frame rates
-  are consistency evidence only; they never construct timestamps, average evidence takes precedence
-  over a nominal short-period alias, and any approximate mismatch must stay within half a tick across
-  the known full-stream frame count. Once anchored, decode order advances continuously so a uniquely
-  placeable one-tick container anomaly is folded back onto the repaired lattice instead of mixing raw
-  and repaired axes. Detection remains fail-closed and cheap, a healthy file leaves on its first
-  composition offset, and anything unproven (variable frame timing, an ambiguous dense cadence, a
-  picture order that does not advance one rank per picture, a non-repeating cadence, or a sample that
-  cannot be anchored) is delivered exactly as the container wrote it. Reported by @orut34iop, whose
-  fixture pair and Apple TV timing signature are regression tests.
+  a container defect no longer costs the native path. Detection is fail-closed and cheap, a healthy
+  file leaves on its first composition offset, and anything unproven (variable frame timing, a
+  picture order that does not advance one rank per picture, a sample that cannot be anchored) is
+  delivered exactly as the container wrote it. Reported by @orut34iop, whose fixture pair is the
+  regression test.
 
 ### Added
 
