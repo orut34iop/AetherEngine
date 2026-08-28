@@ -62,6 +62,20 @@ enum H264CompositionOffsetRepair {
             self.denominator = denominator / divisor
         }
 
+        /// Converts FFmpeg's stream timing metadata into ticks per picture. This is diagnostic
+        /// evidence only: the repair verdict is derived from the packet ladder itself because an
+        /// MP4 writer may publish an average rate that drifts slightly over a long asset.
+        init?(timeBase: AVRational, frameRate: AVRational) {
+            guard timeBase.num > 0, timeBase.den > 0,
+                  frameRate.num > 0, frameRate.den > 0 else { return nil }
+            let (numerator, numeratorOverflow) = Int64(timeBase.den)
+                .multipliedReportingOverflow(by: Int64(frameRate.den))
+            let (denominator, denominatorOverflow) = Int64(timeBase.num)
+                .multipliedReportingOverflow(by: Int64(frameRate.num))
+            guard !numeratorOverflow, !denominatorOverflow else { return nil }
+            self.init(numerator: numerator, denominator: denominator)
+        }
+
         /// Whole ticks per picture, rounded down.
         var wholeTicks: Int64 { numerator / denominator }
 
@@ -572,6 +586,12 @@ final class H264CompositionOffsetRepairSession {
     private let videoDelay: Int
     private let streamStartTime: Int64
     private let ladderStart: Int64
+    private let streamFrameCount: Int64
+    private let streamTimeBase: AVRational
+    private let codedFrameRate: AVRational
+    private let averageFrameRate: AVRational
+    private let codedCadence: H264CompositionOffsetRepair.Cadence?
+    private let averageCadence: H264CompositionOffsetRepair.Cadence?
     private var reader: H264PictureOrderReader?
     private var rewriter: H264CompositionOffsetRepair.Rewriter?
     private var samples: [H264CompositionOffsetRepair.Sample] = []
@@ -590,6 +610,8 @@ final class H264CompositionOffsetRepairSession {
     private var decidedFirstPictureOrderCount: Int64?
     private var decidedMinimumDecodeStep: Int64?
     private var decidedMaximumDecodeStep: Int64?
+    private var decidedFirstDecodeTimestamp: Int64?
+    private var decidedDecodeStepPattern: [Int64] = []
     private var decidedPictureOrderRegressionCount = 0
 
     /// nil unless this stream is the exact shape the defect needs: ISO-BMFF, H.264, and a bitstream
@@ -612,6 +634,16 @@ final class H264CompositionOffsetRepairSession {
         self.videoDelay = Int(codecpar.pointee.video_delay)
         self.streamStartTime = stream.pointee.start_time
         self.ladderStart = ladderStart
+        self.streamFrameCount = stream.pointee.nb_frames
+        self.streamTimeBase = stream.pointee.time_base
+        self.codedFrameRate = stream.pointee.r_frame_rate
+        self.averageFrameRate = stream.pointee.avg_frame_rate
+        self.codedCadence = H264CompositionOffsetRepair.Cadence(
+            timeBase: stream.pointee.time_base,
+            frameRate: stream.pointee.r_frame_rate)
+        self.averageCadence = H264CompositionOffsetRepair.Cadence(
+            timeBase: stream.pointee.time_base,
+            frameRate: stream.pointee.avg_frame_rate)
         self.reader = reader
     }
 
@@ -754,11 +786,30 @@ final class H264CompositionOffsetRepairSession {
             firstPictureOrderCount: decidedFirstPictureOrderCount,
             minimumDecodeStep: decidedMinimumDecodeStep,
             maximumDecodeStep: decidedMaximumDecodeStep,
+            streamTimeBaseNumerator: streamTimeBase.num,
+            streamTimeBaseDenominator: streamTimeBase.den,
+            codedFrameRateNumerator: codedFrameRate.num,
+            codedFrameRateDenominator: codedFrameRate.den,
+            averageFrameRateNumerator: averageFrameRate.num,
+            averageFrameRateDenominator: averageFrameRate.den,
+            streamFrameCount: streamFrameCount,
+            codedCadenceNumerator: codedCadence?.numerator,
+            codedCadenceDenominator: codedCadence?.denominator,
+            averageCadenceNumerator: averageCadence?.numerator,
+            averageCadenceDenominator: averageCadence?.denominator,
+            streamStartTime: streamStartTime,
+            ladderStartTime: ladderStart,
+            firstDecodeTimestamp: decidedFirstDecodeTimestamp,
+            decodeStepPattern: decidedDecodeStepPattern,
             pictureOrderRegressionCount: decidedPictureOrderRegressionCount,
             planStep: diagnosticPlan?.step,
             planDecodeLead: diagnosticPlan?.decodeLead,
             planShift: diagnosticPlan?.shift,
             planPictureOrderStep: diagnosticPlan?.pocStep,
+            planCadenceNumerator: diagnosticPlan?.cadence?.numerator,
+            planCadenceDenominator: diagnosticPlan?.cadence?.denominator,
+            planLadderPhase: diagnosticPlan?.ladderPhase,
+            planLadderOrdinalOffset: diagnosticPlan?.ladderOrdinalOffset,
             repairedPictures: rewriter?.repairedPictures ?? 0,
             unrepairedPictures: rewriter?.unrepairedPictures ?? 0
         )
@@ -840,6 +891,10 @@ final class H264CompositionOffsetRepairSession {
         }
         decidedMinimumDecodeStep = decodeSteps.min()
         decidedMaximumDecodeStep = decodeSteps.max()
+        decidedFirstDecodeTimestamp = samples.first.flatMap {
+            $0.dts == Int64.min ? nil : $0.dts
+        }
+        decidedDecodeStepPattern = decodeSteps
         decidedPictureOrderRegressionCount = zip(samples, samples.dropFirst()).filter {
             $0.pictureOrderCount >= 0 && $1.pictureOrderCount >= 0
                 && $1.pictureOrderCount < $0.pictureOrderCount

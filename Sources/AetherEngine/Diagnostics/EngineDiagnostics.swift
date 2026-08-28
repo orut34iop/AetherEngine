@@ -84,11 +84,30 @@ public struct H264CompositionOffsetRepairDiagnostic: Equatable, Sendable {
     public let firstPictureOrderCount: Int64?
     public let minimumDecodeStep: Int64?
     public let maximumDecodeStep: Int64?
+    public let streamTimeBaseNumerator: Int32?
+    public let streamTimeBaseDenominator: Int32?
+    public let codedFrameRateNumerator: Int32?
+    public let codedFrameRateDenominator: Int32?
+    public let averageFrameRateNumerator: Int32?
+    public let averageFrameRateDenominator: Int32?
+    public let streamFrameCount: Int64?
+    public let codedCadenceNumerator: Int64?
+    public let codedCadenceDenominator: Int64?
+    public let averageCadenceNumerator: Int64?
+    public let averageCadenceDenominator: Int64?
+    public let streamStartTime: Int64?
+    public let ladderStartTime: Int64?
+    public let firstDecodeTimestamp: Int64?
+    public let decodeStepPattern: [Int64]
     public let pictureOrderRegressionCount: Int
     public let planStep: Int64?
     public let planDecodeLead: Int64?
     public let planShift: Int64?
     public let planPictureOrderStep: Int64?
+    public let planCadenceNumerator: Int64?
+    public let planCadenceDenominator: Int64?
+    public let planLadderPhase: Int64?
+    public let planLadderOrdinalOffset: Int64?
     public let repairedPictures: Int
     public let unrepairedPictures: Int
 
@@ -108,11 +127,30 @@ public struct H264CompositionOffsetRepairDiagnostic: Equatable, Sendable {
         firstPictureOrderCount: Int64? = nil,
         minimumDecodeStep: Int64? = nil,
         maximumDecodeStep: Int64? = nil,
+        streamTimeBaseNumerator: Int32? = nil,
+        streamTimeBaseDenominator: Int32? = nil,
+        codedFrameRateNumerator: Int32? = nil,
+        codedFrameRateDenominator: Int32? = nil,
+        averageFrameRateNumerator: Int32? = nil,
+        averageFrameRateDenominator: Int32? = nil,
+        streamFrameCount: Int64? = nil,
+        codedCadenceNumerator: Int64? = nil,
+        codedCadenceDenominator: Int64? = nil,
+        averageCadenceNumerator: Int64? = nil,
+        averageCadenceDenominator: Int64? = nil,
+        streamStartTime: Int64? = nil,
+        ladderStartTime: Int64? = nil,
+        firstDecodeTimestamp: Int64? = nil,
+        decodeStepPattern: [Int64] = [],
         pictureOrderRegressionCount: Int = 0,
         planStep: Int64? = nil,
         planDecodeLead: Int64? = nil,
         planShift: Int64? = nil,
         planPictureOrderStep: Int64? = nil,
+        planCadenceNumerator: Int64? = nil,
+        planCadenceDenominator: Int64? = nil,
+        planLadderPhase: Int64? = nil,
+        planLadderOrdinalOffset: Int64? = nil,
         repairedPictures: Int = 0,
         unrepairedPictures: Int = 0
     ) {
@@ -131,11 +169,30 @@ public struct H264CompositionOffsetRepairDiagnostic: Equatable, Sendable {
         self.firstPictureOrderCount = firstPictureOrderCount
         self.minimumDecodeStep = minimumDecodeStep
         self.maximumDecodeStep = maximumDecodeStep
+        self.streamTimeBaseNumerator = streamTimeBaseNumerator
+        self.streamTimeBaseDenominator = streamTimeBaseDenominator
+        self.codedFrameRateNumerator = codedFrameRateNumerator
+        self.codedFrameRateDenominator = codedFrameRateDenominator
+        self.averageFrameRateNumerator = averageFrameRateNumerator
+        self.averageFrameRateDenominator = averageFrameRateDenominator
+        self.streamFrameCount = streamFrameCount
+        self.codedCadenceNumerator = codedCadenceNumerator
+        self.codedCadenceDenominator = codedCadenceDenominator
+        self.averageCadenceNumerator = averageCadenceNumerator
+        self.averageCadenceDenominator = averageCadenceDenominator
+        self.streamStartTime = streamStartTime
+        self.ladderStartTime = ladderStartTime
+        self.firstDecodeTimestamp = firstDecodeTimestamp
+        self.decodeStepPattern = decodeStepPattern
         self.pictureOrderRegressionCount = pictureOrderRegressionCount
         self.planStep = planStep
         self.planDecodeLead = planDecodeLead
         self.planShift = planShift
         self.planPictureOrderStep = planPictureOrderStep
+        self.planCadenceNumerator = planCadenceNumerator
+        self.planCadenceDenominator = planCadenceDenominator
+        self.planLadderPhase = planLadderPhase
+        self.planLadderOrdinalOffset = planLadderOrdinalOffset
         self.repairedPictures = repairedPictures
         self.unrepairedPictures = unrepairedPictures
     }

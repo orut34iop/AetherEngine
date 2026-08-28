@@ -395,6 +395,51 @@ struct H264CompositionOffsetRepairTests {
 
     // MARK: - a cadence that does not land on whole ticks
 
+    /// Exact bounded evidence from the 2026-08-28 physical Apple TV report. The packet ladder
+    /// repeats a five-picture 200202/5 cadence twice, while the container's duration-derived
+    /// `avg_frame_rate=2144115944/71542715` drifts by about 228 ticks over 239571 pictures. The
+    /// average is useful telemetry, but must not veto the exact short-period sample-table evidence.
+    private func currentPhysicalDeviceSamples() -> [H264CompositionOffsetRepair.Sample] {
+        let steps: [Int64] = [
+            40040, 40041, 40040, 40040, 40041, 40040, 40041, 40040, 40040, 40041, 40040,
+        ]
+        let pocs: [Int64] = [0, 4, 2, 6, 8, 12, 10, 14, 16, 20, 18, 22]
+        var timestamp: Int64 = -40040
+        return pocs.enumerated().map { index, poc in
+            defer {
+                if index < steps.count { timestamp += steps[index] }
+            }
+            return H264CompositionOffsetRepair.Sample(
+                dts: timestamp, pts: timestamp,
+                pictureOrderCount: poc, isKeyframe: index == 0)
+        }
+    }
+
+    @Test("the exact second physical-device ladder is repaired despite average-rate drift")
+    func currentPhysicalDeviceLadderIsRepaired() {
+        let samples = currentPhysicalDeviceSamples()
+        guard case .repair(let plan) = verdict(
+            samples, videoDelay: 1, streamStartTime: 0, ladderStart: -40040) else {
+            Issue.record("the twice-repeated physical ladder must be repairable")
+            return
+        }
+        #expect(plan.cadence == H264CompositionOffsetRepair.Cadence(
+            numerator: 200202, denominator: 5))
+        #expect(plan.decodeLead == 40040)
+        #expect(plan.shift == 40040)
+
+        var rewriter = H264CompositionOffsetRepair.Rewriter(plan: plan)
+        let repaired = samples.compactMap {
+            rewriter.rewrite(
+                dts: $0.dts,
+                pictureOrderCount: $0.pictureOrderCount,
+                isKeyframe: $0.isKeyframe)
+        }
+        #expect(repaired.count == samples.count)
+        #expect(rewriter.repairedPictures == samples.count)
+        #expect(rewriter.unrepairedPictures == 0)
+    }
+
     /// #409's retest asset. It is constant rate, but a picture is not a whole number of ticks long,
     /// so the sample table alternates between the two neighbouring counts: at `time_base=1/1200000`
     /// the pictures are `200202/5` ticks apart and the ladder repeats `40041,40040,40040,40041,40040`.
@@ -569,6 +614,24 @@ struct H264CompositionOffsetRepairTests {
         // The point of this pair: the decode ladder does not advance by one constant.
         let steps = Set(zip(healthy, healthy.dropFirst()).map { $1.dts - $0.dts })
         #expect(steps == [40040, 40041])
+    }
+
+    @Test("the structured verdict exposes the measured fractional cadence and phase")
+    func rationalRepairDiagnostic() throws {
+        let diagnostic = try Self.diagnostic(base64: Self.missingRationalFixtureBase64)
+        #expect(diagnostic.outcome == .repairing)
+        #expect(diagnostic.minimumDecodeStep == 40040)
+        #expect(diagnostic.maximumDecodeStep == 40041)
+        #expect(Set(diagnostic.decodeStepPattern) == [40040, 40041])
+        #expect(diagnostic.streamTimeBaseNumerator == 1)
+        #expect(diagnostic.streamTimeBaseDenominator == 1_200_000)
+        #expect(diagnostic.streamFrameCount == 33)
+        #expect(diagnostic.planCadenceNumerator == 200202)
+        #expect(diagnostic.planCadenceDenominator == 5)
+        #expect(diagnostic.planLadderPhase == 3)
+        #expect(diagnostic.planLadderOrdinalOffset == 2)
+        #expect(diagnostic.repairedPictures == 12)
+        #expect(diagnostic.unrepairedPictures == 0)
     }
 
     @Test("the repaired fractional stream presents every picture exactly once, in order")
