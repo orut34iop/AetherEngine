@@ -495,8 +495,9 @@ extension AetherEngine {
         softwareHost?.ioWindowDiagnostics ?? nativeVideoSession?.demuxer?.ioWindowDiagnostics
     }
 
-    /// Resident bytes in the loopback HLS segment cache. nil when no native session is active.
+    /// Compressed resident bytes: software packet spool or native loopback segment cache.
     var cachedBytes: Int64? {
+        if let bytes = softwareHost?.cachedVODBytes { return bytes }
         guard let bytes = nativeVideoSession?.segmentCacheTotalBytes else { return nil }
         return Int64(bytes)
     }

@@ -1,5 +1,14 @@
 # Changelog
 
+## Moonfin software VOD cache candidate — 2026-09-07
+
+- Restore real ahead-of-playhead buffer reporting on seekable software VOD with
+  bounded, disk-backed compressed-packet read-ahead. Preserve packet metadata and
+  side data; intersect continuous selected A/V PTS coverage instead of estimating
+  time from byte counts. Reuse forward-window/budget limits without changing UI or
+  renderer pacing. Seek generations fence stale packets; stop and stale-session
+  cleanup release owned temporary storage. Physical acceptance is pending.
+
 Quick index of AetherEngine releases. Detailed per-release notes (breaking
 changes, full fix list, acknowledgements) live on
 [GitHub Releases](https://github.com/superuser404notfound/AetherEngine/releases).

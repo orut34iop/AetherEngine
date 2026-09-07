@@ -5,6 +5,24 @@ application.
 
 ## 6.71.0 integration verification
 
+- Software VOD packet-cache candidate (2026-09-07): the user confirms all three
+  recovery-point assets now seek smoothly on the compatibility route, but its
+  decoded-only buffer frontier hid the previous ahead-of-playhead bar. Seekable
+  software VOD now prefetches compressed AVPackets into a chunked temporary FIFO,
+  preserving PTS, DTS, duration, stream/flags, byte position, timebase and every
+  side-data entry. Actual selected A/V PTS coverage is intersected for the existing
+  bufferedPosition interface; missing intervals are never filled by a bitrate or
+  DTS estimate. The native forward-window and quarter-of-free-volume budget
+  helpers are reused; renderer queues remain short. Seek retires the old FIFO
+  generation, and stop/abandoned-session cleanup is bounded and session-scoped.
+  This is forward read-ahead, not native SegmentCache backward-seek retention;
+  seeks refill from the source and the fMP4-specific SessionCacheStatus API is
+  unchanged. Native, live and forward-only playback retain their existing paths.
+  Physical cache-bar/seek/pause/healthy-native acceptance is still pending.
+  Run `Scripts/test-software-packet-{coverage,disk-fifo,read-ahead}.sh` and
+  `Scripts/test-software-stored-packet.sh` for focused model, concurrency, disk
+  failure/lifecycle and actual bundled-FFmpeg packet roundtrip checks.
+
 - Recovery-point compatibility candidate (2026-09-07): three user-reported H.264
   MP4 assets have non-IDR I slices with immediate/exact recovery-point SEI every
   12 frames. Native tvOS output falls from about 30 to 3 fps after cached seeks,

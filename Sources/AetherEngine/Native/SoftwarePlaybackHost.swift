@@ -105,6 +105,16 @@ final class SoftwarePlaybackHost {
     private var audioDecoder: AudioDecoder?
     private var audioOutput: AudioOutput?
     private var demuxer: Demuxer?
+    private var vodPacketReadAhead: SoftwarePacketReadAhead?
+
+    /// The same public buffered-position axis as the live and native hosts, but backed by
+    /// actual compressed A/V packet coverage. nil when no continuous cache span contains the clock.
+    var cachedVODSessionTime: Double? {
+        guard let frontier = vodPacketReadAhead?.snapshot.frontier else { return nil }
+        return max(0, frontier - max(0, clockSessionZero))
+    }
+
+    var cachedVODBytes: Int64? { vodPacketReadAhead.map { Int64($0.snapshot.bytes) } }
 
     private let demuxQueue = DispatchQueue(label: "engine.sw.demux", qos: .userInitiated)
 
@@ -617,7 +627,9 @@ final class SoftwarePlaybackHost {
         startPosition: Double?,
         audioSourceStreamIndex: Int32?,
         isLive: Bool = false,
-        dvrWindowSeconds: Double? = nil
+        dvrWindowSeconds: Double? = nil,
+        forwardBufferSegments: Int? = nil,
+        sessionCacheByteBudget: Int? = nil
     ) async throws {
         self.demuxer = dem
         self.duration = dem.duration
@@ -828,6 +840,53 @@ final class SoftwarePlaybackHost {
             initialClockTime = .zero
         }
 
+        if !isLive, dem.isSourceSeekable {
+            let video = SoftwarePacketReadAhead.Stream(index: videoStreamIndex,
+                                                       numerator: vtb.num, denominator: vtb.den)
+            let audio: SoftwarePacketReadAhead.Stream? = audioStreamIndex >= 0
+                ? dem.stream(at: audioStreamIndex).map {
+                    .init(index: audioStreamIndex, numerator: $0.pointee.time_base.num,
+                          denominator: $0.pointee.time_base.den)
+                } : nil
+            let initialSourceClock = initialClockTime.seconds
+            let cacheResult = await Task.detached(priority: .utility) { () throws -> SoftwarePacketReadAhead? in
+                let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+                let available = (try? temp.resourceValues(forKeys: [.volumeAvailableCapacityKey]))?
+                    .volumeAvailableCapacity.map(Int64.init)
+                let segments = HLSVideoEngine.clampedForwardWindow(forwardBufferSegments)
+                let budget = HLSVideoEngine.resolveSessionCacheBudget(
+                    requestedBytes: sessionCacheByteBudget, volumeAvailableBytes: available,
+                    capRelaxed: HLSVideoEngine.retentionCapRelaxed(forwardWindowSegments: segments))
+                // Window-only policy still needs a small temporary spool, as native HLS does.
+                // Unlike the native hard window, never exceed the volume's safety ceiling.
+                let bytes = min(budget.volumeSafetyLimitBytes,
+                                budget.baseEffectiveBytes > 0 ? budget.baseEffectiveBytes : 32 << 20)
+                guard bytes > 0 else { return Optional<SoftwarePacketReadAhead>.none }
+                let fifo = try SoftwarePacketDiskFIFO()
+                return SoftwarePacketReadAhead(
+                    video: video, audio: audio, byteBudget: bytes,
+                    forwardSeconds: Double(segments) * 4,
+                    initialSourceClock: initialSourceClock, fifo: fifo
+                ) { isCurrent in
+                    guard let packet = try dem.readPacket(isCurrent: isCurrent) else { return nil }
+                    defer { av_packet_unref(packet); av_packet_free_safe(packet) }
+                    return try SoftwareStoredPacket(copying: packet)
+                }
+            }.result
+            let readAhead: SoftwarePacketReadAhead?
+            switch cacheResult {
+            case .success(let cache): readAhead = cache
+            case .failure:
+                // A cache-directory failure must not stop a source that the old direct loop can
+                // still play. Runtime spool corruption is explicit, never silently skipped.
+                EngineLog.emit("[SWHost] packet cache unavailable; retaining direct playback", category: .swPlayback)
+                readAhead = nil
+            }
+            guard !stopRequested else { readAhead?.close(); return }
+            vodPacketReadAhead = readAhead
+            readAhead?.start()
+        }
+
         startTimeUpdates()
         isReady = true
     }
@@ -1006,6 +1065,7 @@ final class SoftwarePlaybackHost {
         // reposition can tell on `seekQueue` whether a newer seek has already taken over.
         bumpSeekGeneration()
         let generation = seekGeneration
+        let cacheGeneration = vodPacketReadAhead?.beginSeek()
         // #292: inside another seek's window `isPlaying` is that seek's parked flag, not the transport's
         // intent. Inherit what it captured, and hand the same value on to whoever supersedes this one.
         let wasPlaying = SeekResumeIntent.resolve(isPlaying: isPlaying,
@@ -1087,6 +1147,7 @@ final class SoftwarePlaybackHost {
         // The source stands at the target and the clock is anchored on it: everything the loop
         // reads from here belongs to this position. Closing the window releases the loop.
         noteSeekSettled(generation)
+        if let cacheGeneration { vodPacketReadAhead?.endSeek(cacheGeneration, sourceClock: seconds) }
         return outcome
     }
 
@@ -1188,6 +1249,8 @@ final class SoftwarePlaybackHost {
         noteSeekSettled(seekGeneration)
         timeTimer?.cancel()
         timeTimer = nil
+        vodPacketReadAhead?.close()
+        vodPacketReadAhead = nil
         renderer.subtitleCompositor.reset()
 
         dvrRing?.close()
@@ -1375,9 +1438,11 @@ final class SoftwarePlaybackHost {
         }
 
         let diag = demuxDiag
+        let readAhead = vodPacketReadAhead
         demuxQueue.async {
             Self.runDemuxLoop(
                 demuxer: dem,
+                readAhead: readAhead,
                 videoDecoder: vDec,
                 videoStreamIndex: vIdx,
                 audioDecoder: aDec,
@@ -1878,6 +1943,7 @@ final class SoftwarePlaybackHost {
     /// Demux loop: reads packets, dispatches by stream index, back-pressures against renderer's isReadyForMoreMediaData, flushes decoders at EOF.
     nonisolated private static func runDemuxLoop(
         demuxer: Demuxer,
+        readAhead: SoftwarePacketReadAhead?,
         videoDecoder: any VideoDecodingPipeline,
         videoStreamIndex: Int32,
         audioDecoder: AudioDecoder?,
@@ -2176,7 +2242,13 @@ final class SoftwarePlaybackHost {
             var epochBeforeRead = videoDecoder.feedEpoch
             let packet: UnsafeMutablePointer<AVPacket>?
             do {
-                packet = try demuxer.readPacket()
+                if let readAhead {
+                    packet = try readAhead.read()?.makeAVPacket()
+                } else {
+                    packet = try demuxer.readPacket()
+                }
+            } catch SoftwarePacketReadAhead.ReadError.interrupted {
+                return true
             } catch {
                 EngineLog.emit("[SWHost] demux read failed: \(error)", category: .swPlayback)
                 onError("Playback error: \(error.localizedDescription)")
@@ -2481,6 +2553,7 @@ final class SoftwarePlaybackHost {
                 let raw = aOut.currentTimeSeconds
                 self.emitDiagIfDue(clock: raw)
                 if raw.isFinite, raw >= 0 {
+                    self.vodPacketReadAhead?.updatePlayhead(raw)
                     // Raw clock = source/subtitle axis; published alongside the mapped position (#107).
                     self.sourceClockSeconds = raw
                     // Live: subtract sessionStartPts to convert to "seconds since first frame"; VOD

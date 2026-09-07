@@ -3,10 +3,10 @@ import Foundation
 /// 1 Hz live playback telemetry snapshot. Nil fields are path-asymmetric:
 /// observedFps=nil on native (AVPlayer has no usable live FPS counter);
 /// avSyncGapMs=nil on SW (measured by HLSSegmentProducer which only runs on the native/HLS-loopback path);
-/// forwardBufferSeconds=nil on SW, and stays nil on purpose (#306): the software demux loop reads on
-/// renderer back-pressure, so there is no seconds-deep reservoir of arrived-but-unplayed media to
-/// report there. `displayCushionSeconds` and `readerWindowAheadBytes` are what that path holds instead,
-/// and putting either of them under the same name would report a near-stall on a healthy session.
+/// forwardBufferSeconds=nil on SW: this remains the native player's loaded-range metric (#306).
+/// Software VOD compressed packet read-ahead is reported through engine.bufferedPosition and
+/// cachedBytes, separately from displayCushionSeconds and the byte-source reader window. Do not
+/// interpret a sub-second decoded queue as the size of the compressed packet cache.
 public struct LiveTelemetry: Equatable, Sendable {
     // Enthusiast section
     public let instantBitrateMbps: Double?

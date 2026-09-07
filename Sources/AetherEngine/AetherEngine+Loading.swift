@@ -1724,14 +1724,13 @@ extension AetherEngine {
             .sink { [weak self] value in
                 guard let self = self else { return }
                 self.clock.currentTime = value
-                // bufferedPosition = newest demuxed source PTS, clamped to never trail the playhead (#54).
-                // #303: `bufferedSessionTime` is fed from `noteEdge`, which only runs on live
-                // sessions, so a VOD software session used to publish the playhead back as its own
-                // frontier. The decoded cushion is what it has instead.
+                // Both paths publish a real continuous cache frontier. Software VOD intersects
+                // selected A/V packet PTS coverage; the decoded cushion remains the unknown fallback.
                 self.clock.bufferedPosition = SoftwareBufferFrontier.bufferedPosition(
                     currentTime: value,
                     liveFrontier: host.bufferedSessionTime,
-                    cushion: host.displayCushionSeconds)
+                    cushion: host.displayCushionSeconds,
+                    cachedVODFrontier: host.cachedVODSessionTime)
             }
             .store(in: &softwareCancellables)
         // #107: sourceTime rides the RAW synchronizer clock (source axis) so subtitle cues
@@ -1766,6 +1765,8 @@ extension AetherEngine {
             Task { @MainActor in self?.setReaderNetworkPhase(phase) }
         }
         if loadGeneration == generation { recordStartupCheckpoint(.sessionConstructed) }   // #361
+        let forwardBufferSegments = loadedOptions.forwardBufferSegments
+        let sessionCacheByteBudget = loadedOptions.sessionCacheByteBudget
         try await Task.detached(priority: .userInitiated) {
             [host, preopenedDemuxer, url, sourceHTTPHeaders, isLive, dvrWindowSeconds, probesize, maxAnalyzeDuration, sequentialOrigin, declaredDuration, networkPhaseSink] in
             let dem: Demuxer
@@ -1781,7 +1782,9 @@ extension AetherEngine {
                 startPosition: startPosition,
                 audioSourceStreamIndex: audioSourceStreamIndex,
                 isLive: isLive,
-                dvrWindowSeconds: dvrWindowSeconds
+                dvrWindowSeconds: dvrWindowSeconds,
+                forwardBufferSegments: forwardBufferSegments,
+                sessionCacheByteBudget: sessionCacheByteBudget
             )
         }.value
         // Superseded: stop idempotently to tear down the demuxer the detached closure opened, then unwind.
