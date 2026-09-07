@@ -178,6 +178,20 @@ timestamp controls, Matroska policy and recovery recognition. Generated fixtures
 contain solid colour/tone only. Packet payload, DTS, audio and metadata are
 preserved; private source regressions and device evidence are recorded in the
 host's `docs/testing/aether-partial-composition-investigation-20260907.md`.
-Physical acceptance is pending for this new candidate. Rollback tag in both
+The user verified the core fix on the original source on Apple TV 4K, tvOS 26.6
+beta. A post-review missing-timestamp guard is committed as `b72fa6bb`; final
+candidate `20260907165350` passed the canonical physical pipeline and is installed.
+The first reply belongs to the early core-fix candidate; the user subsequently
+confirmed the final guard candidate's repeat test also passed. Rollback tag in both
 repositories: `moonfin/pre-partial-ctts-20260907`. Do not fold this new work into
 the already submitted and independently accepted PR branches.
+
+Independent upstream [PR #513](https://github.com/superuser404notfound/AetherEngine/pull/513)
+is based on canonical main `1af43f01`, fork branch
+`codex/pr-partial-composition-20260907` at
+`617ae094cab07b5e79bb55bbb0294b125538a982`. It preserves the policy and guard,
+adapts diagnostics to upstream's internal summary and imports no unmerged
+Matroska/cache interface or host UI. Generated controls, seven source positions,
+packet lifecycle, isolated tvOS build and documentation checks passed locally.
+CI is initially `action_required`, with no jobs started; no upstream adoption is
+claimed. Raw/private evidence remains local to the host investigation record.
