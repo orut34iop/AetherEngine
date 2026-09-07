@@ -164,3 +164,20 @@ not float with upstream `main`.
    the full pushed commit SHA and records it in its task ledger.
 5. Preserve the LGPL-3.0 license and Apple Store / DRM exception. Source for
    this fork, including every modification, remains public.
+# Partial composition-offset follow-up — 2026-09-07
+
+Separate from submitted PRs #510/#511/#512: a healthy MP4 head can be followed by
+zero-offset IDR sequences. The partial policy restores existing timestamp-slot
+ownership without moving DTS/index time or assuming constant cadence. It is
+enabled only when the healthy origin corroborates the edit/index presentation
+lead; unsupported sequences are not guessed. Native diagnostic publication
+reports later region decisions without waiting on demux I/O.
+
+Focused checks: `Scripts/test-h264-partial-composition-controls.sh`, existing
+timestamp controls, Matroska policy and recovery recognition. Generated fixtures
+contain solid colour/tone only. Packet payload, DTS, audio and metadata are
+preserved; private source regressions and device evidence are recorded in the
+host's `docs/testing/aether-partial-composition-investigation-20260907.md`.
+Physical acceptance is pending for this new candidate. Rollback tag in both
+repositories: `moonfin/pre-partial-ctts-20260907`. Do not fold this new work into
+the already submitted and independently accepted PR branches.

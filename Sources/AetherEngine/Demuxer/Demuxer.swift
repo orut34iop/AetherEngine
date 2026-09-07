@@ -1282,11 +1282,22 @@ public final class Demuxer: @unchecked Sendable {
         decideCompositionRepairLocked()
     }
 
-    /// Structured, identity-free evidence for the one composition-offset decision made by this
-    /// demuxer. The access lock makes the repair counters safe to sample while a producer is reading.
+    /// A telemetry tick must never wait behind network I/O held under accessLock.
+    /// Skip busy samples; the next tick can observe the latest complete decision.
+    func tryH264CompositionOffsetRepairDiagnostic() -> H264CompositionOffsetRepairDiagnostic? {
+        guard accessLock.try() else { return nil }
+        defer { accessLock.unlock() }
+        return compositionOffsetRepairDiagnosticLocked()
+    }
+
+    /// Structured, identity-free evidence. The access lock protects region decisions and counters.
     func h264CompositionOffsetRepairDiagnostic() -> H264CompositionOffsetRepairDiagnostic {
         accessLock.lock()
         defer { accessLock.unlock() }
+        return compositionOffsetRepairDiagnosticLocked()
+    }
+
+    private func compositionOffsetRepairDiagnosticLocked() -> H264CompositionOffsetRepairDiagnostic {
         if let compositionRepair {
             return compositionRepair.diagnostic(
                 sourceSeekable: compositionRepairSourceSeekable,

@@ -2202,6 +2202,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var h264CompositionOffsetRepairDiagnostic: H264CompositionOffsetRepairDiagnostic? {
         subsystemSnapshot().demuxer?.h264CompositionOffsetRepairDiagnostic()
     }
+    var latestH264CompositionOffsetRepairDiagnostic: H264CompositionOffsetRepairDiagnostic? {
+        subsystemSnapshot().demuxer?.tryH264CompositionOffsetRepairDiagnostic()
+    }
     var segmentCacheTotalBytes: Int { subsystemSnapshot().cache?.totalBytes ?? 0 }
     /// On-disk segment bytes (freshly stat-ed). Used by `aetherctl live --report-cache-bytes`.
     var segmentCacheDiskBytes: Int64 { subsystemSnapshot().cache?.diskBytes() ?? 0 }

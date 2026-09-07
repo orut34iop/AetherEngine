@@ -2,6 +2,10 @@
 set -euo pipefail
 TASK_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TASK_FFMPEG_ROOT="$TASK_ROOT/build/tvos-6.71.0/SourcePackages/checkouts/FFmpegBuild"
+TASK_DRIVER="$TASK_ROOT/Scripts/tests/H264TimestampRuntimeStandalone.swift"
+if [[ "${AETHER_TIMESTAMP_PARTIAL_CTTS:-0}" == 1 ]]; then
+  TASK_DRIVER="$TASK_ROOT/Scripts/tests/H264PartialCompositionRuntimeStandalone.swift"
+fi
 TASK_EXPECTED_REVISION=$(/usr/bin/ruby -rjson -e \
   'puts JSON.parse(File.read(ARGV.fetch(0))).fetch("pins").find { |p| p.fetch("identity") == "ffmpegbuild" }.fetch("state").fetch("revision")' "$TASK_ROOT/Package.resolved")
 [[ $(git -C "$TASK_FFMPEG_ROOT" rev-parse HEAD) == "$TASK_EXPECTED_REVISION" ]] \
@@ -27,7 +31,9 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swiftc -swift-ver
   "$TASK_ROOT/Sources/AetherEngine/Native/SoftwareStoredPacket.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Native/SoftwareStoredPacket+FFmpeg.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Video/H264CompositionOffsetRepair.swift" \
+  "$TASK_ROOT/Sources/AetherEngine/Video/H264PartialCompositionRepair.swift" \
+  "$TASK_ROOT/Sources/AetherEngine/Video/H264PartialCompositionRepairSession.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Video/H264MatroskaTimestampRepair.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Video/H264MatroskaTimestampRepairSession.swift" \
-  "$TASK_ROOT/Scripts/tests/H264TimestampRuntimeStandalone.swift" -o "$TASK_TMP/check"
+  "$TASK_DRIVER" -o "$TASK_TMP/check"
 "$TASK_TMP/check" "$@"

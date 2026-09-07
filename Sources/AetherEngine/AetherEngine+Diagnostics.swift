@@ -459,6 +459,14 @@ extension AetherEngine {
     /// Single write-through point: sampler never reaches into `EngineDiagnostics` directly.
     func applyLiveTelemetry(_ snapshot: LiveTelemetry) {
         diagnostics.liveTelemetry = snapshot
+        // A healthy head is not a permanent verdict for a mixed-ctts MP4. Publish region
+        // changes to the existing identity-free diagnostic channel after seeks and during play.
+        // The demuxer read is nonblocking, and counters alone do not produce repeated log lines.
+        if let sample = nativeVideoSession?.latestH264CompositionOffsetRepairDiagnostic,
+           sample.reason != diagnostics.h264CompositionOffsetRepairDiagnostic?.reason
+            || sample.outcome != diagnostics.h264CompositionOffsetRepairDiagnostic?.outcome {
+            diagnostics.h264CompositionOffsetRepairDiagnostic = sample
+        }
     }
 
     /// Refresh current byte/park/eviction fields without disturbing the lifecycle result retained

@@ -24,6 +24,8 @@ public enum H264CompositionOffsetRepairReason: String, Equatable, Sendable {
     case sampling
     case compositionOffsetsPresent = "composition_offsets_present"
     case confirmedMissingOffsets = "confirmed_missing_offsets"
+    case confirmedPartialCompositionOffsets = "confirmed_partial_composition_offsets"
+    case partialCompositionSequenceUnproven = "partial_composition_sequence_unproven"
     case confirmedMatroskaCodingOrder = "confirmed_matroska_coding_order"
     case matroskaSequenceUnproven = "matroska_sequence_unproven"
     case matroskaSequenceChanged = "matroska_sequence_changed"

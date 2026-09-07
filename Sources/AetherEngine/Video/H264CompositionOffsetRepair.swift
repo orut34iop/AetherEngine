@@ -597,6 +597,8 @@ final class H264CompositionOffsetRepairSession: H264TimestampRepairSession {
     private let averageCadence: H264CompositionOffsetRepair.Cadence?
     private var reader: H264PictureOrderReader?
     private var rewriter: H264CompositionOffsetRepair.Rewriter?
+    private let partialRepairCandidate: H264PartialCompositionRepairSession?
+    private var monitorsPartialOffsets = false
     private var samples: [H264CompositionOffsetRepair.Sample] = []
     private var held: [(packet: UnsafeMutablePointer<AVPacket>, pictureOrderCount: Int64?)] = []
     private var heldBytes = 0
@@ -648,6 +650,10 @@ final class H264CompositionOffsetRepairSession: H264TimestampRepairSession {
             timeBase: stream.pointee.time_base,
             frameRate: stream.pointee.avg_frame_rate)
         self.reader = reader
+        let (lead, overflow) = stream.pointee.start_time.subtractingReportingOverflow(ladderStart)
+        partialRepairCandidate = !overflow && stream.pointee.start_time != Int64.min && ladderStart != Int64.min
+            ? H264PartialCompositionRepairSession(stream: stream, streamIndex: streamIndex, presentationLead: lead)
+            : nil
     }
 
     deinit {
@@ -669,16 +675,17 @@ final class H264CompositionOffsetRepairSession: H264TimestampRepairSession {
     /// repaired packets cut segment 2 one picture past its keyframe, which is a segment AVPlayer
     /// cannot start at.
     var decodeTimestampOffset: Int64? {
+        if monitorsPartialOffsets { return 0 }
         guard phase == .repairing, let rewriter else { return nil }
         return rewriter.plan.shift - rewriter.plan.decodeLead
     }
 
     /// Returns true when the packet was taken over by the session and must not be emitted yet.
     /// A packet the session keeps is owned by it until `dequeue()` hands it back.
-    func ingest(_ packet: UnsafeMutablePointer<AVPacket>) -> Bool {
+    func ingest(_ packet: UnsafeMutablePointer<AVPacket>) throws -> Bool {
         switch phase {
         case .off:
-            return false
+            return monitorsPartialOffsets ? try partialRepairCandidate?.ingest(packet) ?? false : false
         case .repairing:
             guard packet.pointee.stream_index == streamIndex else { return false }
             applyRepair(to: packet, pictureOrderCount: reader?.pictureOrderCount(for: packet))
@@ -716,8 +723,9 @@ final class H264CompositionOffsetRepairSession: H264TimestampRepairSession {
     }
 
     /// EOF during sampling. Decides on what is there, so the held packets are still delivered.
-    func endOfStream() {
+    func endOfStream() throws {
         if phase == .sampling { decide() }
+        if monitorsPartialOffsets { try partialRepairCandidate?.endOfStream() }
     }
 
     func noteSeek() {
@@ -728,6 +736,7 @@ final class H264CompositionOffsetRepairSession: H264TimestampRepairSession {
         // file (verdict `.off`, sample still held) put two duplicate pictures into the stream a
         // producer had already emitted.
         dropHeldPackets()
+        partialRepairCandidate?.noteSeek()
         switch phase {
         case .sampling:
             // The sample restarts where the source now stands.
@@ -756,8 +765,9 @@ final class H264CompositionOffsetRepairSession: H264TimestampRepairSession {
     }
 
     func dequeue() -> UnsafeMutablePointer<AVPacket>? {
-        guard phase != .sampling, !held.isEmpty else { return nil }
-        return held.removeFirst().packet
+        guard phase != .sampling else { return nil }
+        if !held.isEmpty { return held.removeFirst().packet }
+        return monitorsPartialOffsets ? partialRepairCandidate?.dequeue() : nil
     }
 
     var summary: String {
@@ -773,7 +783,11 @@ final class H264CompositionOffsetRepairSession: H264TimestampRepairSession {
         isISOBaseMediaFile: Bool,
         isH264: Bool
     ) -> H264CompositionOffsetRepairDiagnostic {
-        H264CompositionOffsetRepairDiagnostic(
+        if monitorsPartialOffsets, let partialRepairCandidate, partialRepairCandidate.hasDecision {
+            return partialRepairCandidate.diagnostic(sourceSeekable: sourceSeekable,
+                isISOBaseMediaFile: isISOBaseMediaFile, isH264: isH264)
+        }
+        return H264CompositionOffsetRepairDiagnostic(
             outcome: diagnosticOutcome,
             reason: diagnosticReason,
             sourceSeekable: sourceSeekable,
@@ -852,6 +866,12 @@ final class H264CompositionOffsetRepairSession: H264TimestampRepairSession {
                 category: .demux
             )
         case .healthy:
+            // Corroborate the edit/index lead with an actual healthy origin picture. A random
+            // nonzero B-picture offset is not enough evidence to retime a later region.
+            if let first = samples.first, first.isKeyframe, first.pictureOrderCount == 0,
+               first.dts == ladderStart, first.pts == streamStartTime {
+                monitorsPartialOffsets = partialRepairCandidate != nil
+            }
             diagnosticOutcome = .healthy
             diagnosticReason = .compositionOffsetsPresent
             verdictDescription = "healthy"
