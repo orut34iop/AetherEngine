@@ -10,6 +10,11 @@ the public-API contract.
 
 ## [Unreleased]
 
+- Moonfin compatibility candidate: bounded H.264 VOD recovery-point detection
+  selects libavcodec for repeated non-IDR immediate/exact recovery keys, to test
+  persistent post-seek native HLS frame-rate collapse. Physical acceptance pending;
+  regular IDR hardware playback is unchanged.
+
 - Moonfin post-seek diagnostics: optional source/item decode timestamps, mux sample
   duration, observed H.264 NAL types and write result on `NativeVideoFrameTime`.
   Existing initializers retain nil defaults. No playback behavior is changed.

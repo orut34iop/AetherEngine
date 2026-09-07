@@ -7,6 +7,10 @@ import Combine
 @MainActor
 public final class EngineDiagnostics: ObservableObject {
 
+    /// Number of positively identified non-IDR immediate/exact recovery-point
+    /// key packets in the bounded VOD routing sample. nil means not sampled.
+    @Published public internal(set) var h264RecoveryPointKeyCount: Int?
+
     /// 1 Hz snapshot while playing/paused; nil while idle. Cleared in stopInternal so sessions don't inherit stale numbers.
     @Published public internal(set) var liveTelemetry: LiveTelemetry?
 

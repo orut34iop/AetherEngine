@@ -25,6 +25,19 @@ Interlaced sources (DVD-rip MPEG-2, SD / HD broadcast H.264) are deinterlaced th
 
 ### MP4 without composition offsets
 
+The Moonfin fork is separately validating a recovery-point compatibility gate:
+on seekable H.264 VOD, a bounded sample of at most 180 video / 600 total packets
+and three seconds of between-read wall-clock checks looks for three container-key
+packets containing non-IDR slices and immediate/exact recovery-point SEI. Only
+that positive evidence selects the libavcodec path. Reads still use the existing
+reader timeout, and the consumed probe is rewound before reuse. This is distinct
+from missing composition offsets and does not repair or rewrite timestamps.
+The candidate costs software decode for that detected class and needs physical
+performance/sync acceptance. Apple HLS requires IDR segment starts, but a recovery
+point is not necessarily an invalid or undecodable picture: do not generalize this
+route's observed failure to every VideoToolbox integration or every non-IDR stream.
+
+
 Some writers emit a sample table with no `ctts` while the H.264 bitstream still reorders pictures.
 Every sample then reports `PTS == DTS`, and since the native route stream-copies those timestamps
 into fMP4, AVPlayer is handed decode order as presentation order: each future reference picture is

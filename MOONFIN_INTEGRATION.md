@@ -5,6 +5,19 @@ application.
 
 ## 6.71.0 integration verification
 
+- Recovery-point compatibility candidate (2026-09-07): three user-reported H.264
+  MP4 assets have non-IDR I slices with immediate/exact recovery-point SEI every
+  12 frames. Native tvOS output falls from about 30 to 3 fps after cached seeks,
+  while target-segment DTS/duration and mux writes remain healthy. The new bounded
+  VOD sample selects libavcodec only after three positively identified non-IDR
+  recovery keys; ordinary IDR, absent/malformed evidence, live and non-H.264 routes
+  are unchanged. This is a compatibility candidate, not yet physical acceptance.
+  No bitstream/timestamp rewrite or host UI change is included. CPU cost and
+  audio/video sync must be checked on the actual Apple TV. The public numeric
+  `diagnostics.h264RecoveryPointKeyCount` records why this route was selected.
+  `bash Scripts/test-h264-recovery-point.sh` executes the pure parser/evidence tests
+  without building a host app; the matching Testing suite is retained for CI.
+
 - Post-seek investigation (2026-09-07): source-compatible optional native-frame
   metadata now reports source/item DTS, mux duration, H.264 NAL-type mask and write
   result. This is observation only, not a cadence repair; it does not change packet
