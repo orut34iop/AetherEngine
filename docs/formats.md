@@ -52,8 +52,12 @@ healthy MKV/MP4 and missing-ctts controls), and
 `bash Scripts/test-h264-timestamp-runtime.sh <local-file> 0 700 3600` (actual parser,
 packet preservation, two libavcodec decoders, seek and ownership checks against the
 frozen FFmpegBuild). The runtime diagnostic prints no paths, payloads or pictures.
-Physical Apple TV acceptance of this new repair is pending; host decoding tests
-are not optical proof of smooth presentation.
+Physical Apple TV candidate `20260907140332` passed the reporter's from-head and
+seek reproduction on 2026-09-07. Matching device logs confirm hardware routing,
+`confirmed_matroska_coding_order` (60 pictures, 20 POC regressions, 34 ms decode
+lead), successful forward/backward seek landings and zero reported drops/stalls.
+Acceptance covers that short reproduction, not a full-film or exhaustive codec
+soak; host decoding tests alone are not optical proof of smooth presentation.
 
 ### MP4 without composition offsets
 
