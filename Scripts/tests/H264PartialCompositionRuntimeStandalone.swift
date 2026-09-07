@@ -127,20 +127,23 @@ struct H264PartialCompositionRuntimeTests {
             precondition(session.dequeue() == nil && PacketBalanceTracker.alive == 0,
                 "seek must release both pending input and partly drained output")
         }
-        try seek()
-        var confirmed = false
-        for _ in 0..<2000 {
-            try read()
-            if session.diagnostic(sourceSeekable: true, isISOBaseMediaFile: true, isH264: true)
-                .reason == .confirmedPartialCompositionOffsets { confirmed = true; break }
+        for malformedDTS: Int64 in [Int64.min, 0] {
+            try seek()
+            var confirmed = false
+            for _ in 0..<2000 {
+                try read()
+                if session.diagnostic(sourceSeekable: true, isISOBaseMediaFile: true, isH264: true)
+                    .reason == .confirmedPartialCompositionOffsets { confirmed = true; break }
+            }
+            precondition(confirmed)
+            guard let malformed = trackedPacketAlloc() else { throw Failure.demux }
+            malformed.pointee.stream_index = index
+            malformed.pointee.dts = malformedDTS
+            do { _ = try session.ingest(malformed); throw Failure.session }
+            catch H264PartialCompositionRepairSession.RepairError.sequenceNoLongerRepairable { }
+            precondition(PacketBalanceTracker.alive == 0 && session.dequeue() == nil)
+            session.noteSeek()
         }
-        precondition(confirmed)
-        guard let malformed = trackedPacketAlloc() else { throw Failure.demux }
-        malformed.pointee.stream_index = index
-        do { _ = try session.ingest(malformed); throw Failure.session }
-        catch H264PartialCompositionRepairSession.RepairError.sequenceNoLongerRepairable { }
-        precondition(PacketBalanceTracker.alive == 0 && session.dequeue() == nil)
-        session.noteSeek()
         try seek()
         for _ in 0..<3 { try read() }
         // Pending video plus empty auxiliary packets must hit the all-stream bound without

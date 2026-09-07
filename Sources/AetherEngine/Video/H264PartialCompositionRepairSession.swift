@@ -79,6 +79,13 @@ final class H264PartialCompositionRepairSession {
             do { try finishSequence(nextDTS: packet.pointee.dts) }
             catch { var owned: UnsafeMutablePointer<AVPacket>? = packet; trackedPacketFree(&owned); throw error }
         }
+        // A missing timestamp differs numerically from a valid one but is NOT evidence of
+        // healthy composition offsets. Preserve ownership and use the same refusal policy.
+        if packet.pointee.pts == Int64.min || packet.pointee.dts == Int64.min {
+            append(packet, poc: nil); videoCount += 1
+            try refuse()
+            return true
+        }
         let offsets = packet.pointee.pts != packet.pointee.dts
         if offsets {
             // Genuine composition offsets always win. A mixed/unsupported sequence is emitted
