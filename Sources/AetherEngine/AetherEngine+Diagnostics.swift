@@ -502,6 +502,11 @@ extension AetherEngine {
         return Int64(bytes)
     }
 
+    /// Short metadata lock only; never reads the packet store from the main actor.
+    var softwarePacketCacheSnapshot: SoftwarePacketReadAhead.Snapshot? {
+        softwareHost?.vodPacketCacheSnapshot
+    }
+
     /// Freshly stat-ed on-disk footprint of the segment cache. nil when no native session is active. Used by `aetherctl live --report-cache-bytes`.
     public var segmentCacheDiskBytes: Int64? {
         nativeVideoSession?.segmentCacheDiskBytes

@@ -38,6 +38,11 @@ public struct LiveTelemetry: Equatable, Sendable {
     /// the first metrics read. Cumulative for the session, so a rate comes from differencing two ticks.
     public let accumulatedFrameDelaySeconds: Double?
     public let cachedBytes: Int64?
+    /// Session-local compressed-packet cache counters. nil outside software VOD. A hit reuses
+    /// retained packets without changing the source epoch; a miss requires a source reposition.
+    public let softwareCacheSeekHits: UInt64?
+    public let softwareCacheSeekMisses: UInt64?
+    public let softwareCacheSourceEpoch: UInt64?
     /// The rate the source link delivers at while it is delivering, so it stays comparable between the
     /// two paths: `observedBitrate` from the access log on native, and on the software path the
     /// demuxer's own byte counter over the seconds bytes arrived in (#306 follow-up). Not a wall-clock
@@ -86,6 +91,9 @@ public struct LiveTelemetry: Equatable, Sendable {
         readerWindowAheadBytes: Int? = nil,
         accumulatedFrameDelaySeconds: Double? = nil,
         cachedBytes: Int64?,
+        softwareCacheSeekHits: UInt64? = nil,
+        softwareCacheSeekMisses: UInt64? = nil,
+        softwareCacheSourceEpoch: UInt64? = nil,
         networkThroughputMbps: Double?,
         networkTransferredBytes: Int64?,
         avSyncGapMs: Double?,
@@ -107,6 +115,9 @@ public struct LiveTelemetry: Equatable, Sendable {
         self.readerWindowAheadBytes = readerWindowAheadBytes
         self.accumulatedFrameDelaySeconds = accumulatedFrameDelaySeconds
         self.cachedBytes = cachedBytes
+        self.softwareCacheSeekHits = softwareCacheSeekHits
+        self.softwareCacheSeekMisses = softwareCacheSeekMisses
+        self.softwareCacheSourceEpoch = softwareCacheSourceEpoch
         self.networkThroughputMbps = networkThroughputMbps
         self.networkTransferredBytes = networkTransferredBytes
         self.avSyncGapMs = avSyncGapMs

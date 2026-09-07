@@ -13,9 +13,9 @@ private final class Locked<Value>: @unchecked Sendable {
 private final class PendingRead: @unchecked Sendable {
     let completed = DispatchSemaphore(value: 0)
     private let result = Locked<Result<SoftwareStoredPacket?, Error>?>(nil)
-    init(_ source: SoftwarePacketReadAhead) {
+    init(_ source: SoftwarePacketReadAhead, isCurrent: @escaping @Sendable () -> Bool = { true }) {
         DispatchQueue.global().async {
-            let answer = Result { try source.read() }
+            let answer = Result { try source.read(isCurrent: isCurrent) }
             self.result.withValue { $0 = answer }
             self.completed.signal()
         }
@@ -48,12 +48,12 @@ private func check(_ condition: @autoclosure () throws -> Bool,
 struct SoftwarePacketReadAheadTests {
     static let video = SoftwarePacketReadAhead.Stream(index: 0, numerator: 1, denominator: 1)
     static let audio = SoftwarePacketReadAhead.Stream(index: 1, numerator: 1, denominator: 1)
-    enum SourceFailure: Error { case rejected, deliberate }
+    enum SourceFailure: Error { case rejected, deliberate, retainedBudgetBoundary }
 
     static func packet(_ pts: Int64, stream: Int32 = 0, duration: Int64 = 1,
-                       marker: UInt8 = 7, payloadSize: Int = 8) -> SoftwareStoredPacket {
+                       marker: UInt8 = 7, payloadSize: Int = 8, flags: Int32 = 0x21) -> SoftwareStoredPacket {
         SoftwareStoredPacket(pts: pts, dts: pts - 2, duration: duration,
-            position: 123_456 + pts, streamIndex: stream, flags: 0x21,
+            position: 123_456 + pts, streamIndex: stream, flags: flags,
             timeBaseNumerator: 1, timeBaseDenominator: 1,
             bytes: Data(repeating: marker, count: payloadSize),
             sideData: [.init(type: 0, bytes: Data([0, 1, 0, 255])),
@@ -62,12 +62,16 @@ struct SoftwarePacketReadAheadTests {
 
     static func make(_ root: URL, audio: SoftwarePacketReadAhead.Stream? = nil,
                      budget: Int = 1_000_000, seconds: Double = 100, clock: Double = 0,
+                     retainConsumed: Bool = false, chunkTargetBytes: Int = 1024,
+                     videoReorderDepth: Int? = nil,
                      beforeConsumerOperation: (@Sendable () -> Void)? = nil,
                      read: @escaping @Sendable (@Sendable () -> Bool) throws -> SoftwareStoredPacket?) throws
         -> (SoftwarePacketReadAhead, SoftwarePacketDiskFIFO) {
-        let fifo = try SoftwarePacketDiskFIFO(chunkTargetBytes: 1024, parentDirectory: root)
+        let fifo = try SoftwarePacketDiskFIFO(chunkTargetBytes: chunkTargetBytes,
+                                             retainConsumed: retainConsumed, parentDirectory: root)
         let source = SoftwarePacketReadAhead(video: video, audio: audio,
             byteBudget: budget, forwardSeconds: seconds, initialSourceClock: clock, fifo: fifo,
+            videoReorderDepth: videoReorderDepth,
             beforeConsumerOperation: beforeConsumerOperation, readSource: read)
         return (source, fifo)
     }
@@ -89,13 +93,21 @@ struct SoftwarePacketReadAheadTests {
         try sourceLockAdmission(root)
         try closeUnblocksConsumer(root)
         try byteBound(root)
+        try exactResidentBudgetBoundary(root)
         try timeBoundAndPlayhead(root)
         try selectedAVCoverage(root)
         try delayedOldConsumer(root)
         try explicitFailure(root)
         try closeBeforeStart(root)
+        try retainedForwardAndBackwardSeek(root)
+        try retainedCacheMissAndRapidSeeks(root)
+        try retainedSeekPreservesInFlightProducer(root)
+        try retainedSeekRetiresOldConsumer(root)
+        try expiredKeyframeCannotRestore(root)
+        try staleHostAdmission(root)
+        try successorCoverageIntegration(root)
         try check(FileManager.default.contentsOfDirectory(atPath: root.path).isEmpty)
-        print("PASS: packet metadata/side-data, EOF/errors, seek reset/rapid seeks, source-lock admission, close wake, byte/time bounds, A/V gaps, delayed old consumer")
+        print("PASS: packet metadata/side-data, EOF/errors, seek reset/rapid seeks, source-lock admission, close wake, byte/time bounds, exact resident-budget refill, A/V gaps, delayed old consumer; retained forward/backward seeks, cache miss/eviction, in-flight producer, stale host admission, successor coverage")
     }
 
     static func roundTripAndEOF(_ root: URL) throws {
@@ -266,6 +278,45 @@ struct SoftwarePacketReadAheadTests {
         close(source, fifo)
     }
 
+    static func exactResidentBudgetBoundary(_ root: URL) throws {
+        let sample = packet(0)
+        let recordBytes = try sample.encoded().count + 8 // the FIFO length prefix is resident too
+        let exactBudget = recordBytes * 4
+        let calls = Locked(0)
+        let refill = DispatchSemaphore(value: 0)
+        let (source, fifo) = try make(root, budget: exactBudget, retainConsumed: true,
+                                     chunkTargetBytes: recordBytes) { accepts in
+            try calls.withValue { value in
+                guard accepts() else { throw SourceFailure.rejected }
+                value += 1
+                if value == 5 { refill.signal() }
+                return sample
+            }
+        }
+        source.start()
+        eventually("exact-budget fixture did not park at four resident records") {
+            source.snapshot.packetCount == 4 && source.snapshot.residentBytes == exactBudget
+        }
+        precondition(calls.withValue { $0 } == 4)
+        // One complete consumed chunk is now evictable while THREE unread packets remain.
+        // Refill must resume here, not wait until the consumer drains the whole queue.
+        try check(PendingRead(source).finish().get() == sample)
+        if refill.wait(timeout: .now() + 2) != .success {
+            let state = source.snapshot
+            close(source, fifo)
+            FileHandle.standardError.write(Data(
+                "FAIL: exact resident budget stranded producer with \(state.packetCount) unread packets and \(state.residentBytes)/\(exactBudget) resident bytes\n".utf8))
+            throw SourceFailure.retainedBudgetBoundary
+        }
+        eventually("exact-budget refill did not restore four forward packets") {
+            source.snapshot.packetCount == 4
+        }
+        precondition(source.snapshot.residentBytes == exactBudget)
+        precondition((fifo.snapshot.oldestRetainedChunkID ?? 0) > 0,
+                     "refill was funded without removing the consumed history chunk")
+        close(source, fifo)
+    }
+
     static func selectedAVCoverage(_ root: URL) throws {
         // Decode-order B-picture gap and slower selected audio each limit the frontier.
         let packets = [packet(0), packet(2), packet(0, stream: 1), packet(1), packet(2, stream: 1)]
@@ -340,5 +391,239 @@ struct SoftwarePacketReadAheadTests {
         close(source, fifo)
         source.start()
         precondition(fifo.snapshot.isClosed)
+    }
+
+    static func keyPacket(_ pts: Int64) -> SoftwareStoredPacket {
+        packet(pts, marker: UInt8(pts % 251), flags: pts % 10 == 0 ? 1 : 0)
+    }
+
+    static func retainedForwardAndBackwardSeek(_ root: URL) throws {
+        let state = Locked((next: Int64(0), reads: 0))
+        let (source, fifo) = try make(root, retainConsumed: true) { accepts in
+            try state.withValue { state in
+                guard accepts() else { throw SourceFailure.rejected }
+                state.reads += 1
+                guard state.next <= 30 else { return nil }
+                defer { state.next += 1 }; return keyPacket(state.next)
+            }
+        }
+        source.start()
+        eventually("retained source did not fill") { source.snapshot.sourceEnded }
+        let originalReads = state.withValue { $0.reads }
+        let originalEpoch = source.snapshot.sourceEpoch
+        let originalResident = source.snapshot.residentBytes
+        precondition(originalResident > 0 && source.snapshot.frontier == 31)
+        for pts: Int64 in 0...10 { try check(PendingRead(source).finish().get() == keyPacket(pts)) }
+        source.updatePlayhead(10)
+
+        for (hit, target): (Int, Double) in [(1, 20), (2, 10), (3, 20)] {
+            let token = source.beginSeek(to: target)
+            precondition(source.snapshot.residentBytes == originalResident,
+                         "begin cached seek discarded resident storage")
+            try check(source.prepareSeek(token, to: target), "covered target was treated as source seek")
+            source.endSeek(token, sourceClock: target)
+            precondition(source.snapshot.sourceEpoch == originalEpoch)
+            precondition(source.snapshot.cacheSeekHits == hit)
+            precondition(source.snapshot.frontier == 31, "cached seek collapsed the forward frontier")
+            let first = try PendingRead(source).finish().get()!
+            precondition(first.flags & 1 != 0 && Double(first.pts) <= target,
+                         "cache replay did not start at an earlier retained key packet")
+            precondition(first == keyPacket(first.pts), "cache replay changed packet metadata")
+            try check(PendingRead(source).finish().get() == keyPacket(first.pts + 1))
+            precondition(state.withValue { $0.reads } == originalReads,
+                         "cached seek read the original source again")
+        }
+        close(source, fifo)
+    }
+
+    static func retainedCacheMissAndRapidSeeks(_ root: URL) throws {
+        let state = Locked((next: Int64(0), limit: Int64(30)))
+        let (source, fifo) = try make(root, retainConsumed: true) { accepts in
+            try state.withValue { state in
+                guard accepts() else { throw SourceFailure.rejected }
+                guard state.next <= state.limit else { return nil }
+                defer { state.next += 1 }; return keyPacket(state.next)
+            }
+        }
+        source.start()
+        eventually("rapid-seek fixture did not fill") { source.snapshot.sourceEnded }
+        let initialEpoch = source.snapshot.sourceEpoch
+        let old = source.beginSeek(to: 20)
+        try check(source.prepareSeek(old, to: 20))
+        let current = source.beginSeek(to: 100)
+        // An already superseded prepare must neither restore an old cursor nor reset the new aim.
+        do {
+            let restored = try source.prepareSeek(old, to: 20)
+            precondition(!restored, "superseded prepare restored an old cache target")
+        } catch SoftwarePacketReadAhead.ReadError.interrupted { }
+        source.endSeek(old, sourceClock: 20)
+        precondition(source.snapshot.seeking && source.snapshot.generation == current)
+        precondition(source.snapshot.sourceEpoch == initialEpoch)
+        try check(!source.prepareSeek(current, to: 100), "uncached target claimed a cache hit")
+        precondition(source.snapshot.sourceEpoch == initialEpoch + 1)
+        precondition(source.snapshot.residentBytes == 0 && source.snapshot.packetCount == 0)
+        precondition(source.snapshot.cacheSeekMisses == 1)
+        state.withValue { $0 = (100, 105) } // represents the caller's serialized real source seek
+        source.endSeek(current, sourceClock: 100)
+        try check(PendingRead(source).finish().get() == keyPacket(100))
+        eventually("post-miss fixture did not finish") { source.snapshot.sourceEnded }
+        precondition(source.snapshot.frontier == 106)
+        close(source, fifo)
+    }
+
+    static func retainedSeekPreservesInFlightProducer(_ root: URL) throws {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let state = Locked(Int64(0))
+        let (source, fifo) = try make(root, retainConsumed: true) { accepts in
+            let pts = try state.withValue { value in
+                guard accepts() else { throw SourceFailure.rejected }
+                defer { value += 1 }; return value
+            }
+            if pts == 31 {
+                entered.signal()
+                requireSignal(release, "cached seek did not release in-flight producer")
+            }
+            return pts <= 31 ? keyPacket(pts) : nil
+        }
+        source.start()
+        requireSignal(entered, "producer did not pause after retained prefix")
+        precondition(source.snapshot.frontier == 31)
+        let epoch = source.snapshot.sourceEpoch
+        let token = source.beginSeek(to: 20)
+        try check(source.prepareSeek(token, to: 20), "blocked source prevented an available cache hit")
+        source.endSeek(token, sourceClock: 20)
+        precondition(source.snapshot.sourceEpoch == epoch)
+        release.signal()
+        eventually("same-epoch producer did not publish its tail") { source.snapshot.sourceEnded }
+        precondition(source.snapshot.frontier == 32, "cached seek discarded an in-flight producer packet")
+        let first = try PendingRead(source).finish().get()!
+        precondition(first.flags & 1 != 0 && first.pts <= 20)
+        if first.pts < 31 {
+            for pts in (first.pts + 1)...31 { try check(PendingRead(source).finish().get() == keyPacket(pts)) }
+        }
+        try check(PendingRead(source).finish().get() == nil)
+        close(source, fifo)
+    }
+
+    static func expiredKeyframeCannotRestore(_ root: URL) throws {
+        let next = Locked(Int64(0))
+        let (source, fifo) = try make(root, budget: 1400, retainConsumed: true,
+                                     chunkTargetBytes: 512) { accepts in
+            try next.withValue { value in
+                guard accepts() else { throw SourceFailure.rejected }
+                guard value <= 40 else { return nil }
+                defer { value += 1 }; return keyPacket(value)
+            }
+        }
+        source.start()
+        for pts: Int64 in 0...30 {
+            try check(PendingRead(source).finish().get() == keyPacket(pts))
+            source.updatePlayhead(Double(pts))
+        }
+        eventually("consumed history was not trimmed") {
+            (fifo.snapshot.oldestRetainedChunkID ?? 0) > 0
+        }
+        let token = source.beginSeek(to: 0)
+        try check(!source.prepareSeek(token, to: 0), "evicted keyframe bookmark remained seekable")
+        precondition(source.snapshot.cacheSeekMisses == 1)
+        precondition(source.snapshot.residentBytes == 0)
+        // Leave the miss held; no source reposition is performed by this storage-lifetime test.
+        close(source, fifo)
+    }
+
+    static func retainedSeekRetiresOldConsumer(_ root: URL) throws {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let hookCalls = Locked(0)
+        let next = Locked(Int64(0))
+        let (source, fifo) = try make(root, retainConsumed: true, beforeConsumerOperation: {
+            let first = hookCalls.withValue { value in defer { value += 1 }; return value == 0 }
+            if first { entered.signal(); requireSignal(release, "old cached consumer was not released") }
+        }) { accepts in
+            try next.withValue { value in
+                guard accepts() else { throw SourceFailure.rejected }
+                guard value <= 30 else { return nil }
+                defer { value += 1 }; return keyPacket(value)
+            }
+        }
+        source.start()
+        eventually("cached old-consumer fixture did not finish") { source.snapshot.sourceEnded }
+        let sourceEpoch = source.snapshot.sourceEpoch
+        let oldConsumer = PendingRead(source)
+        requireSignal(entered, "old cached consumer did not pause before cursor operation")
+        let token = source.beginSeek(to: 20)
+        try check(source.prepareSeek(token, to: 20))
+        source.endSeek(token, sourceClock: 20)
+        let restoredCount = source.snapshot.packetCount
+        release.signal()
+        switch oldConsumer.finish() {
+        case .failure(SoftwarePacketReadAhead.ReadError.interrupted): break
+        default: preconditionFailure("old consumer escaped a cache-hit generation change")
+        }
+        precondition(source.snapshot.packetCount == restoredCount,
+                     "old consumer consumed the restored cache cursor")
+        precondition(source.snapshot.sourceEpoch == sourceEpoch)
+        let first = try PendingRead(source).finish().get()!
+        precondition(first.flags & 1 != 0 && first.pts <= 20)
+        try check(PendingRead(source).finish().get() == keyPacket(first.pts + 1))
+        close(source, fifo)
+    }
+
+    static func staleHostAdmission(_ root: URL) throws {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let hookCount = Locked(0)
+        let hostCurrent = Locked(true)
+        let next = Locked(Int64(0))
+        let (source, fifo) = try make(root, beforeConsumerOperation: {
+            let first = hookCount.withValue { value in defer { value += 1 }; return value == 0 }
+            if first { entered.signal(); requireSignal(release, "stale host consumer was not released") }
+        }) { accepts in
+            try next.withValue { value in
+                guard accepts() else { throw SourceFailure.rejected }
+                guard value == 0 else { return nil }
+                value += 1; return packet(0)
+            }
+        }
+        source.start()
+        eventually("host-admission fixture did not end") { source.snapshot.sourceEnded }
+        let pending = PendingRead(source, isCurrent: { hostCurrent.withValue { $0 } })
+        requireSignal(entered, "host consumer was not paused before FIFO pop")
+        hostCurrent.withValue { $0 = false }
+        release.signal()
+        switch pending.finish() {
+        case .failure(SoftwarePacketReadAhead.ReadError.interrupted): break
+        default: preconditionFailure("stale host consumer read a packet")
+        }
+        precondition(source.snapshot.packetCount == 1, "host admission ran after a destructive pop")
+        try check(PendingRead(source).finish().get() == packet(0))
+        switch PendingRead(source, isCurrent: { false }).finish() {
+        case .failure(SoftwarePacketReadAhead.ReadError.interrupted): break
+        default: preconditionFailure("stale host consumer observed EOF as a current result")
+        }
+        try check(PendingRead(source).finish().get() == nil)
+        close(source, fifo)
+    }
+
+    static func successorCoverageIntegration(_ root: URL) throws {
+        // One-second tick fixture exercises successor semantics without relying on packet duration.
+        // The long packet duration belongs to decode cadence and must not extend final coverage.
+        let packets = [packet(0), packet(3, duration: 16), packet(2), packet(1), packet(4), packet(5)]
+        let next = Locked(0)
+        let (source, fifo) = try make(root, videoReorderDepth: 3) { accepts in
+            try next.withValue { value in
+                guard accepts() else { throw SourceFailure.rejected }
+                guard value < packets.count else { return nil }
+                defer { value += 1 }; return packets[value]
+            }
+        }
+        source.start()
+        eventually("successor fixture did not reach true EOF") { source.snapshot.sourceEnded }
+        precondition(source.snapshot.frontier == 5,
+                     "successor model used packet decode duration or failed to finalize at EOF")
+        source.updatePlayhead(5)
+        precondition(source.snapshot.frontier == nil, "unknown final frame end was fabricated")
+        close(source, fifo)
     }
 }

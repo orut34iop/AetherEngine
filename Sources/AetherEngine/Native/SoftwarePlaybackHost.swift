@@ -114,7 +114,8 @@ final class SoftwarePlaybackHost {
         return max(0, frontier - max(0, clockSessionZero))
     }
 
-    var cachedVODBytes: Int64? { vodPacketReadAhead.map { Int64($0.snapshot.bytes) } }
+    var cachedVODBytes: Int64? { vodPacketReadAhead.map { Int64($0.snapshot.residentBytes) } }
+    var vodPacketCacheSnapshot: SoftwarePacketReadAhead.Snapshot? { vodPacketReadAhead?.snapshot }
 
     private let demuxQueue = DispatchQueue(label: "engine.sw.demux", qos: .userInitiated)
 
@@ -324,6 +325,17 @@ final class SoftwarePlaybackHost {
     nonisolated var seekWindowOpen: Bool {
         feedLock.lock(); defer { feedLock.unlock() }
         return SeekWindow.isOpen(requested: _seekGeneration, settled: _settledSeekGeneration)
+    }
+
+    /// A single seek-state snapshot is needed for packet, EOF and error admission. Reading the
+    /// generation and window separately can straddle a seek that opens and settles between them.
+    nonisolated private func admitsRead(generation: UInt64) -> Bool {
+        feedLock.lock()
+        let requested = _seekGeneration
+        let settled = _settledSeekGeneration
+        feedLock.unlock()
+        return SoftwareReadAdmission.admits(readGeneration: generation,
+            requestedGeneration: requested, settledGeneration: settled, stopRequested: stopRequested)
     }
 
     nonisolated private func noteSeekSettled(_ generation: UInt64) {
@@ -849,6 +861,7 @@ final class SoftwarePlaybackHost {
                           denominator: $0.pointee.time_base.den)
                 } : nil
             let initialSourceClock = initialClockTime.seconds
+            let videoReorderDepth: Int? = vCodecID == AV_CODEC_ID_H264.rawValue ? 32 : nil
             let cacheResult = await Task.detached(priority: .utility) { () throws -> SoftwarePacketReadAhead? in
                 let temp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
                 let available = (try? temp.resourceValues(forKeys: [.volumeAvailableCapacityKey]))?
@@ -862,11 +875,13 @@ final class SoftwarePlaybackHost {
                 let bytes = min(budget.volumeSafetyLimitBytes,
                                 budget.baseEffectiveBytes > 0 ? budget.baseEffectiveBytes : 32 << 20)
                 guard bytes > 0 else { return Optional<SoftwarePacketReadAhead>.none }
-                let fifo = try SoftwarePacketDiskFIFO()
+                let fifo = try SoftwarePacketDiskFIFO(
+                    chunkTargetBytes: min(4 << 20, max(8, bytes)), retainConsumed: true)
                 return SoftwarePacketReadAhead(
                     video: video, audio: audio, byteBudget: bytes,
                     forwardSeconds: Double(segments) * 4,
-                    initialSourceClock: initialSourceClock, fifo: fifo
+                    initialSourceClock: initialSourceClock, fifo: fifo,
+                    videoReorderDepth: videoReorderDepth
                 ) { isCurrent in
                     guard let packet = try dem.readPacket(isCurrent: isCurrent) else { return nil }
                     defer { av_packet_unref(packet); av_packet_free_safe(packet) }
@@ -986,9 +1001,11 @@ final class SoftwarePlaybackHost {
             lastAudioPts: demuxDiag.snapshot.lastAudioPts
         )
         guard tail > 0 else { return parkClockNow() }
+        let generation = seekGeneration
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(tail * 1_000_000_000))
-            self?.parkClockNow()
+            guard let self, self.admitsRead(generation: generation) else { return }
+            self.parkClockNow()
         }
     }
 
@@ -1060,12 +1077,17 @@ final class SoftwarePlaybackHost {
     /// that read (App Hangs of 4.4 s and 5.2 s in the field on a WAN source).
     @discardableResult
     func seek(to seconds: Double) async -> Demuxer.RepositionOutcome {
+        guard !stopRequested else { return .superseded }
         guard let dem = demuxer else { return .stalled }
         // Stop loop + bump generation to invalidate in-flight packets. Captured right after, so the
         // reposition can tell on `seekQueue` whether a newer seek has already taken over.
         bumpSeekGeneration()
         let generation = seekGeneration
-        let cacheGeneration = vodPacketReadAhead?.beginSeek()
+        didReachEnd = false
+        didParkClockAtEnd = false
+        didEmitParkedDiag = false
+        let packetSource = vodPacketReadAhead
+        let cacheGeneration = packetSource?.beginSeek(to: seconds)
         // #292: inside another seek's window `isPlaying` is that seek's parked flag, not the transport's
         // intent. Inherit what it captured, and hand the same value on to whoever supersedes this one.
         let wasPlaying = SeekResumeIntent.resolve(isPlaying: isPlaying,
@@ -1106,9 +1128,50 @@ final class SoftwarePlaybackHost {
         videoDecoder.skipUntilPTS = targetTime
         renderer.setSkipThreshold(targetTime)
 
-        let outcome = await dem.seekBounded(
-            to: seconds, timeout: Self.seekBudgetSeconds, on: seekQueue,
-            isSuperseded: { [weak self] in self?.seekGeneration != generation })
+        var cacheHit = false
+        if let packetSource, let cacheGeneration {
+            let preparation = await Task.detached(priority: .userInitiated) {
+                try packetSource.prepareSeek(cacheGeneration, to: seconds)
+            }.result
+            guard seekGeneration == generation, !stopRequested else { return .superseded }
+            switch preparation {
+            case .success(let hit):
+                cacheHit = hit
+                EngineLog.emit(
+                    "[SWHost] packet cache seek generation=\(generation) "
+                    + "result=\(hit ? "hit" : "miss") "
+                    + "target_s=\(String(format: "%.3f", seconds)) "
+                    + "resident_bytes=\(packetSource.snapshot.residentBytes)",
+                    category: .swPlayback
+                )
+            case .failure(SoftwarePacketReadAhead.ReadError.interrupted),
+                 .failure(SoftwarePacketReadAhead.ReadError.closed):
+                return .superseded
+            case .failure:
+                // A corrupt/unreadable retained packet must not be silently skipped or treated as
+                // a normal cache miss. Leave playback parked and publish an explicit failure.
+                seekInFlight = false
+                packetSource.close()
+                noteSeekSettled(generation)
+                EngineLog.emit("[SWHost] packet cache seek generation=\(generation) result=error",
+                               category: .swPlayback)
+                failure = PlaybackErrorInfo(kind: .softwarePipelineFailed,
+                                            message: "Playback cache could not reposition.")
+                return .stalled
+            }
+        }
+        let outcome: Demuxer.RepositionOutcome
+        if cacheHit {
+            // The decode cursor now points at retained preroll. The source reader remains at its
+            // existing frontier; seeking it too would duplicate or skip already retained packets.
+            outcome = .landed
+        } else {
+            outcome = await dem.seekBounded(
+                to: seconds, timeout: Self.seekBudgetSeconds, on: seekQueue,
+                isSuperseded: { [weak self] in
+                    self?.seekGeneration != generation || (self?.stopRequested ?? true)
+                })
+        }
         // A newer seek owns the state from here: it published its own target and clears the hold itself.
         // stop() can also land in the await now that this suspends, and re-arming the clock or flipping
         // isPlaying on a torn-down session would resurrect a loop that has already been told to quit.
@@ -1147,7 +1210,7 @@ final class SoftwarePlaybackHost {
         // The source stands at the target and the clock is anchored on it: everything the loop
         // reads from here belongs to this position. Closing the window releases the loop.
         noteSeekSettled(generation)
-        if let cacheGeneration { vodPacketReadAhead?.endSeek(cacheGeneration, sourceClock: seconds) }
+        if let cacheGeneration { packetSource?.endSeek(cacheGeneration, sourceClock: seconds) }
         return outcome
     }
 
@@ -1325,21 +1388,30 @@ final class SoftwarePlaybackHost {
         let subIndices = subtitleStreamIndices
         let subTimeBases = subtitleStreamTimeBases
         let subSplitSetIndices = splitDisplaySetSubtitleStreamIndices
-        let onError: @Sendable (String) -> Void = { [weak self] msg in
+        let onErrorForGeneration: @Sendable (String, UInt64) -> Void = { [weak self] msg, generation in
             Task { @MainActor [weak self] in
-                self?.failure = PlaybackErrorInfo(kind: .softwarePipelineFailed, message: msg)
+                guard let self, self.admitsRead(generation: generation) else { return }
+                self.failure = PlaybackErrorInfo(kind: .softwarePipelineFailed, message: msg)
             }
         }
-        let onEnd: @Sendable () -> Void = { [weak self] in
-            // AE#374: the diagnostic line has to say the producer is done, or a falling aLead over a
-            // frozen audio PTS reads exactly like drift on a running session.
-            self?.demuxDiag.markSourceExhausted()
+        let onEndForGeneration: @Sendable (UInt64) -> Void = { [weak self] generation in
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self, self.admitsRead(generation: generation) else { return }
+                // Only current EOF may mark the diagnostic source exhausted or stop playback.
+                // A queued pre-seek EOF task must not end a freshly positioned generation.
+                self.demuxDiag.markSourceExhausted()
                 self.parkClockAtEndOfMedia()
                 self.didReachEnd = true
                 self.isPlaying = false
             }
+        }
+        let onError: @Sendable (String) -> Void = { [weak self] message in
+            guard let self else { return }
+            onErrorForGeneration(message, self.seekGeneration)
+        }
+        let onEnd: @Sendable () -> Void = { [weak self] in
+            guard let self else { return }
+            onEndForGeneration(self.seekGeneration)
         }
 
         // Live + DVR ring: reader/feeder split; live-only and VOD use the combined loop below.
@@ -1351,6 +1423,9 @@ final class SoftwarePlaybackHost {
         }
         let getSeekGeneration: @Sendable () -> UInt64 = { [weak self] in
             self?.seekGeneration ?? 0
+        }
+        let admitsRead: @Sendable (UInt64) -> Bool = { [weak self] generation in
+            self?.admitsRead(generation: generation) ?? false
         }
         let getSeekWindowOpen: @Sendable () -> Bool = { [weak self] in
             self?.seekWindowOpen ?? false
@@ -1466,12 +1541,13 @@ final class SoftwarePlaybackHost {
                 markClockArmed: setClockArmed,
                 onClockAnchored: onClockAnchored,
                 seekGeneration: getSeekGeneration,
+                admitsRead: admitsRead,
                 seekWindowOpen: getSeekWindowOpen,
                 setDecodeGeneration: setDecodeGeneration,
                 noteDecodeGeneration: noteDecodeGeneration,
                 backgroundAudioOnly: getBackgroundAudioOnly,
-                onError: onError,
-                onEnd: onEnd,
+                onError: onErrorForGeneration,
+                onEnd: onEndForGeneration,
                 audioTapSink: getAudioTapSink,
                 subtitleStreamIndices: subIndices,
                 subtitleTimeBases: subTimeBases,
@@ -1966,12 +2042,13 @@ final class SoftwarePlaybackHost {
         markClockArmed: @Sendable () -> Void,
         onClockAnchored: @Sendable (Double) -> Void,
         seekGeneration: @Sendable () -> UInt64,
+        admitsRead: @Sendable (UInt64) -> Bool,
         seekWindowOpen: @Sendable () -> Bool,
         setDecodeGeneration: @Sendable (UInt64) -> Void,
         noteDecodeGeneration: @Sendable () -> Void,
         backgroundAudioOnly: @Sendable () -> Bool,
-        onError: @Sendable (String) -> Void,
-        onEnd: @Sendable () -> Void,
+        onError: @Sendable (String, UInt64) -> Void,
+        onEnd: @Sendable (UInt64) -> Void,
         audioTapSink: @Sendable () -> ((@Sendable (CMSampleBuffer) -> Void)?),
         subtitleStreamIndices: Set<Int32> = [],
         subtitleTimeBases: [Int32: AVRational] = [:],
@@ -2013,6 +2090,7 @@ final class SoftwarePlaybackHost {
         // pump get it from the DVR feeder arm on its own thread.
         var parkedVideo: [UnsafeMutablePointer<AVPacket>] = []
         let parkedVideoCap = 256
+        var terminalGeneration = SoftwareTerminalGeneration()
         var lastEnqueuedAudioPtsSec = Double.nan
         var rebuffering = false
         // The pause/rebuffer arm stays off until the source has proven it can deliver a real
@@ -2191,6 +2269,19 @@ final class SoftwarePlaybackHost {
         }
 
         func demuxIteration() -> Bool {
+            // A valid EOF/error can be queued for MainActor just before a newer seek supersedes
+            // it. Keep the VOD consumer parked (without duplicate callbacks), not permanently
+            // exited, so that newer generation still has a loop to consume its retained packets.
+            if !isLive, terminalGeneration.shouldPark(generation: seekGeneration()) {
+                condition.lock()
+                while terminalGeneration.shouldPark(generation: seekGeneration()), !stopRequested() {
+                    autoreleasepool {
+                        _ = condition.wait(until: Date(timeIntervalSinceNow: 0.5))
+                    }
+                }
+                condition.unlock()
+                return !stopRequested()
+            }
             // AE#491 round 2: the seek window is part of this park, not a second one. Keyed on it,
             // the loop stands still from the generation bump until the source and the clock are
             // both at the target, so nothing it does can be measured against, or fed from, the
@@ -2243,42 +2334,42 @@ final class SoftwarePlaybackHost {
             let packet: UnsafeMutablePointer<AVPacket>?
             do {
                 if let readAhead {
-                    packet = try readAhead.read()?.makeAVPacket()
+                    packet = try readAhead.read(isCurrent: { admitsRead(genBeforeRead) })?.makeAVPacket()
                 } else {
-                    packet = try demuxer.readPacket()
+                    packet = try demuxer.readPacket(isCurrent: { admitsRead(genBeforeRead) })
                 }
-            } catch SoftwarePacketReadAhead.ReadError.interrupted {
-                return true
             } catch {
+                // Stop/seek cancellation is not a playback failure, including a normal .closed
+                // returned by the packet source during teardown. Errors belong to the read's
+                // captured host generation, just like packets and EOF.
+                guard admitsRead(genBeforeRead) else { return !stopRequested() }
+                if case SoftwarePacketReadAhead.ReadError.interrupted = error { return true }
                 EngineLog.emit("[SWHost] demux read failed: \(error)", category: .swPlayback)
-                onError("Playback error: \(error.localizedDescription)")
-                return false
+                if terminalGeneration.record(genBeforeRead) {
+                    onError("Playback error: \(error.localizedDescription)", genBeforeRead)
+                }
+                return !isLive
             }
 
+            // Admit every result BEFORE interpreting nil as EOF. Otherwise an old read can drain
+            // or end the new seek generation without ever reaching the old packet-only gate.
+            guard admitsRead(genBeforeRead) else {
+                if let packet { av_packet_unref(packet); av_packet_free_safe(packet) }
+                return !stopRequested()
+            }
             guard let packet else {
                 // Play the parked tail out before the flush: nothing more will arrive, the queues
                 // must drain to end-of-media. The wait lifts a rebuffer hold on its own - held,
                 // the clock would never take the tail and end-of-media would never be reached.
                 releaseRebufferHold("end of media, nothing left to rebuffer from")
                 waitForRenderer(.drainAll)
+                guard admitsRead(genBeforeRead) else { return !stopRequested() }
                 freeParkedVideo()
                 videoDecoder.flush()
                 audioDecoder?.flush()
                 renderer.drainReorderBuffer()
-                onEnd()
-                return false
-            }
-
-            // Stale packet from before seek flush: decoding would clear the skip threshold (visible
-            // fast-forward burst). Discard. AE#491 round 2: the generation alone does not say it,
-            // because a read that starts INSIDE the window carries the new one and is stale all the
-            // same; see `SeekWindow.admitsPacket`.
-            if !SeekWindow.admitsPacket(readGeneration: genBeforeRead,
-                                        liveGeneration: seekGeneration(),
-                                        windowOpen: seekWindowOpen()) {
-                av_packet_unref(packet)
-                av_packet_free_safe(packet)
-                return true
+                if terminalGeneration.record(genBeforeRead) { onEnd(genBeforeRead) }
+                return !isLive
             }
 
             let streamIdx = packet.pointee.stream_index
@@ -2746,6 +2837,7 @@ final class SWPlaybackDiagState: @unchecked Sendable {
         if generation >= _audioFlushGeneration {
             _audioFlushGeneration = generation
             _lastAudioPts = .nan
+            _sourceExhausted = false
         }
         lock.unlock()
     }

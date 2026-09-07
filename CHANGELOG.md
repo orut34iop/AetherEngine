@@ -2,6 +2,15 @@
 
 ## Moonfin software VOD cache candidate — 2026-09-07
 
+- Follow-up to physical feedback: retain bounded compressed-packet history and keyframe cursors
+  for cache-local seeks; separate consumer generations from source epochs so a hit neither clears
+  the buffer frontier nor drops an in-flight source packet. H.264 frontier accounting now follows
+  verified presentation successors, matching held VFR pictures instead of interpreting decode
+  packet durations as presentation coverage. Guard stale host reads, EOF and teardown callbacks.
+  Optional `LiveTelemetry.softwareCacheSeekHits`, `softwareCacheSeekMisses` and
+  `softwareCacheSourceEpoch` support identity-free device acceptance. Physical acceptance of
+  these follow-up paths is pending; the initial packet-cache candidate was not accepted.
+
 - Restore real ahead-of-playhead buffer reporting on seekable software VOD with
   bounded, disk-backed compressed-packet read-ahead. Preserve packet metadata and
   side data; intersect continuous selected A/V PTS coverage instead of estimating

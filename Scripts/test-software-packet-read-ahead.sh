@@ -7,6 +7,7 @@ trap 'rm -f "$TASK_TMP/check"; rmdir "$TASK_TMP"' EXIT
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swiftc \
   "$TASK_ROOT/Sources/AetherEngine/Native/SoftwareStoredPacket.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Native/SoftwarePacketCoverage.swift" \
+  "$TASK_ROOT/Sources/AetherEngine/Native/SoftwareVideoPacketCoverage.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Native/SoftwarePacketDiskFIFO.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Native/SoftwarePacketReadAhead.swift" \
   "$TASK_ROOT/Scripts/tests/SoftwarePacketReadAheadStandalone.swift" -o "$TASK_TMP/check"

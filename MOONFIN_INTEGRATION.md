@@ -90,6 +90,12 @@ not float with upstream `main`.
 - Streaming cache remains session-only. Moonfin uses Aether's disk-backed fMP4
   `SegmentCache`; a normal session close deletes its segment directory. The
   project does not implement cross-session HTTP Range-cache persistence.
+  Seekable software VOD additionally retains bounded compressed packets in a
+  session-owned disk store. Cache-local seeks replay retained keyframe preroll
+  without moving the source reader; cache misses reset and seek the source.
+  The shared buffer frontier is verified selected A/V time coverage, while
+  native fMP4 `SessionCacheStatus` is still route-specific. This does not claim
+  identical storage formats or cross-session retention on the two paths.
 - Product UI, focus, subtitle layout, and translation providers remain in the
   host. Demux, decode, route selection, subtitle cue production, session-cache
   contracts, and other engine behavior are fixed in this fork rather than by

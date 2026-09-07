@@ -139,6 +139,7 @@ final class PublicAPIDocumentationTests: XCTestCase {
             "activeSecondarySubtitleTrackIndex", "secondarySidecarASSHeader",
             "sessionCacheByteBudget", "sessionCacheStatus",
             "H264CompositionOffsetRepairDiagnostic", "DisplayModeDiagnostic",
+            "softwareCacheSeekHits", "softwareCacheSeekMisses", "softwareCacheSourceEpoch",
         ] {
             XCTAssertTrue(documentation(docs, names: symbol), "Undocumented Moonfin API: \(symbol)")
         }
