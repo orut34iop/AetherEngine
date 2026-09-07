@@ -40,6 +40,12 @@ jobs:
       - name: swift test
         run: swift test
 
+      - name: Timestamp policy and generated media regressions
+        run: |
+          brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
+          bash Scripts/test-h264-matroska-timestamps.sh
+          bash Scripts/test-h264-timestamp-controls.sh
+
       # The transport probe is a device harness and runs nowhere in CI, so nothing else would keep
       # it compiling. A harness that stopped building is discovered by the person who needed it.
       - name: build the transport probe (AE#377)

@@ -10,7 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- Positively identified Matroska H.264 coding-order timestamp ladders now keep
+  their original presentation slots but assign each slot to its parsed picture
+  order. This removes persistent judder on the affected native/hardware VOD path
+  at startup and after seeks. The IDR-bounded policy leaves healthy/unproven
+  input untouched and preserves packet payloads, audio, and the seek-index axis.
+  It is separate from the existing missing-MP4-composition-offset policy.
 
 ## [6.71.0] - 2026-09-06
 

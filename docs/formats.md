@@ -23,6 +23,40 @@ That list is the supported set, not the compiled set. The FFmpeg build also carr
 
 Interlaced sources (DVD-rip MPEG-2, SD / HD broadcast H.264) are deinterlaced through a persistent bwdif graph (yadif fallback) that engages on the first interlaced frame and costs nothing on progressive content. The dispatch decision lives in `AetherEngine.load` (`VideoRoutingPolicy`), gated per source on `VTCapabilityProbe`, codec id, declared field order, and on VOD the decode sample that verifies it.
 
+### Matroska H.264 with coding-order timestamps
+
+Some Matroska H.264 streams contain reordered pictures, but their packet PTS rise
+in coding order. The timestamp then belongs to the wrong picture: a decoder emits
+the right pictures with a regressing presentation clock. Unlike missing MP4
+`ctts`, FFmpeg can synthesize DTS different from PTS here; equality of those
+fields is not an eligibility test for this container. Matroska block timestamps
+are presentation timestamps, as specified in the
+[Matroska technical notes](https://www.matroska.org/technical/notes.html).
+
+The demuxer holds a bounded, complete IDR-to-IDR sequence for a seekable H.264 VOD
+source. Repair requires progressive frame pictures, a strictly rising near-CFR
+source ladder, reordered POC, and a complete unique POC-to-slot mapping. It
+permutes the existing PTS slots, without manufacturing a rounded replacement
+clock. The original packet order, payload, duration, side data, flags and
+audio/subtitle timing remain intact. A constant decode lead puts DTS and the
+container index on the same axis; that confirmed lead survives seeks.
+
+Healthy or unproven input is released unchanged. Live/non-seekable sources,
+still extraction and discarded video are not sampled. A changed/unsupported
+sequence after activation fails explicitly instead of silently reverting the
+published timestamp axis. Seek and teardown release every held packet.
+This is a demux fix: native hardware decoding stays selected, with no host UI
+compensation or source-file rewrite.
+
+The regression suite includes a numeric timestamp/POC fixture without source
+identity, invalid and healthy policy controls, and real parser/session/decoder
+checks against the pinned FFmpegBuild. Run
+`bash Scripts/test-h264-matroska-timestamps.sh` for the pure policy, and
+`bash Scripts/test-h264-timestamp-controls.sh` for generated solid-colour/AAC
+fixtures (requires an `ffmpeg` CLI with libx264 and the resolved FFmpegBuild
+checkout). Set `AETHER_FFMPEG_CHECKOUT` if that exact pinned checkout is not in
+`.build/checkouts/FFmpegBuild`. No private sample is required or distributed.
+
 ### MP4 without composition offsets
 
 Some writers emit a sample table with no `ctts` while the H.264 bitstream still reorders pictures.
