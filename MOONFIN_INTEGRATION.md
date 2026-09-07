@@ -5,6 +5,13 @@ application.
 
 ## 6.71.0 integration verification
 
+- Post-seek investigation (2026-09-07): source-compatible optional native-frame
+  metadata now reports source/item DTS, mux duration, H.264 NAL-type mask and write
+  result. This is observation only, not a cadence repair; it does not change packet
+  data, flags, duration, PTS/DTS, segment cutting or transport. tvOS arm64 compilation
+  passed. Initializer coverage is retained in NativeVideoFrameTimingDiagnosticTests;
+  the unsupported library-scheme tvOS unit-test action is not claimed as executed.
+
 - tvOS arm64 package compilation passed with Xcode and the frozen 3.0.0 FFmpegBuild /
   2.1.0 LibDovi dependencies (2026-09-07).
 - The host's 36 focused Aether/subtitle/cache/lifecycle contracts passed.

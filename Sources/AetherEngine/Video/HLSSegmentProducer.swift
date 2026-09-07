@@ -4181,8 +4181,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
             : Self.foldingShiftBack(packet.pointee.pts, shift: videoShiftPts)
         let frameIsKeyframe = (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
         let frameSegmentIndex = currentMuxerSegmentIndex
+        let frameSourceDts = frameObserver == nil ? Int64.min
+            : Self.foldingShiftBack(packet.pointee.dts, shift: videoShiftPts)
+        var frameNALMask: UInt32?
+        if frameObserver != nil, a53CodecKind == .h264, let data = packet.pointee.data {
+            var mask: UInt32 = 0
+            A53SEIParser.forEachNAL(data, Int(packet.pointee.size), a53NALFraming) { nal, size in
+                if size > 0 { mask |= UInt32(1) << UInt32(nal[0] & 0x1f) }
+            }
+            if mask != 0 { frameNALMask = mask }
+        }
 
         av_packet_rescale_ts(packet, sourceVideoTimeBase, muxer.muxerVideoTimeBase)
+        let frameDuration = packet.pointee.duration
         let write = muxer.writePacket(packet)
         if write.rc < 0, !loggedVideoWriteFailure {
             // #369: this rc used to be dropped on the floor; the field failure (movenc rejecting a
@@ -4206,7 +4217,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     item: item,
                     segmentIndex: frameSegmentIndex,
                     isKeyframe: frameIsKeyframe,
-                    epoch: epoch
+                    epoch: epoch,
+                    sourceDecode: Self.cmTime(ticks: frameSourceDts, timeBase: sourceVideoTimeBase),
+                    itemDecode: Self.cmTime(ticks: written.dts, timeBase: muxer.muxerVideoTimeBase),
+                    sampleDuration: Self.cmTime(ticks: frameDuration, timeBase: muxer.muxerVideoTimeBase),
+                    h264NALTypeMask: frameNALMask,
+                    muxWriteResult: write.rc
                 )
             )
         }

@@ -39,12 +39,32 @@ public struct NativeVideoFrameTime: Sendable, Equatable {
     /// are not consecutive and the values carry no meaning beyond their order.
     public let epoch: UInt64
 
-    public init(source: CMTime, item: CMTime, segmentIndex: Int, isKeyframe: Bool, epoch: UInt64) {
+    /// Source-axis decode time after producer repair, before muxer rescale; nil if unavailable.
+    public let sourceDecode: CMTime?
+    /// Decode time returned by the final muxer timestamp sanitizer; nil if unavailable.
+    public let itemDecode: CMTime?
+    /// Video sample duration handed to the muxer, on its time base; nil if unavailable.
+    public let sampleDuration: CMTime?
+    /// Bit n means H.264 NAL type n was observed in this packet. nil on non-H.264
+    /// or unreadable packets. A container keyframe flag is not proof of an IDR (bit 5).
+    public let h264NALTypeMask: UInt32?
+    /// libavformat write result; a negative value means the muxer refused this packet.
+    public let muxWriteResult: Int32?
+
+    public init(source: CMTime, item: CMTime, segmentIndex: Int, isKeyframe: Bool, epoch: UInt64,
+                sourceDecode: CMTime? = nil, itemDecode: CMTime? = nil,
+                sampleDuration: CMTime? = nil, h264NALTypeMask: UInt32? = nil,
+                muxWriteResult: Int32? = nil) {
         self.source = source
         self.item = item
         self.segmentIndex = segmentIndex
         self.isKeyframe = isKeyframe
         self.epoch = epoch
+        self.sourceDecode = sourceDecode
+        self.itemDecode = itemDecode
+        self.sampleDuration = sampleDuration
+        self.h264NALTypeMask = h264NALTypeMask
+        self.muxWriteResult = muxWriteResult
     }
 }
 

@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+- Moonfin post-seek diagnostics: optional source/item decode timestamps, mux sample
+  duration, observed H.264 NAL types and write result on `NativeVideoFrameTime`.
+  Existing initializers retain nil defaults. No playback behavior is changed.
+
 ### Moonfin 6.71.0 integration
 
 - Merged canonical 6.71.0 (`f1298924bf9d53e353cd3725e06f3077e6369b8d`)
