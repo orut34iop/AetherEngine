@@ -3,6 +3,31 @@
 This public fork carries AetherEngine changes required by the Moonfin tvOS
 application.
 
+## Upstream submissions — 2026-09-07
+
+The user approved three independent PRs against canonical main
+`1af43f017ffca973e35f8fec1e700852f2953d55`:
+
+- [#510: recovery-point VOD compatibility](https://github.com/superuser404notfound/AetherEngine/pull/510),
+  `36789677cc290632e0cefd3504e7d32b6964b3a3`.
+- [#511: Matroska H.264 timestamp ownership](https://github.com/superuser404notfound/AetherEngine/pull/511),
+  `f0c01de34003bd45347d5562f2ed47d18ba544b8`.
+- [#512: retained software VOD read-ahead/cache-local seeks](https://github.com/superuser404notfound/AetherEngine/pull/512),
+  `1f96ea33c02efe09892cc9bd2241853ac6395746`.
+
+Each is a single scoped commit on its own pushed fork branch, with docs and
+regressions. The cache port uses upstream's existing budget policy rather than
+this fork's host-specific settings; Matroska diagnostics use an internal summary.
+No host UI or private media/log data is submitted. All three isolated tvOS
+package builds and focused standalone checks passed. Full upstream CI currently
+awaits maintainer approval (14:54 Asia/Shanghai), not a failed test.
+
+The accepted runtime on this branch and the installed candidate 20260907140332
+remain unchanged; the host stays pinned to `8b3001c85d38512c14ed7a06e5db441372c62220`.
+This entry is documentation only. Earlier candidate/pending entries below are
+historical; later acceptance records and the linked PR test plans state the final
+results and their limits. No pushed history or rollback tag was rewritten.
+
 ## 6.71.0 integration verification
 
 - Software VOD packet-cache candidate (2026-09-07): the user confirms all three
