@@ -23,6 +23,38 @@ That list is the supported set, not the compiled set. The FFmpeg build also carr
 
 Interlaced sources (DVD-rip MPEG-2, SD / HD broadcast H.264) are deinterlaced through a persistent bwdif graph (yadif fallback) that engages on the first interlaced frame and costs nothing on progressive content. The dispatch decision lives in `AetherEngine.load` (`VideoRoutingPolicy`), gated per source on `VTCapabilityProbe`, codec id, declared field order, and on VOD the decode sample that verifies it.
 
+### Matroska H.264 with coding-order timestamps
+
+Some Matroska writers put an increasing timestamp ladder on packets stored in coding
+order, although Block timestamps are presentation times. FFmpeg synthesizes DTS for
+such input, so `PTS != DTS` does not establish that it is healthy. A reported Main
+profile source has decoded-frame PTS `0,73,107,140,40,...` milliseconds while both
+its buffer and average playback FPS look normal.
+
+The VOD demuxer separately checks this shape without changing hardware routing.
+It requires actual IDR NAL boundaries, parsed complete-frame POC, a complete
+consecutive even-POC permutation, strictly increasing near-CFR timestamp slots and
+a valid decode lead. It holds at most one sequence (512 pictures / 1024 interleaved
+packets / 32 MiB, with at most one incoming-packet slack), then assigns those **existing** slots to
+the appropriate pictures. It never generates timestamps from average FPS, changes
+compressed payloads, or rewrites audio/subtitles. Healthy reordered Matroska exits
+on its first backwards packet PTS; MP4 retains the independent #409 policy below.
+
+The original presentation-time set and each IDR's absolute anchor survive exactly.
+The confirmed constant decode lead is also applied to the container keyframe index
+and retained across seeks. A changed/unproven sequence after activation fails
+explicitly instead of silently mixing timestamp axes. VFR, field pictures, open-GOP
+entries, missing POC and over-budget sampling are not guessed at.
+
+Focused checks: `bash Scripts/test-h264-matroska-timestamps.sh` (numeric-only
+committed fixture), `bash Scripts/test-h264-timestamp-controls.sh` (generated
+healthy MKV/MP4 and missing-ctts controls), and
+`bash Scripts/test-h264-timestamp-runtime.sh <local-file> 0 700 3600` (actual parser,
+packet preservation, two libavcodec decoders, seek and ownership checks against the
+frozen FFmpegBuild). The runtime diagnostic prints no paths, payloads or pictures.
+Physical Apple TV acceptance of this new repair is pending; host decoding tests
+are not optical proof of smooth presentation.
+
 ### MP4 without composition offsets
 
 The Moonfin fork is separately validating a recovery-point compatibility gate:

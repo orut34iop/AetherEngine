@@ -201,7 +201,7 @@ public final class Demuxer: @unchecked Sendable {
     /// producer, the segment plan, the software decoder, the still extractor) reads the same axis;
     /// a repair applied per host would have them disagree by the reorder delay. nil for every stream
     /// that is not the exact defect shape, which is decided once, on the first read.
-    private var compositionRepair: H264CompositionOffsetRepairSession?
+    private var compositionRepair: (any H264TimestampRepairSession)?
     private var compositionRepairEvaluated = false
     private var compositionRepairReason: H264CompositionOffsetRepairReason = .notEvaluated
     private var compositionRepairSourceSeekable = true
@@ -1263,12 +1263,12 @@ public final class Demuxer: @unchecked Sendable {
             guard let packet = try readPacketLocked() else {
                 // EOF can arrive mid-sample on a very short source; the verdict has to be reached
                 // now or the held packets would never be delivered.
-                compositionRepair?.endOfStream()
+                try compositionRepair?.endOfStream()
                 if let held = compositionRepair?.dequeue() { return held }
                 return nil
             }
             guard let repair = armCompositionRepairIfNeeded() else { return packet }
-            if !repair.ingest(packet) { return packet }
+            if try !repair.ingest(packet) { return packet }
         }
     }
 
@@ -1311,10 +1311,10 @@ public final class Demuxer: @unchecked Sendable {
         guard let repair = armCompositionRepairIfNeeded(), !repair.isDecided else { return }
         while !repair.isDecided {
             guard let packet = try? readPacketLocked() else {
-                repair.endOfStream()
+                try? repair.endOfStream()
                 return
             }
-            if !repair.ingest(packet) {
+            if (try? repair.ingest(packet)) == false {
                 // Not held: the session is done with the sample and this packet is already on the
                 // final axis, so it goes to the front of the queue rather than out of order.
                 repair.enqueueFront(packet)
@@ -1326,7 +1326,7 @@ public final class Demuxer: @unchecked Sendable {
     /// #409: resolved once per demuxer, at the first read or at the explicit decision above,
     /// because it needs the stream parameters `avformat_find_stream_info` fills in and costs nothing
     /// for the streams it does not apply to.
-    private func armCompositionRepairIfNeeded() -> H264CompositionOffsetRepairSession? {
+    private func armCompositionRepairIfNeeded() -> (any H264TimestampRepairSession)? {
         if compositionRepairEvaluated { return compositionRepair }
         compositionRepairEvaluated = true
         guard let ctx = formatContext else {
@@ -1360,7 +1360,8 @@ public final class Demuxer: @unchecked Sendable {
             compositionRepairReason = .videoStreamDiscarded
             return nil
         }
-        guard compositionRepairIsISOBaseMediaFile else {
+        let isMatroska = containerNames.contains("matroska")
+        guard compositionRepairIsISOBaseMediaFile || isMatroska else {
             compositionRepairReason = .unsupportedContainer
             return nil
         }
@@ -1374,6 +1375,11 @@ public final class Demuxer: @unchecked Sendable {
         guard codecpar.pointee.video_delay > 0 else {
             compositionRepairReason = .noReorderDelay
             return nil
+        }
+        if isMatroska {
+            compositionRepair = H264MatroskaTimestampRepairSession(stream: stream, streamIndex: index)
+            compositionRepairReason = compositionRepair == nil ? .parserUnavailable : .sampling
+            return compositionRepair
         }
         guard let repair = H264CompositionOffsetRepairSession(
             containerFormatName: containerFormatName,

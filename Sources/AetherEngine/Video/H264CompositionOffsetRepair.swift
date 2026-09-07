@@ -523,6 +523,9 @@ final class H264PictureOrderReader {
     private var parser: UnsafeMutablePointer<AVCodecParserContext>?
     private var context: UnsafeMutablePointer<AVCodecContext>?
 
+    /// The Matroska repair only accepts complete frame pictures, not individual fields.
+    var isFramePicture: Bool { parser?.pointee.picture_structure == AV_PICTURE_STRUCTURE_FRAME }
+
     init?(codecParameters: UnsafePointer<AVCodecParameters>, timeBase: AVRational) {
         guard let codec = avcodec_find_decoder(AV_CODEC_ID_H264),
               let context = avcodec_alloc_context3(codec) else { return nil }
@@ -577,7 +580,7 @@ final class H264PictureOrderReader {
 /// costs one small queue and keeps the decision on the same bytes playback is about to consume.
 /// Every packet is held, not just video, so the interleaving the container chose survives the
 /// verdict.
-final class H264CompositionOffsetRepairSession {
+final class H264CompositionOffsetRepairSession: H264TimestampRepairSession {
 
     enum Phase: Equatable { case sampling, repairing, off }
 
