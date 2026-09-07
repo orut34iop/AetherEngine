@@ -56,8 +56,11 @@ Physical Apple TV candidate `20260907140332` passed the reporter's from-head and
 seek reproduction on 2026-09-07. Matching device logs confirm hardware routing,
 `confirmed_matroska_coding_order` (60 pictures, 20 POC regressions, 34 ms decode
 lead), successful forward/backward seek landings and zero reported drops/stalls.
-Acceptance covers that short reproduction, not a full-film or exhaustive codec
-soak; host decoding tests alone are not optical proof of smooth presentation.
+The reporter also passed an extended check on the same candidate: two logged
+sessions span 319 and 611 seconds with forward/backward seeks, 206 settled player
+samples at 29.61–31.50 fps, and zero reported drops/stalls. Acceptance covers these
+reproductions, not a full-film or exhaustive codec soak; host decoding tests alone
+are not optical proof of smooth presentation.
 
 ### MP4 without composition offsets
 
