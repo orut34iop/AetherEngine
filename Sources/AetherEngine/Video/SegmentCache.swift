@@ -248,8 +248,14 @@ final class SegmentCache: @unchecked Sendable {
     func setInit(_ data: Data) {
         condition.lock()
         initSegment = data
+        // Diagnostic branch only. Keep the exact session init next to the existing media
+        // files so the canonical device exporter can collect independently readable segments.
+        // Holding the cache lock prevents close() from racing this bounded initial write.
+        let evidence = PR510NativeSegmentEvidence.writeInit(
+            data, sessionDirectory: sessionDir, sessionClosed: closed)
         condition.broadcast()
         condition.unlock()
+        EngineLog.emit("[PR510Diagnostic] init_capture=\(evidence) bytes=\(data.count)", category: .session)
     }
 
     /// Register fresh init at SSAI program switch valid from `fromSegment`. Idempotent on fromSegment.

@@ -4013,7 +4013,12 @@ public final class AetherEngine: ObservableObject {
                 throw DemuxerError.readFailed(code: -5)
             }
             diagnostics.h264RecoveryPointKeyCount = result.evidence.recoveryKeys
-            useSoftwarePath = result.evidence.requiresCompatibilityPath
+            // DIAGNOSTIC BRANCH ONLY: vary #510's routing decision while retaining the
+            // same probe, rewind, timestamp repairs, cache and native playback code.
+            // This is not a production replacement for the accepted compatibility route.
+            useSoftwarePath = false
+            EngineLog.emit("[PR510Diagnostic] native_comparison=true "
+                + "detected_recovery_compatibility=\(result.evidence.requiresCompatibilityPath)", category: .engine)
             EngineLog.emit("[AetherEngine] H264 recovery-point sample: video=\(result.videoPackets) "
                 + "recoveryKeys=\(result.evidence.recoveryKeys) "
                 + "compatibility=\(useSoftwarePath)", category: .engine)
