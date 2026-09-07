@@ -3,7 +3,31 @@
 This public fork carries AetherEngine changes required by the Moonfin tvOS
 application.
 
+## 6.71.0 integration verification
+
+- tvOS arm64 package compilation passed with Xcode and the frozen 3.0.0 FFmpegBuild /
+  2.1.0 LibDovi dependencies (2026-09-07).
+- The host's 36 focused Aether/subtitle/cache/lifecycle contracts passed.
+- The SwiftPM `AetherEngine` library scheme has no tvOS test action. The attempted
+  simulator test invocation did not execute tests and is not counted as a pass.
+  Retained engine suites therefore still need their supported CI test runner.
+- Host packaging, installed first frame and physical playback are verified separately
+  against the exact pushed engine revision; a library build alone is not playback acceptance.
+
 ## Baseline
+
+- Current upstream integration: canonical `6.71.0`,
+  `f1298924bf9d53e353cd3725e06f3077e6369b8d`.
+- Recovery tag: `moonfin/pre-aether-6.71.0-20260907`, resolving to
+  `a66a9d3460530aafc3be2c186805cf3b69cfaa48` before the merge.
+  The host repository carries the same tag at its own pre-upgrade commit.
+- H.264 repair follows upstream's fractional-cadence algorithm. Moonfin adds
+  structured diagnostics and its measured device regression sample, not a second algorithm.
+- TLS uses upstream's owned sessions and HLS relay plus Moonfin's exact-origin set;
+  the old `HLSReverseProxyServer` is retired. The host does not set the general evaluator.
+- Cache budget/cleanup and dual-subtitle contracts remain; upstream residency,
+  cold-seek reachability and live-cache protection must not be dropped.
+- The following records the original fork lineage, not the current upstream version.
 
 - Upstream: `https://github.com/RadicalMuffinMan/AetherEngine`
 - Moonfin 2.4.0 baseline:

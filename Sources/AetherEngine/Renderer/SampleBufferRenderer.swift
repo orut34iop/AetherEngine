@@ -43,6 +43,32 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// Drop frames before this PTS after a seek (prevents keyframe-to-target fast-forward). Cleared after the first passing frame.
     private var skipUntilPTS: CMTime?
 
+    /// #311: fires for every frame handed to the queue target, on the decode thread. Guarded by
+    /// `reorderLock` for the swap only; the call itself happens with no lock held, so a host that
+    /// re-enters the renderer from it cannot deadlock.
+    private var _frameEnqueuedObserver: SoftwareVideoFrameTimeObserver?
+    func setFrameEnqueuedObserver(_ observer: SoftwareVideoFrameTimeObserver?) {
+        reorderLock.lock()
+        _frameEnqueuedObserver = observer
+        reorderLock.unlock()
+    }
+
+    /// #311: moved on by every flush, so a consumer can drop the frame times it recorded for frames the
+    /// compositor has since discarded. Guarded by `reorderLock`.
+    ///
+    /// Drawn from a process-wide allocator rather than counted from zero (#314). A load builds a new
+    /// renderer, and a renderer that started at zero would report below the outgoing one, which is the
+    /// order a consumer reads as "stale". The first value is drawn at init for the same reason: the
+    /// generation a renderer reports before its first flush has to rank above the previous renderer's
+    /// last, not tie with it. Successive values are therefore strictly increasing but not consecutive.
+    private static let flushGenerations = FrameTimeSequence()
+    private var _flushGeneration: UInt64 = SampleBufferRenderer.flushGenerations.next()
+    var flushGeneration: UInt64 {
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        return _flushGeneration
+    }
+
     /// Cached CMVideoFormatDescription keyed by dimensions + pixel format + colorimetry + pixel aspect ratio. CMVideoFormatDescriptionCreateForImageBuffer snapshots color AND aspect attachments at creation, so a mid-stream change at same dimensions must invalidate the cache; a PAR-less first frame froze a PAR-less description for the whole stream and collapsed anamorphic content to coded dimensions (#177). Guarded by reorderLock; nil'd by flush().
     private var cachedFormatDesc: CMVideoFormatDescription?
     private var cachedFormatKey: FormatDescriptionKey?
@@ -62,8 +88,24 @@ final class SampleBufferRenderer: @unchecked Sendable {
     private var loggedLayerFailed = false
     private var loggedNotReady = false
     /// Internal (not private) for #298 tests: the gate's job is that untimed frames never get here.
+    /// Guarded by `reorderLock` since #407: the 1 Hz diagnostic reads it off the main actor while the
+    /// decode thread writes it, and the two counts it is compared against are read under the same lock.
     private(set) var enqueueCount = 0
     private var hdr10PlusAttachedCount = 0
+
+    /// #407: frames that reached `flushFrame` and still never got to the layer, because the sample
+    /// buffer could not be built. Separate from `_untimedFramesDropped` (refused before the reorder
+    /// buffer) and from the post-seek skip, which is a decision rather than a loss. Guarded by
+    /// `reorderLock`.
+    private var _sampleBuildFailures = 0
+
+    /// #407: spacing of the timestamps actually handed to the layer, over the interval since the last
+    /// snapshot. `framesEnqueued` counts DECODER OUTPUT, so a per-second frame count reads healthy for
+    /// an even 24 fps timeline and for one carrying a doubled or a duplicate interval alike; only the
+    /// spacing separates them. Guarded by `reorderLock`, reset by `takeCadence()`.
+    private var _lastHandedPtsSeconds: Double?
+    private var _minHandedDeltaSeconds = Double.infinity
+    private var _maxHandedDeltaSeconds = -Double.infinity
 
     /// #298: frames refused at the enqueue gate for carrying an unschedulable PTS. Guarded by `reorderLock`.
     private var _untimedFramesDropped = 0
@@ -85,8 +127,38 @@ final class SampleBufferRenderer: @unchecked Sendable {
         return _newestEnqueuedPtsSeconds
     }
 
-    init() {
-        displayLayer = Self.makeDisplayLayer(isHDR: false)
+    /// #353: the size the picture presents at, which is the coded frame under the pixel aspect ratio
+    /// the decoder attached; nil before the first sample buffer is built. Read off the description
+    /// that is enqueued rather than recomputed from the SAR: the ratio is resolved per frame across
+    /// three sources (#177) and a ratio whose display aspect is impossible is dropped (#290), so a
+    /// second computation of the same answer is a second thing that can disagree with the screen.
+    /// Guarded by `reorderLock`.
+    private var _displaySize: CGSize?
+    var displaySize: CGSize? {
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        return _displaySize
+    }
+
+    /// #353: fires when the settled display size CHANGES, on the decode thread, plus once on
+    /// installation if the picture already settled. Compared against the value and not against the
+    /// description, because `flush()` drops the cached description and every seek therefore rebuilds
+    /// one for a picture that never changed shape. The late-installation call is what a host relies
+    /// on: on a source with one format, the only report ever due has already happened.
+    private var _displaySizeObserver: (@Sendable (CGSize) -> Void)?
+    func setDisplaySizeObserver(_ observer: (@Sendable (CGSize) -> Void)?) {
+        reorderLock.lock()
+        _displaySizeObserver = observer
+        let settled = _displaySize
+        reorderLock.unlock()
+        if let settled { observer?(settled) }
+    }
+
+    /// #489: the gravity is a construction parameter, not something a caller assigns afterwards.
+    /// The engine holds the host app's picture mode across loads, and a layer that starts on the
+    /// default and is corrected a moment later shows one frame of the wrong fill.
+    init(videoGravity: AVLayerVideoGravity = .resizeAspect) {
+        displayLayer = Self.makeDisplayLayer(isHDR: false, gravity: videoGravity)
     }
 
     /// #303: what the display did with the frames, as the renderer itself counts them. Our own
@@ -99,20 +171,69 @@ final class SampleBufferRenderer: @unchecked Sendable {
         let accumulatedDelay: TimeInterval
     }
 
+    /// #407: what the renderer itself put on the layer, as opposed to what the decoder produced.
+    /// `RenderMetrics` describes the layer's verdict on frames it received; this describes the frames
+    /// it received, which is the half no counter covered while a report of visible judder read clean
+    /// on every one of them.
+    struct Cadence: Sendable {
+        /// Cumulative frames handed to the queue target.
+        let handedOver: Int
+        /// Cumulative frames lost between the decoder callback and the layer: unschedulable
+        /// timestamps plus failed sample-buffer builds. A gap between the decoder's count and
+        /// `handedOver` that this does not account for is a post-seek skip.
+        let lostBeforeLayer: Int
+        /// Shortest and longest gap between consecutive handed-over timestamps over the interval,
+        /// nil when fewer than two frames were handed over. Source axis, seconds.
+        let minDeltaSeconds: Double?
+        let maxDeltaSeconds: Double?
+    }
+
+    /// Reads the cadence counters and resets the per-interval spacing extremes. Called at 1 Hz by the
+    /// diagnostic line; the cumulative counts survive, the min/max describe the interval only.
+    func takeCadence() -> Cadence {
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        let minD = _minHandedDeltaSeconds.isFinite ? _minHandedDeltaSeconds : nil
+        let maxD = _maxHandedDeltaSeconds.isFinite ? _maxHandedDeltaSeconds : nil
+        _minHandedDeltaSeconds = .infinity
+        _maxHandedDeltaSeconds = -.infinity
+        return Cadence(handedOver: enqueueCount,
+                       lostBeforeLayer: _untimedFramesDropped + _sampleBuildFailures,
+                       minDeltaSeconds: minD, maxDeltaSeconds: maxD)
+    }
+
     /// nil where the metrics cannot be asked for: an OS predating the API, or the pre-tvOS-18 path
     /// where the queue target is the display layer itself rather than an `AVSampleBufferVideoRenderer`.
+    ///
+    /// #313: main-actor isolated, and reading through the completion-handler accessor rather than
+    /// the async one, because the two halves of that constraint come from different toolchains and
+    /// no single `await` on `videoPerformanceMetrics` satisfies both. An SDK that isolates the layer
+    /// to the main actor refuses to hand `sampleBufferRenderer` to any other domain; a toolchain
+    /// that imports the async accessor as `nonisolated` refuses to take that non-Sendable renderer
+    /// from the main actor. The completion form suspends without moving the renderer anywhere, so it
+    /// holds on both. Every caller is main-actor isolated already, so the annotation costs no hop.
+    ///
+    /// #344: the version list gates the metrics accessor (tvOS/iOS 17.4, macOS 14.4, visionOS 1.1),
+    /// not the renderer, which exists from visionOS 1.0. tvOS/iOS 18 and macOS 15 stay as they are:
+    /// below them `queueTarget` is the display layer, so there is no renderer to ask.
+    @MainActor
     func loadRenderMetrics() async -> RenderMetrics? {
-        guard #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) else { return nil }
-        guard let m = await displayLayer.sampleBufferRenderer.videoPerformanceMetrics else { return nil }
-        return RenderMetrics(total: m.totalNumberOfFrames,
-                             dropped: m.numberOfDroppedFrames,
-                             corrupted: m.numberOfCorruptedFrames,
-                             accumulatedDelay: m.totalAccumulatedFrameDelay)
+        guard #available(tvOS 18.0, iOS 18.0, macOS 15.0, visionOS 1.1, *) else { return nil }
+        let renderer = displayLayer.sampleBufferRenderer
+        return await withCheckedContinuation { (cont: CheckedContinuation<RenderMetrics?, Never>) in
+            renderer.loadVideoPerformanceMetrics { m in
+                guard let m else { return cont.resume(returning: nil) }
+                cont.resume(returning: RenderMetrics(total: m.totalNumberOfFrames,
+                                                     dropped: m.numberOfDroppedFrames,
+                                                     corrupted: m.numberOfCorruptedFrames,
+                                                     accumulatedDelay: m.totalAccumulatedFrameDelay))
+            }
+        }
     }
 
     // MARK: - Queue rendering target
 
-    /// tvOS 18+ / iOS 18+ / macOS 15+: use AVSampleBufferVideoRenderer via displayLayer.sampleBufferRenderer. Calling the deprecated layer enqueue/flush/isReadyForMoreMediaData on tvOS 26+ with AVSampleBufferRenderSynchronizer fails with FigVideoQueueRemote -12080 after the first enqueue. Older OSes use the layer directly via AVQueuedSampleBufferRendering.
+    /// tvOS 18+ / iOS 18+ / macOS 15+: use AVSampleBufferVideoRenderer via displayLayer.sampleBufferRenderer. Calling the deprecated layer enqueue/flush/isReadyForMoreMediaData on tvOS 26+ with AVSampleBufferRenderSynchronizer fails with FigVideoQueueRemote -12080 after the first enqueue. Older OSes use the layer directly via AVQueuedSampleBufferRendering. visionOS is not named because it has the renderer from 1.0, which is the package floor, so the `*` arm is the renderer arm there and naming it would be a check that is always true.
     var queueTarget: any AVQueuedSampleBufferRendering {
         if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
             return displayLayer.sampleBufferRenderer
@@ -227,8 +348,11 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
         while reorderBuffer.count > reorderDepth {
             let (pb, t, hdr) = reorderBuffer.removeFirst()
+            // #407: the successor is already held, so its timestamp is the frame's exact duration at
+            // no extra latency. Read before the unlock, since enqueue() runs on the decode thread.
+            let next = reorderBuffer.first?.1
             reorderLock.unlock()
-            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr)
+            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr, nextPTS: next)
             reorderLock.lock()
         }
 
@@ -241,10 +365,15 @@ final class SampleBufferRenderer: @unchecked Sendable {
     func flush(removingDisplayedImage: Bool = true) {
         reorderLock.lock()
         reorderBuffer.removeAll()
+        // #407: the next frame handed over will not follow the last one, so the gap between them is
+        // not a cadence measurement. Left standing, every seek would report one enormous interval.
+        _lastHandedPtsSeconds = nil
         // #303: nothing is held any more, so the frontier is not a frontier. Left standing, a
         // backward seek would keep reporting the pre-seek timestamp and read as a cushion of
         // however far the seek travelled.
         _newestEnqueuedPtsSeconds = nil
+        // #311: everything reported before this point describes frames that are now gone.
+        _flushGeneration = SampleBufferRenderer.flushGenerations.next()
         // Invalidate the format description cache; the next load() may open a stream with different colorimetry at the same resolution.
         cachedFormatDesc = nil
         cachedFormatKey = nil
@@ -271,16 +400,28 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderBuffer.removeAll()
         reorderLock.unlock()
 
-        for (pb, t, hdr) in remaining {
-            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr)
+        for (i, (pb, t, hdr)) in remaining.enumerated() {
+            // The final frame has no successor, so it is handed over untimed in length: at end of
+            // media that is the frame that stays on screen, and a length is exactly what it must not
+            // have.
+            let next = i + 1 < remaining.count ? remaining[i + 1].1 : nil
+            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr, nextPTS: next)
         }
     }
 
     // MARK: - Internal
 
-    private func flushFrame(pixelBuffer: CVPixelBuffer, pts: CMTime, hdr10PlusData: Data?) {
+    private func flushFrame(pixelBuffer: CVPixelBuffer, pts: CMTime, hdr10PlusData: Data?,
+                            nextPTS: CMTime? = nil) {
         let outputBuffer = subtitleCompositor.composite(pixelBuffer, ptsSeconds: pts.seconds)
-        guard let sampleBuffer = createSampleBuffer(from: outputBuffer, pts: pts) else {
+        guard let sampleBuffer = createSampleBuffer(
+            from: outputBuffer, pts: pts,
+            duration: Self.frameDuration(from: pts, to: nextPTS)) else {
+            // #407: a frame the decoder produced and the layer never saw. Counted, because the
+            // per-second frame count is taken on the decoder's side of this line.
+            reorderLock.lock()
+            _sampleBuildFailures += 1
+            reorderLock.unlock()
             return
         }
         // HDR10+ attachment overrides any payload baked into the bitstream (VT may strip per-frame SEI on decode).
@@ -311,10 +452,31 @@ final class SampleBufferRenderer: @unchecked Sendable {
         }
         target.enqueue(sampleBuffer)
 
+        // #311: reported here rather than at admission, so it describes frames the compositor has
+        // been given. A frame refused for an unschedulable timestamp, skipped after a seek, or lost
+        // to a failed sample-buffer creation never reaches this line and is never reported.
+        reorderLock.lock()
+        let observer = _frameEnqueuedObserver
+        let generation = _flushGeneration
+        reorderLock.unlock()
+        observer?(SoftwareVideoFrameTime(presentation: pts, generation: generation))
+
+        reorderLock.lock()
         enqueueCount += 1
+        // #407: the spacing of what the layer was given, which is the thing a frame COUNT cannot say.
+        if let previous = _lastHandedPtsSeconds {
+            let delta = CMTimeGetSeconds(pts) - previous
+            if delta.isFinite {
+                _minHandedDeltaSeconds = min(_minHandedDeltaSeconds, delta)
+                _maxHandedDeltaSeconds = max(_maxHandedDeltaSeconds, delta)
+            }
+        }
+        _lastHandedPtsSeconds = CMTimeGetSeconds(pts)
+        let handed = enqueueCount
+        reorderLock.unlock()
         // Sparse milestones so a stall is distinguishable from "logging stopped at #30"; bounded to 4 lines/hour at 60 fps.
-        if enqueueCount == 1 || enqueueCount == 30 || enqueueCount == 100 || enqueueCount == 1000 || enqueueCount == 5000 {
-            EngineLog.emit("[Renderer] enqueue #\(enqueueCount): status=\(statusName) ready=\(queueTarget.isReadyForMoreMediaData) error=\(queueError?.localizedDescription ?? "nil")", category: .swPlayback)
+        if handed == 1 || handed == 30 || handed == 100 || handed == 1000 || handed == 5000 {
+            EngineLog.emit("[Renderer] enqueue #\(handed): status=\(statusName) ready=\(queueTarget.isReadyForMoreMediaData) error=\(queueError?.localizedDescription ?? "nil")", category: .swPlayback)
         }
     }
 
@@ -327,8 +489,33 @@ final class SampleBufferRenderer: @unchecked Sendable {
         }
     }
 
+    /// [SWDiag] surface: current queue-target status for the 1 Hz diagnostic line. A mid-session
+    /// flip away from `rendering` is the layer-side stall the per-frame counters cannot show.
+    var diagStatusName: String { statusName }
+
+    /// #353: what the layer will draw the description at. Pixel aspect ratio and clean aperture are
+    /// extensions of the description itself, so this asks the description what it presents at
+    /// instead of repeating the decision that built it.
+    static func presentationSize(of desc: CMVideoFormatDescription) -> CGSize {
+        CMVideoFormatDescriptionGetPresentationDimensions(
+            desc, usePixelAspectRatio: true, useCleanAperture: true)
+    }
+
+    /// #407: the length a frame is presented for, from the successor the reorder buffer is already
+    /// holding. `.invalid` for the last frame of a stream (nothing follows it) and for a successor
+    /// that cannot be a frame length: a non-positive gap is a duplicate or a reordering fault, and a
+    /// gap past a second is a stream discontinuity, neither of which is a duration to present for.
+    static func frameDuration(from pts: CMTime, to nextPTS: CMTime?) -> CMTime {
+        guard let nextPTS, pts.isNumeric, nextPTS.isNumeric else { return .invalid }
+        let delta = CMTimeSubtract(nextPTS, pts)
+        let seconds = CMTimeGetSeconds(delta)
+        guard seconds > 0, seconds <= 1.0 else { return .invalid }
+        return delta
+    }
+
     /// Internal (not private) for #177 regression tests: the PAR-keyed cache behavior is the fix.
-    func createSampleBuffer(from pixelBuffer: CVPixelBuffer, pts: CMTime) -> CMSampleBuffer? {
+    func createSampleBuffer(from pixelBuffer: CVPixelBuffer, pts: CMTime,
+                            duration: CMTime = .invalid) -> CMSampleBuffer? {
         // Cache hit avoids CMVideoFormatDescriptionCreateForImageBuffer allocation + CF refcount churn on every frame.
         let par = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferPixelAspectRatioKey, nil) as? NSDictionary
         let key = FormatDescriptionKey(
@@ -359,15 +546,22 @@ final class SampleBufferRenderer: @unchecked Sendable {
                 formatDescriptionOut: &formatDesc
             )
             guard status == noErr, let new = formatDesc else { return nil }
+            // #353: a new description is the only moment the picture can change shape, so the
+            // settled size is taken here and reported outside the lock.
+            let settled = Self.presentationSize(of: new)
             reorderLock.lock()
             cachedFormatDesc = new
             cachedFormatKey = key
+            let changed = settled != _displaySize
+            if changed { _displaySize = settled }
+            let sizeObserver = changed ? _displaySizeObserver : nil
             reorderLock.unlock()
+            sizeObserver?(settled)
             desc = new
         }
 
         var timing = CMSampleTimingInfo(
-            duration: .invalid,
+            duration: duration,
             presentationTimeStamp: pts,
             decodeTimeStamp: .invalid
         )

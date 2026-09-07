@@ -1,6 +1,6 @@
 import Foundation
-import Libavcodec
-import Libavutil
+import AetherLibavcodec
+import AetherLibavutil
 
 extension HLSVideoEngine {
 
@@ -94,14 +94,11 @@ extension HLSVideoEngine {
         let videoRange: HLSVideoRange
         let primaryCodecs: String
         let supplementalCodecs: String?
-        /// Drop dvcC before write_header. Used for P7 (BL routed as plain HDR10; VT rejects dvcC with
-        /// -12906) and P8.1/P8.4 on non-DV panels (tvOS 26 filter rejects dvvC + plain hvc1 with -11868).
-        let stripDolbyVisionMetadata: Bool
+        /// What the muxer does with the source dvcC on the way into init.mp4.
+        /// See `MP4SegmentMuxer.DoviConfigPolicy`.
+        let doviConfig: MP4SegmentMuxer.DoviConfigPolicy
         /// Per-packet RPU rewrite P7 -> P8.1 via DoviRpuConverter; true only for P7 on a DV panel.
         let convertP7ToProfile81: Bool
-        /// Rewrite container dvcC to P8.1 in init.mp4: P7-on-DV (alongside convertP7ToProfile81)
-        /// and the "P8.6" malformed-compat case (#53). Mutually exclusive with stripDolbyVisionMetadata.
-        let rewriteDoviConfigTo81: Bool
         let dvVariant: DVVariant
 
         init(
@@ -109,18 +106,16 @@ extension HLSVideoEngine {
             videoRange: HLSVideoRange,
             primaryCodecs: String,
             supplementalCodecs: String?,
-            stripDolbyVisionMetadata: Bool,
+            doviConfig: MP4SegmentMuxer.DoviConfigPolicy,
             convertP7ToProfile81: Bool,
-            rewriteDoviConfigTo81: Bool = false,
             dvVariant: DVVariant
         ) {
             self.codecTagOverride = codecTagOverride
             self.videoRange = videoRange
             self.primaryCodecs = primaryCodecs
             self.supplementalCodecs = supplementalCodecs
-            self.stripDolbyVisionMetadata = stripDolbyVisionMetadata
+            self.doviConfig = doviConfig
             self.convertP7ToProfile81 = convertP7ToProfile81
-            self.rewriteDoviConfigTo81 = rewriteDoviConfigTo81
             self.dvVariant = dvVariant
         }
     }
@@ -186,6 +181,64 @@ extension HLSVideoEngine {
         return s
     }
 
+    /// RFC 6381 `avc1.PPCCLL` read straight off the avcC configuration record, which states all three
+    /// bytes outright: AVCProfileIndication, profile_compatibility (the constraint_set flags) and
+    /// AVCLevelIndication are bytes 1..3. Same reasoning as `hevcCodecsString`: the record is what the
+    /// muxer writes into the sample entry, so deriving the attribute from anything else invites the
+    /// two to disagree. nil for Annex-B extradata (MPEG-TS carries no record; byte 0 is a start code,
+    /// not configurationVersion 1) and for a record too short to hold the three bytes.
+    static func avcCodecsString(fromConfigRecord avcC: [UInt8]) -> String? {
+        guard avcC.count >= 4, avcC[0] == 1 else { return nil }
+        return String(format: "avc1.%02X%02X%02X", avcC[1], avcC[2], avcC[3])
+    }
+
+    /// Same three bytes read off the SPS instead, which is what MPEG-TS carries in place of a record:
+    /// profile_idc, the constraint_set flags byte and level_idc are the first three bytes of the RBSP,
+    /// right behind the NAL header. This keeps the live path exact rather than reconstructing the
+    /// compatibility byte from the two flags libavcodec preserved. nil unless the NAL really is an SPS
+    /// (type 7) and long enough to hold them.
+    static func avcCodecsString(fromSPSNAL sps: [UInt8]) -> String? {
+        guard sps.count >= 4, (sps[0] & 0x1F) == 7 else { return nil }
+        return String(format: "avc1.%02X%02X%02X", sps[1], sps[2], sps[3])
+    }
+
+    /// Fallback for sources with no avcC. `AVCodecParameters.profile` is NOT a bare profile_idc:
+    /// libavcodec ORs the constraint flags into the high bits, so Constrained Baseline arrives as
+    /// `66|AV_PROFILE_H264_CONSTRAINED` = 578 and the Intra profiles as `idc|AV_PROFILE_H264_INTRA`.
+    /// Formatting that raw overflowed `%02X` to three digits and produced `avc1.2420028`, seven hex
+    /// digits where the grammar defines six. Masking recovers profile_idc, and the two flags map back
+    /// into the compatibility byte they came from (constraint_set1 is bit 6, constraint_set3 is bit 4),
+    /// so the fallback states them instead of the hardcoded zero the branch used to emit.
+    static func avcCodecsString(profile: Int32, level: Int32) -> String {
+        let raw = profile > 0 ? Int(profile) : 100   // High
+        let safeLevel = level > 0 ? Int(level) : 40  // 4.0
+        var compatibility = 0
+        if raw & 0x200 != 0 { compatibility |= 0x40 }   // AV_PROFILE_H264_CONSTRAINED -> constraint_set1
+        if raw & 0x800 != 0 { compatibility |= 0x10 }   // AV_PROFILE_H264_INTRA       -> constraint_set3
+        return String(format: "avc1.%02X%02X%02X", raw & 0xFF, compatibility, safeLevel)
+    }
+
+    /// The source states these bytes; prefer whichever form it carries them in (avcC, then the SPS a
+    /// TS stream carries instead), and only reconstruct from the codecpar fields when it carries
+    /// neither. Mirrors `plainHEVCCodecs`. Deriving the attribute from the same extradata the muxer
+    /// stream-copies into the sample entry is what keeps the manifest and the init from disagreeing.
+    private func avcCodecs(codecpar: UnsafePointer<AVCodecParameters>) -> String {
+        if let ed = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0 {
+            let bytes = Array(UnsafeBufferPointer(
+                start: ed, count: Int(codecpar.pointee.extradata_size)))
+            if let derived = Self.avcCodecsString(fromConfigRecord: bytes) {
+                return derived
+            }
+            // Annex-B (MPEG-TS): no record, but the SPS states the same three bytes.
+            if let sps = H264SPS.spsNAL(fromExtradata: bytes),
+               let derived = Self.avcCodecsString(fromSPSNAL: sps) {
+                return derived
+            }
+        }
+        return Self.avcCodecsString(
+            profile: codecpar.pointee.profile, level: codecpar.pointee.level)
+    }
+
     /// Derive the plain-HEVC CODECS string from the source hvcC when parseable, else fall back to the
     /// legacy Main10 form. Used only by the non-DV `.none` / `.profile82` branch; DV variants keep their
     /// deliberate `hvc1.2.4` (Main10 PQ base) declaration.
@@ -209,10 +262,6 @@ extension HLSVideoEngine {
         let codecID = codecpar.pointee.codec_id
 
         if codecID == AV_CODEC_ID_H264 {
-            let profileIDC = Int(codecpar.pointee.profile)
-            let levelIDC = Int(codecpar.pointee.level)
-            let safeProfile = profileIDC > 0 ? profileIDC : 100  // High
-            let safeLevel = levelIDC > 0 ? levelIDC : 40         // 4.0
             // AVC+DV P9: no Apple AVC+DV decoder; strip dvcC so muxer writes clean avc1 (dvvC trips -11868).
             let hasDV = doviConfigRecord(from: codecpar) != nil
             if hasDV {
@@ -226,9 +275,9 @@ extension HLSVideoEngine {
             return CodecRoute(
                 codecTagOverride: "avc1",
                 videoRange: manifestVideoRange(codecpar),
-                primaryCodecs: String(format: "avc1.%02X%02X%02X", safeProfile, 0, safeLevel),
+                primaryCodecs: avcCodecs(codecpar: codecpar),
                 supplementalCodecs: nil,
-                stripDolbyVisionMetadata: hasDV,
+                doviConfig: hasDV ? .strip : .keep,
                 convertP7ToProfile81: false,
                 dvVariant: .none
             )
@@ -256,7 +305,7 @@ extension HLSVideoEngine {
                     videoRange: .pq,
                     primaryCodecs: "dav1.10.\(dvLevelStr)",
                     supplementalCodecs: nil,
-                    stripDolbyVisionMetadata: false,
+                    doviConfig: .keep,
                     convertP7ToProfile81: false,
                     dvVariant: dvVariant
                 )
@@ -267,7 +316,7 @@ extension HLSVideoEngine {
                     videoRange: .pq,
                     primaryCodecs: "dav1.10.\(dvLevelStr)",
                     supplementalCodecs: nil,
-                    stripDolbyVisionMetadata: false,
+                    doviConfig: .keep,
                     convertP7ToProfile81: false,
                     dvVariant: dvVariant
                 )
@@ -283,7 +332,7 @@ extension HLSVideoEngine {
                     videoRange: .hlg,
                     primaryCodecs: primary,
                     supplementalCodecs: "dav1.10.\(dvLevelStr)/db4h",
-                    stripDolbyVisionMetadata: false,
+                    doviConfig: .keep,
                     convertP7ToProfile81: false,
                     dvVariant: dvVariant
                 )
@@ -323,7 +372,7 @@ extension HLSVideoEngine {
                     videoRange: videoRange,
                     primaryCodecs: primary,
                     supplementalCodecs: nil,
-                    stripDolbyVisionMetadata: dvVariant == .av1Profile102,
+                    doviConfig: dvVariant == .av1Profile102 ? .strip : .keep,
                     convertP7ToProfile81: false,
                     dvVariant: dvVariant
                 )
@@ -372,7 +421,7 @@ extension HLSVideoEngine {
                 videoRange: .pq,
                 primaryCodecs: "dvh1.05.\(dvLevelStr)",
                 supplementalCodecs: nil,
-                stripDolbyVisionMetadata: false,
+                doviConfig: .keep,
                 convertP7ToProfile81: false,
                 dvVariant: dvVariant
             )
@@ -381,18 +430,43 @@ extension HLSVideoEngine {
             // DV panel: hvc1 + dvvC (muxer writes dvvC automatically) + SUPPLEMENTAL dvh1.08.XX/db1p.
             //   db1p required; without it AVPlayer treats variant as plain HDR10 and DV never engages.
             // Non-DV panel: strip dvvC (hvc1 + dvvC trips -11868 even without SUPPLEMENTAL, 2026-05-26).
-            // "P8.6" malformed compat (#53): rewriteDoviConfigTo81 normalizes container to compat=1;
+            // "P8.6" malformed compat (#53): the dvcC rewrite normalizes the container to compat=1;
             //   on non-DV panel the strip path handles it without rewrite.
+            // AE#455, opt-in: on a display with no Dolby Vision of its own, serve the P8.1 the way a P5
+            // is served, so AVPlayer composes the RPU itself instead of the panel receiving the bare
+            // HDR10 base layer with its one static grade. The bitstream is untouched; what moves is the
+            // container's claim about it, and a P8.1 RPU already carries the mapping out of its own base
+            // layer. See `LoadOptions.forceDolbyVisionOnNonDVDisplay` for the risk this buys.
+            //
+            // P8.1 only. P8.4's base layer is HLG, and a profile-5 dvcC on an HLG `colr` is a container
+            // that contradicts itself; nobody has measured that and it is not what was reported.
+            if !effectiveDvMode && forceDolbyVisionOnNonDVDisplay {
+                EngineLog.emit(
+                    "[HLSVideoEngine] AE#455: serving HEVC DV Profile 8.1 as Profile 5 "
+                    + "(dvh1 sample entry, dvcC profile=5 compat=0, CODECS=dvh1.05.\(dvLevelStr)) "
+                    + "so AVPlayer composes the RPU on a display without Dolby Vision",
+                    category: .session
+                )
+                return CodecRoute(
+                    codecTagOverride: "dvh1",
+                    videoRange: .pq,
+                    primaryCodecs: "dvh1.05.\(dvLevelStr)",
+                    supplementalCodecs: nil,
+                    doviConfig: .rewriteToProfile5,
+                    convertP7ToProfile81: false,
+                    dvVariant: dvVariant
+                )
+            }
             let compat = Int(dvRecord?.dv_bl_signal_compatibility_id ?? 1)
             let needsCompatRewrite = compat != 1
             let supplemental: String?
-            let strip: Bool
+            let doviConfig: MP4SegmentMuxer.DoviConfigPolicy
             if effectiveDvMode {
                 supplemental = "dvh1.08.\(dvLevelStr)/db1p"
-                strip = false
+                doviConfig = needsCompatRewrite ? .rewriteToProfile81 : .keep
             } else {
                 supplemental = nil
-                strip = true
+                doviConfig = .strip
             }
             if needsCompatRewrite && effectiveDvMode {
                 EngineLog.emit(
@@ -407,9 +481,8 @@ extension HLSVideoEngine {
                 videoRange: .pq,
                 primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
                 supplementalCodecs: supplemental,
-                stripDolbyVisionMetadata: strip,
+                doviConfig: doviConfig,
                 convertP7ToProfile81: false,
-                rewriteDoviConfigTo81: needsCompatRewrite && effectiveDvMode,
                 dvVariant: dvVariant
             )
         case .profile84:
@@ -418,20 +491,20 @@ extension HLSVideoEngine {
             // Non-DV panel: strip dvvC (same -11868 risk as P8.1). Plain HLG plays + tonemaps on all panels.
             // Note: dvh1 sample entry is never valid for HLG-base (AVPlayer rejects it, DrHurt#4 Build 160).
             let supplemental: String?
-            let strip: Bool
+            let doviConfig: MP4SegmentMuxer.DoviConfigPolicy
             if effectiveDvMode {
                 supplemental = "dvh1.08.\(dvLevelStr)/db4h"
-                strip = false
+                doviConfig = .keep
             } else {
                 supplemental = nil
-                strip = true
+                doviConfig = .strip
             }
             return CodecRoute(
                 codecTagOverride: "hvc1",
                 videoRange: .hlg,
                 primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
                 supplementalCodecs: supplemental,
-                stripDolbyVisionMetadata: strip,
+                doviConfig: doviConfig,
                 convertP7ToProfile81: false,
                 dvVariant: dvVariant
             )
@@ -440,22 +513,21 @@ extension HLSVideoEngine {
             // drop EL, rewrite container dvcC to P8.1, route as hvc1 + SUPPLEMENTAL dvh1.08.XX/db1p.
             // Non-DV panel: no Apple P7 decoder; strip dvcC, play PQ HEVC HDR10 base.
             let supplemental: String?
-            let strip: Bool
+            let doviConfig: MP4SegmentMuxer.DoviConfigPolicy
             if effectiveDvMode {
                 supplemental = "dvh1.08.\(dvLevelStr)/db1p"
-                strip = false
+                doviConfig = .rewriteToProfile81
             } else {
                 supplemental = nil
-                strip = true
+                doviConfig = .strip
             }
             return CodecRoute(
                 codecTagOverride: "hvc1",
                 videoRange: .pq,
                 primaryCodecs: "hvc1.2.4.L\(hevcLevel)",
                 supplementalCodecs: supplemental,
-                stripDolbyVisionMetadata: strip,
+                doviConfig: doviConfig,
                 convertP7ToProfile81: effectiveDvMode,
-                rewriteDoviConfigTo81: effectiveDvMode,
                 dvVariant: dvVariant
             )
         case .unknown:
@@ -477,7 +549,7 @@ extension HLSVideoEngine {
                 videoRange: manifestVideoRange(codecpar),
                 primaryCodecs: plainHEVCCodecs(codecpar: codecpar, fallbackLevel: hevcLevel),
                 supplementalCodecs: nil,
-                stripDolbyVisionMetadata: dvVariant == .profile82,
+                doviConfig: dvVariant == .profile82 ? .strip : .keep,
                 convertP7ToProfile81: false,
                 dvVariant: dvVariant
             )

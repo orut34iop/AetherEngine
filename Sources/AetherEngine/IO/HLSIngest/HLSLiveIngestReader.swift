@@ -32,8 +32,16 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// Tracks observed segment-arrival cadence for LL-HLS shaping (AetherEngine#167). Updated whenever new
     /// upstream segments appear; read via `observedLiveCadenceSeconds`.
     private var _cadenceMeter = LiveArrivalCadenceMeter()
+    /// AE#447: longest EXTINF the upstream has actually served, the measured counterpart to
+    /// `_upstreamTargetDuration`. Monotonic; read via `upstreamSegmentDurationSeconds`.
+    private var _upstreamSegmentDurationSeconds: Double?
     /// Installed by the resolver before the first FIFO byte; nil = muxed audio.
     private var _companionAudioReader: HLSLiveIngestReader?
+    /// AE#359: SUBTITLES renditions of the picked variant, resolved to absolute URLs. Metadata only.
+    private var _subtitleRenditions: [LiveSubtitleRenditionInfo] = []
+    /// AE#359: EXT-X-PROGRAM-DATE-TIME of the first segment this reader joined at, i.e. the wall time
+    /// the engine's own timeline starts at. The anchor a sibling rendition is placed against.
+    private var _joinWallClock: Date?
     /// "mpegts" or "aac", classified from the first segment's leading bytes, written before that segment's first FIFO byte.
     private var _segmentFormatHint: String?
     private var _packedAudioTimestampOffset90k: Int64?
@@ -67,6 +75,14 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         return startLock.withLock { _cadenceMeter.observedCadence(at: now) }
     }
 
+    public var upstreamSegmentDurationSeconds: Double? {
+        startLock.withLock { _upstreamSegmentDurationSeconds }
+    }
+
+    public var closedLiveCadenceSeconds: Double? {
+        startLock.withLock { _cadenceMeter.closedCadence }
+    }
+
     /// Monotonic seconds (uptime); immune to wall-clock jumps that would corrupt interval measurement.
     private static func monotonicNow() -> Double {
         Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
@@ -74,6 +90,14 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     public var companionAudioReader: IOReader? {
         startLock.withLock { _companionAudioReader }
+    }
+
+    var subtitleRenditions: [LiveSubtitleRenditionInfo] {
+        startLock.withLock { _subtitleRenditions }
+    }
+
+    var joinWallClock: Date? {
+        startLock.withLock { _joinWallClock }
     }
 
     public var packedAudioTimestampOffset90k: Int64? {
@@ -224,21 +248,42 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     )
                 }
                 if media.hasMap { throw HLSIngestError.unsupportedSegmentFormat }
-                refreshInterval = min(6, max(1, media.targetDuration / 2))
+                // AE#447: sample at half the SERVED segment duration, not half the advertised target.
+                // A padded advert (`segment + 1`, which the RFC allows and packagers habitually serve)
+                // makes the poll coarser than the source's real cadence, and arrivals then quantize
+                // upward: a 2.000 s source polled every 1.5 s shows 3 s inter-arrival gaps, and that is
+                // what the served TARGETDURATION gets sealed from. Never above the advert, which stays
+                // the upper bound a conforming origin promises.
+                let servedSegment = media.segments.last?.duration ?? media.targetDuration
+                refreshInterval = min(6, max(1, min(servedSegment, media.targetDuration) / 2))
 
                 let isJoin = !sniffedFirstSegment
                 let fresh = tracker.newSegments(in: media)
                 if tracker.stallCount > 6 { throw HLSIngestError.ingestStalled }
                 if !fresh.isEmpty {
                     // Real arrival of new content: the interval since the previous arrival is the observed
-                    // cadence the engine shapes the local playlist around (AetherEngine#167).
+                    // cadence the engine shapes the local playlist around (AetherEngine#167). The longest
+                    // segment served rides along, because it bounds that cadence from below before any
+                    // interval has closed, which is when the served TARGETDURATION is sealed (AE#447).
                     let now = Self.monotonicNow()
-                    startLock.withLock { _cadenceMeter.recordArrival(at: now) }
+                    let longest = fresh.reduce(0.0) { max($0, $1.duration) }
+                    startLock.withLock {
+                        _cadenceMeter.recordArrival(at: now)
+                        if longest > 0 {
+                            _upstreamSegmentDurationSeconds = max(_upstreamSegmentDurationSeconds ?? 0, longest)
+                        }
+                    }
                 }
                 if isJoin, !fresh.isEmpty {
+                    // AE#359: the wall time the engine's timeline begins at. Sibling renditions carry the
+                    // same PDT for the same content, which is what makes their cues placeable.
+                    if let joinDate = fresh.first?.programDateTime {
+                        startLock.withLock { _joinWallClock = joinDate }
+                    }
                     let backlog = fresh.reduce(0.0) { $0 + $1.duration }
                     EngineLog.emit(
-                        "[HLSIngest] joined \(fresh.count) segment(s), ~\(Int(backlog))s behind the live edge",
+                        "[HLSIngest] joined \(fresh.count) segment(s), ~\(Int(backlog))s behind the live edge"
+                        + " pdt=\(fresh.first?.programDateTime.map { "\($0)" } ?? "nil")",
                         category: .engine
                     )
                 }
@@ -435,6 +480,28 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     category: .engine
                 )
                 installCompanion(HLSLiveIngestReader(playlistURL: audioURL, httpHeaders: httpHeaders, role: .companionAudio))
+            }
+            // AE#359: the variant's SUBTITLES group, resolved to absolute playlist URLs and published as
+            // metadata. Nothing is fetched here; the host decides whether a subtitle track is ever wanted.
+            if let group = best.subtitleGroupID {
+                let resolved = master.subtitleRenditions
+                    .filter { $0.groupID == group }
+                    .compactMap { rendition -> LiveSubtitleRenditionInfo? in
+                        guard let url = HLSPlaylistParser.resolve(uri: rendition.uri, against: finalURL) else {
+                            return nil
+                        }
+                        return LiveSubtitleRenditionInfo(name: rendition.name, language: rendition.language,
+                                                         isDefault: rendition.isDefault,
+                                                         isForced: rendition.isForced, playlistURL: url)
+                    }
+                startLock.withLock { _subtitleRenditions = resolved }
+                // Logged including the empty case: a group that resolves to nothing is a routing answer,
+                // and a silent diagnostic there is indistinguishable from a resolver that never ran.
+                EngineLog.emit(
+                    "[HLSIngest] subtitle renditions in group \"\(group)\": \(resolved.count)"
+                    + (resolved.isEmpty ? "" : " (" + resolved.map { $0.language ?? "und" }.joined(separator: ", ") + ")"),
+                    category: .engine
+                )
             }
             EngineLog.emit("[HLSIngest] master playlist: picked variant bandwidth=\(best.bandwidth)", category: .engine)
             return (url, nil)

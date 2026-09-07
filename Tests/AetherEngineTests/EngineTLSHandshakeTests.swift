@@ -1,9 +1,9 @@
-// Live-handshake proof for `EngineTLS.allowedUntrustedCertificateOrigins`. The
-// resolver unit tests cannot show the load-bearing part: that URLSession
-// actually delivers the server-trust challenge to the reader's per-task
-// delegates. NWListener rejects an imported in-memory identity with EINVAL,
-// so the self-signed origin runs as a Python subprocess, which limits this
-// suite to macOS, the platform `swift test` runs on anyway.
+// Live-handshake proof for `EngineTLS.serverTrustEvaluator`. The resolver
+// unit tests cannot show the load-bearing part: that URLSession actually
+// delivers the server-trust challenge to the reader's per-task delegates.
+// NWListener rejects an imported in-memory identity with EINVAL, so the
+// self-signed origin runs as a Python subprocess, which limits this suite to
+// macOS, the platform `swift test` runs on anyway.
 #if os(macOS)
 
     import Foundation
@@ -11,48 +11,55 @@
 
     @testable import AetherEngine
 
-    /// Everything that replaces EngineTLS's process-wide origin set lives in
-    /// this one suite. Suites otherwise run in parallel, so a second suite
-    /// mutating it would decide what this one is testing.
+    /// Everything that sets `EngineTLS.serverTrustEvaluator` lives in this one
+    /// suite. The evaluator is process global and suites otherwise run in
+    /// parallel, so a second suite setting it would decide what this one is
+    /// testing.
     extension EngineTLSTestSuite {
+    @Suite("EngineTLS live handshake against a self-signed origin")
+    struct EngineTLSHandshakeTests {
 
-    @Suite("Live handshake against a self-signed origin")
-    struct HandshakeTests {
+        /// Lives here rather than beside the resolver tests because reading the
+        /// evaluator is as much a claim on the process global as writing it,
+        /// and a suite that only reads still races the ones that write.
+        @Test("No evaluator is set by default")
+        func defaultsToNoEvaluator() {
+            #expect(EngineTLS.serverTrustEvaluator == nil)
+        }
 
-        @Test("Empty policy: the handshake is refused and no request reaches the origin")
+        @Test("No evaluator: the handshake is refused and no request reaches the origin")
         func refusedByDefault() async throws {
             let server = try #require(SelfSignedTLSOrigin())
             defer { server.stop() }
 
-            let previous = EngineTLS.allowedUntrustedCertificateOrigins
-            defer { EngineTLS.allowedUntrustedCertificateOrigins = previous }
-            EngineTLS.allowedUntrustedCertificateOrigins = []
+            let previous = EngineTLS.serverTrustEvaluator
+            defer { EngineTLS.serverTrustEvaluator = previous }
+            EngineTLS.serverTrustEvaluator = nil
 
             let reader = AVIOReader(
                 url: URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!,
                 chunkRequestTimeout: 5, chunkMaxRetries: 1)
             defer { reader.markClosed(); reader.close() }
-            try reader.open()
+            let refusal = Self.openFailure(of: reader)
 
-            try await Task.sleep(for: .seconds(3))
+            try await Task.sleep(for: .seconds(1))
             #expect(server.requestsServed == 0,
                     "a request crossed a handshake that system trust should have refused")
+            #expect(Self.isTrustRefusal(refusal),
+                    "open failed as \(String(describing: refusal)), not a trust refusal")
         }
 
-        @Test("Exact origin approval serves the reader")
-        func acceptedWhenExactOriginIsAllowed() async throws {
+        @Test("Accepted for this origin: the same server serves the reader")
+        func acceptedWhenOptedIn() async throws {
             let server = try #require(SelfSignedTLSOrigin())
             defer { server.stop() }
 
-            let url = URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!
-            let previous = EngineTLS.allowedUntrustedCertificateOrigins
-            defer { EngineTLS.allowedUntrustedCertificateOrigins = previous }
-            EngineTLS.allowedUntrustedCertificateOrigins = [
-                try #require(EngineTLS.Origin(url: url))
-            ]
+            let previous = EngineTLS.serverTrustEvaluator
+            defer { EngineTLS.serverTrustEvaluator = previous }
+            EngineTLS.serverTrustEvaluator = { _ in true }
 
             let reader = AVIOReader(
-                url: url,
+                url: URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!,
                 chunkRequestTimeout: 10, chunkMaxRetries: 2)
             defer { reader.markClosed(); reader.close() }
             try reader.open()
@@ -72,46 +79,46 @@
             #expect(server.requestsServed > 0)
         }
 
-        @Test("A different port does not inherit an origin approval")
-        func wrongPortIsRefused() async throws {
+
+        @Test("An evaluator that answers for another host leaves this one refused")
+        func refusedForAnOriginTheHostDidNotAccept() async throws {
             let server = try #require(SelfSignedTLSOrigin())
             defer { server.stop() }
 
-            let wrongPort = server.port == UInt16.max ? Int(server.port) - 1 : Int(server.port) + 1
-            let previous = EngineTLS.allowedUntrustedCertificateOrigins
-            defer { EngineTLS.allowedUntrustedCertificateOrigins = previous }
-            EngineTLS.allowedUntrustedCertificateOrigins = [
-                try #require(EngineTLS.Origin(
-                    scheme: "https", host: "127.0.0.1", port: wrongPort))
-            ]
+            // The case a process-wide flag cannot express: a host holding a LAN
+            // address behind a private certificate and a WAN address with a real
+            // one, accepting the first without quietly relaxing the second.
+            let previous = EngineTLS.serverTrustEvaluator
+            defer { EngineTLS.serverTrustEvaluator = previous }
+            EngineTLS.serverTrustEvaluator = { $0.host == "media.example" }
 
             let reader = AVIOReader(
                 url: URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!,
                 chunkRequestTimeout: 5, chunkMaxRetries: 1)
             defer { reader.markClosed(); reader.close() }
-            try reader.open()
+            let refusal = Self.openFailure(of: reader)
 
-            try await Task.sleep(for: .seconds(3))
-            #expect(server.requestsServed == 0)
+            try await Task.sleep(for: .seconds(1))
+            #expect(server.requestsServed == 0,
+                    "a request crossed a handshake the evaluator did not accept")
+            #expect(Self.isTrustRefusal(refusal),
+                    "open failed as \(String(describing: refusal)), not a trust refusal")
         }
 
-        @Test("Through the proxy: a client that never sees the certificate gets the stream")
-        func proxyServesThroughUntrustedOrigin() async throws {
+        @Test("Through the relay: a client that never sees the certificate gets the stream")
+        func relayServesThroughUntrustedOrigin() async throws {
             let origin = try #require(SelfSignedHLSOrigin())
             defer { origin.stop() }
 
+            let previous = EngineTLS.serverTrustEvaluator
+            defer { EngineTLS.serverTrustEvaluator = previous }
+            EngineTLS.serverTrustEvaluator = { _ in true }
+
+            let server = try Self.relayServer()
+            defer { server.stop(); server.relay?.stop() }
+
             let master = URL(string: "https://127.0.0.1:\(origin.port)/master.m3u8")!
-            let previous = EngineTLS.allowedUntrustedCertificateOrigins
-            defer { EngineTLS.allowedUntrustedCertificateOrigins = previous }
-            EngineTLS.allowedUntrustedCertificateOrigins = [
-                try #require(EngineTLS.Origin(url: master))
-            ]
-
-            let proxy = HLSReverseProxyServer()
-            try proxy.start()
-            defer { proxy.stop() }
-
-            let entry = try #require(proxy.proxyURL(for: master))
+            let entry = try #require(server.relayURL(for: master))
 
             let playlist = try await Self.text(of: entry)
             #expect(playlist.contains("#EXT-X-STREAM-INF"))
@@ -132,27 +139,134 @@
             #expect(bytes.first == 0x47, "not an MPEG-TS sync byte")
         }
 
-        @Test("Through the proxy: an unapproved origin is not laundered")
-        func proxyRefusesWhenNotOptedIn() async throws {
+        @Test("Moonfin exact-origin policy works through the upstream relay")
+        func exactOriginRelayServesThroughUntrustedOrigin() async throws {
             let origin = try #require(SelfSignedHLSOrigin())
             defer { origin.stop() }
 
             let previous = EngineTLS.allowedUntrustedCertificateOrigins
             defer { EngineTLS.allowedUntrustedCertificateOrigins = previous }
-            EngineTLS.allowedUntrustedCertificateOrigins = []
+            EngineTLS.allowedUntrustedCertificateOrigins = [
+                try #require(EngineTLS.Origin(scheme: "https", host: "127.0.0.1", port: Int(origin.port)))
+            ]
 
-            let proxy = HLSReverseProxyServer()
-            try proxy.start()
-            defer { proxy.stop() }
+            let server = try Self.relayServer()
+            defer { server.stop(); server.relay?.stop() }
 
             let master = URL(string: "https://127.0.0.1:\(origin.port)/master.m3u8")!
-            let entry = try #require(proxy.proxyURL(for: master))
+            let entry = try #require(server.relayURL(for: master))
+
+            let playlist = try await Self.text(of: entry)
+            #expect(playlist.contains("#EXT-X-STREAM-INF"))
+            let variant = try #require(
+                playlist.components(separatedBy: "\n").first { $0.hasPrefix("http://127.0.0.1:") })
+
+            let media = try await Self.text(of: try #require(URL(string: variant)))
+            #expect(media.contains("#EXTINF"))
+            let segmentLine = try #require(
+                media.components(separatedBy: "\n").first {
+                    $0.hasPrefix("http://127.0.0.1:") && !$0.contains("m3u8")
+                })
+
+            let (bytes, response) = try await URLSession.shared.data(
+                from: try #require(URL(string: segmentLine)))
+            #expect((response as? HTTPURLResponse)?.statusCode == 200)
+            #expect(bytes.count == 4096, "served \(bytes.count) segment bytes")
+            #expect(bytes.first == 0x47, "not an MPEG-TS sync byte")
+        }
+
+        @Test("Through the relay: no evaluator refuses to launder an untrusted origin")
+        func relayRefusesWhenNotOptedIn() async throws {
+            let origin = try #require(SelfSignedHLSOrigin())
+            defer { origin.stop() }
+
+            let previous = EngineTLS.serverTrustEvaluator
+            defer { EngineTLS.serverTrustEvaluator = previous }
+            EngineTLS.serverTrustEvaluator = nil
+
+            let server = try Self.relayServer()
+            defer { server.stop(); server.relay?.stop() }
+
+            let master = URL(string: "https://127.0.0.1:\(origin.port)/master.m3u8")!
+            let entry = try #require(server.relayURL(for: master))
 
             var request = URLRequest(url: entry)
             request.timeoutInterval = 15
             let (_, response) = try await URLSession.shared.data(for: request)
             #expect((response as? HTTPURLResponse)?.statusCode == 502,
                     "the upstream handshake should have failed system trust")
+        }
+
+        @Test("Through the relay: an origin the evaluator declines is not laundered either")
+        func relayRefusesAnOriginTheEvaluatorDeclines() async throws {
+            let origin = try #require(SelfSignedHLSOrigin())
+            defer { origin.stop() }
+
+            // The relay is mounted for every https origin once an evaluator
+            // exists, so the per-origin answer has to hold at the handshake it
+            // makes on the player's behalf.
+            let previous = EngineTLS.serverTrustEvaluator
+            defer { EngineTLS.serverTrustEvaluator = previous }
+            EngineTLS.serverTrustEvaluator = { $0.host == "media.example" }
+
+            let server = try Self.relayServer()
+            defer { server.stop(); server.relay?.stop() }
+
+            let master = URL(string: "https://127.0.0.1:\(origin.port)/master.m3u8")!
+            let entry = try #require(server.relayURL(for: master))
+
+            var request = URLRequest(url: entry)
+            request.timeoutInterval = 15
+            let (_, response) = try await URLSession.shared.data(for: request)
+            #expect((response as? HTTPURLResponse)?.statusCode == 502,
+                    "an origin the evaluator declined was served anyway")
+        }
+
+        @Test("A self-signed origin is what the relay is mounted for")
+        func trustProbeNamesTheSelfSignedOrigin() async throws {
+            let origin = try #require(SelfSignedHLSOrigin())
+            defer { origin.stop() }
+
+            // The probe asks the system, not the evaluator, so an answer already given here must not
+            // change what it reads: what is being measured is whether AVPlayer could reach the origin
+            // unaided, and AVPlayer never sees the evaluator.
+            let previous = EngineTLS.serverTrustEvaluator
+            defer { EngineTLS.serverTrustEvaluator = previous }
+            EngineTLS.serverTrustEvaluator = { _ in true }
+
+            let refused = await HLSOriginRelay.systemTrustRefuses(
+                URL(string: "https://127.0.0.1:\(origin.port)/master.m3u8")!)
+            #expect(refused, "the origin the relay exists for was read as one AVPlayer could reach")
+        }
+
+        private static func relayServer() throws -> HLSLocalServer {
+            let server = HLSLocalServer(relay: HLSOriginRelay())
+            try server.start()
+            return server
+        }
+
+        @Test("A different port does not inherit an origin approval")
+        func wrongPortIsRefused() async throws {
+            let server = try #require(SelfSignedTLSOrigin())
+            defer { server.stop() }
+
+            let wrongPort = server.port == UInt16.max ? Int(server.port) - 1 : Int(server.port) + 1
+            let previous = EngineTLS.allowedUntrustedCertificateOrigins
+            defer { EngineTLS.allowedUntrustedCertificateOrigins = previous }
+            EngineTLS.allowedUntrustedCertificateOrigins = [
+                try #require(EngineTLS.Origin(
+                    scheme: "https", host: "127.0.0.1", port: wrongPort))
+            ]
+
+            let reader = AVIOReader(
+                url: URL(string: "https://127.0.0.1:\(server.port)/movie.bin")!,
+                chunkRequestTimeout: 5, chunkMaxRetries: 1)
+            defer { reader.markClosed(); reader.close() }
+            let refusal = Self.openFailure(of: reader)
+            #expect(Self.isTrustRefusal(refusal))
+
+            try await Task.sleep(for: .seconds(1))
+            #expect(server.requestsServed == 0)
         }
 
         @Test("A redirect target does not inherit the source origin approval")
@@ -225,6 +339,22 @@
             let (data, response) = try await URLSession.shared.data(for: request)
             #expect((response as? HTTPURLResponse)?.statusCode == 200)
             return String(decoding: data, as: UTF8.self)
+        }
+
+        /// A refused handshake reaches the host as a typed failure rather than as unreadable media,
+        /// so the refusal arms assert the classification and not only that no byte was served.
+        private static func openFailure(of reader: AVIOReader) -> Error? {
+            do {
+                try reader.open()
+                return nil
+            } catch {
+                return error
+            }
+        }
+
+        private static func isTrustRefusal(_ error: Error?) -> Bool {
+            guard case .transportSecurityFailed = error as? AVIOReaderError else { return false }
+            return true
         }
     }
 

@@ -23,6 +23,32 @@ final class LiveProductionHaltTests: XCTestCase {
             "non-halted signal-less live keeps the low-latency default")
     }
 
+    // MARK: - Delivery stall (AE#446)
+
+    /// Same policy as the halt above, applied one watchdog earlier. A source that has stopped
+    /// delivering cannot satisfy a blocking reload either, and holding the client's poll for
+    /// 3 x TARGETDURATION costs it every segment it would otherwise have fetched from the cache.
+    func testDeliveryStallBeatsOverrideAndPolicy() {
+        XCTAssertFalse(
+            VideoSegmentProvider.resolveLiveBlockingReload(
+                deliveryStalled: true, override: true, policy: nil),
+            "a source that is not delivering cannot honor blocking-reload however loudly the host asks")
+        XCTAssertFalse(
+            VideoSegmentProvider.resolveLiveBlockingReload(
+                deliveryStalled: true, override: nil, policy: nil))
+        XCTAssertTrue(
+            VideoSegmentProvider.resolveLiveBlockingReload(
+                deliveryStalled: false, override: nil, policy: nil),
+            "a delivering source keeps the low-latency default")
+    }
+
+    func testHaltAndDeliveryStallAreIndependentRoutesToTheSameAnswer() {
+        XCTAssertFalse(VideoSegmentProvider.resolveLiveBlockingReload(
+            halted: true, deliveryStalled: false, override: true, policy: nil))
+        XCTAssertFalse(VideoSegmentProvider.resolveLiveBlockingReload(
+            halted: false, deliveryStalled: true, override: true, policy: nil))
+    }
+
     // MARK: - Pump-exit classification
 
     func testHostRetuneExitsHaltLiveProduction() {
@@ -49,12 +75,53 @@ final class LiveProductionHaltTests: XCTestCase {
         XCTAssertFalse(HLSVideoEngine.shouldHaltLiveProduction(
             reason: .stopRequested, sourceReopenable: false))
         XCTAssertFalse(HLSVideoEngine.shouldHaltLiveProduction(
-            reason: .muxerFailed, sourceReopenable: false))
+            reason: .muxerFailed, sourceReopenable: false),
+            "handleLiveMuxerFailure rebuilds the producer into the same provider; an eager halt would 503 the provider the rebuild serves, and the arm halts itself on budget exhaustion")
         XCTAssertFalse(HLSVideoEngine.shouldHaltLiveProduction(
             reason: .backpressureWedge, sourceReopenable: false))
         XCTAssertFalse(HLSVideoEngine.shouldHaltLiveProduction(
             reason: .needsAudioSampleEntryPrime, sourceReopenable: false),
-            "AE#222 rebuilds into the same provider with a primed muxer, so production continues")
+            "the AE#222 arm rebuilds into the same provider with a primed muxer (in place for live), so production continues")
+    }
+
+    // MARK: - Live recovery budget (shared by the in-place muxer rebuild and the reopen ladder)
+
+    /// Both arms carry their own counter pair but the same decision, and both ship the same cap. Pinned
+    /// because the reopen arm ran an untested inline copy of this until the muxer arm needed it too.
+    func testBothLiveRecoveryArmsShipTheSameCap() {
+        XCTAssertEqual(HLSVideoEngine.maxBarrenReopenCycles, 3)
+        XCTAssertEqual(HLSVideoEngine.maxLiveMuxerRebuildCycles, 3)
+    }
+
+    func testFirstLiveMuxerDeathAlwaysRebuilds() {
+        let d = HLSVideoEngine.liveRecoveryBudgetDecision(
+            progressIndex: 414, lastProgressIndex: -1, barrenCycles: 0, cap: 3)
+        XCTAssertTrue(d.proceed, "a fresh death at a new continuation point starts a fresh budget")
+        XCTAssertEqual(d.newBarrenCycles, 0)
+    }
+
+    func testProgressSinceLastDeathResetsTheBudget() {
+        let d = HLSVideoEngine.liveRecoveryBudgetDecision(
+            progressIndex: 431, lastProgressIndex: 414, barrenCycles: 2, cap: 3)
+        XCTAssertTrue(d.proceed,
+            "segments were cut since the last death: an hours-long channel crossing several encoder restarts must not exhaust a session-lifetime budget")
+        XCTAssertEqual(d.newBarrenCycles, 0)
+    }
+
+    func testConsecutiveBarrenDeathsExhaustTheBudget() {
+        var cycles = 0
+        var last = -1
+        var rebuilds = 0
+        // Death after death at the same continuation point: nothing was ever produced in between.
+        for _ in 0..<10 {
+            let d = HLSVideoEngine.liveRecoveryBudgetDecision(
+                progressIndex: 414, lastProgressIndex: last, barrenCycles: cycles, cap: 3)
+            cycles = d.newBarrenCycles
+            last = 414
+            if d.proceed { rebuilds += 1 } else { break }
+        }
+        XCTAssertEqual(rebuilds, 3,
+            "exactly the cap's worth of barren rebuilds, then halt + host retune, never an endless rebuild storm against an unmuxable source")
     }
 
     // MARK: - Provider halt latch
@@ -119,7 +186,7 @@ final class LiveProductionHaltTests: XCTestCase {
         let server = HLSLocalServer(provider: provider)
         try server.start()
         defer { server.stop() }
-        let result = try fetch(URL(string: "http://127.0.0.1:\(server.port)/media.m3u8?_HLS_msn=99")!)
+        let result = try fetch(URL(string: "http://127.0.0.1:\(server.port)/\(server.pathToken)/media.m3u8?_HLS_msn=99")!)
         XCTAssertEqual(result.status, 503,
                        "a held blocking reload that cannot be satisfied must 503 (retriable), never serve the unchanged playlist (-15410)")
     }
@@ -129,7 +196,7 @@ final class LiveProductionHaltTests: XCTestCase {
         let server = HLSLocalServer(provider: provider)
         try server.start()
         defer { server.stop() }
-        let result = try fetch(URL(string: "http://127.0.0.1:\(server.port)/media.m3u8?_HLS_msn=2")!)
+        let result = try fetch(URL(string: "http://127.0.0.1:\(server.port)/\(server.pathToken)/media.m3u8?_HLS_msn=2")!)
         XCTAssertEqual(result.status, 200)
         XCTAssertTrue(result.body.contains("#EXTM3U"), "satisfied hold serves the playlist as before")
     }
@@ -141,7 +208,7 @@ final class LiveProductionHaltTests: XCTestCase {
         let server = HLSLocalServer(provider: provider)
         try server.start()
         defer { server.stop() }
-        let result = try fetch(URL(string: "http://127.0.0.1:\(server.port)/media.m3u8?_HLS_msn=99")!)
+        let result = try fetch(URL(string: "http://127.0.0.1:\(server.port)/\(server.pathToken)/media.m3u8?_HLS_msn=99")!)
         XCTAssertEqual(result.status, 200)
         XCTAssertTrue(result.body.contains("#EXTM3U"))
         XCTAssertEqual(provider.holdCalls, 0, "gate OFF must never park the request in waitForLiveSegment")

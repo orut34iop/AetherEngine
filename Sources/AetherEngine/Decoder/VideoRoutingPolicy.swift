@@ -1,9 +1,10 @@
-import Libavcodec
+import AetherLibavcodec
+import AetherLibavutil
 
 /// Pure codec-and-field-order routing decision extracted from AetherEngine.load's dispatch so it is
-/// unit-testable. Mirrors the historical switch (AV1 gated on HW, VP9/VP8/MPEG4/MPEG2/VC1 always
-/// software) and adds the #107 rule: interlaced H.264 goes software so DeinterlaceFilter (bwdif) can
-/// deinterlace it. tvOS AVPlayer does not deinterlace, so 1080i broadcast otherwise combs.
+/// unit-testable. Native carries HEVC, H.264 and HW-decodable AV1; every other video codec is
+/// software. The #107 rule sits on top: interlaced H.264 goes software too, so DeinterlaceFilter
+/// (bwdif) can deinterlace it. tvOS AVPlayer does not deinterlace, so 1080i broadcast otherwise combs.
 enum VideoRoutingPolicy {
 
     /// Field orders that indicate interlaced content warranting software deinterlacing.
@@ -19,25 +20,58 @@ enum VideoRoutingPolicy {
     /// through untouched), never a wrong deinterlace. #232 narrows that class: on a seekable VOD
     /// source the declaration is checked against decoded frames before it routes (see
     /// `InterlaceProbe` and `routesSoftwareForDeclaredInterlace`).
+    ///
+    /// FFmpegBuild#1: the native side is an allowlist, not a denylist. `HLSVideoEngine` refuses
+    /// anything that is not HEVC / H.264 / HW-decodable AV1 (`unsupportedCodec`), so a codec that is
+    /// merely absent from the software list did not fall back, it failed the load. That took every
+    /// codec nobody had enumerated (qtrle, ProRes, MJPEG, Theora, the QuickTime long tail) to the one
+    /// path that cannot play it, while the software path decodes them. Only `AV_CODEC_ID_NONE` stays
+    /// native by default: an audio-only source probes as NONE and has no video route to get wrong.
     static func requiresSoftwarePath(
         codecID: AVCodecID,
         fieldOrder: AVFieldOrder,
         av1Available: Bool,
-        spsIndicatesInterlaced: Bool = false
+        spsIndicatesInterlaced: Bool = false,
+        stereo3DType: AVStereo3DType? = nil
     ) -> Bool {
         switch codecID {
+        case AV_CODEC_ID_NONE, AV_CODEC_ID_HEVC:
+            return false
         case AV_CODEC_ID_AV1:
             return !av1Available
-        case AV_CODEC_ID_VP9, AV_CODEC_ID_VP8, AV_CODEC_ID_MPEG4,
-             AV_CODEC_ID_MPEG2VIDEO, AV_CODEC_ID_VC1:
-            return true
         case AV_CODEC_ID_H264:
+            if routesSoftwareForMultiviewCarriage(codecID: codecID, stereo3DType: stereo3DType) {
+                return true
+            }
             return routesSoftwareForDeclaredInterlace(
                 codecID: codecID, fieldOrder: fieldOrder,
                 spsIndicatesInterlaced: spsIndicatesInterlaced)
         default:
-            return false
+            return true
         }
+    }
+
+    /// #435: H.264 that carries both stereo views inside one track, which is how a 3D Blu-ray MVC remux
+    /// is muxed: Matroska StereoMode 13 / 14 (`block_lr` / `block_rl`, both eyes in one block), reported
+    /// by libavformat as stream-level `AV_PKT_DATA_STEREO3D` of type `AV_STEREO3D_FRAMESEQUENCE`. The
+    /// dependent view's slices reference a subset SPS the base decoder does not have, so a decoder that
+    /// only knows plain H.264 has to skip them, and VideoToolbox gets no say in that: it is handed whole
+    /// samples with both views' NALs inside and renders nothing (reported as black video with audio
+    /// playing). libavcodec skips the extension NALs and decodes the base view, which is the left eye and
+    /// exactly the 2D fallback every non-3D player shows, so the software path is the one that produces a
+    /// picture. Same shape as the interlaced and High 4:2:2 rules: native on paper, no picture in practice.
+    ///
+    /// Only these two carriages qualify. The frame-packed modes (side by side, top / bottom, checkerboard,
+    /// row or column interleaved, anaglyph) are single self-contained pictures that decode natively and
+    /// keep the native route; the host, not the engine, decides whether to crop an eye out of them.
+    /// HEVC is excluded on purpose: MV-HEVC is Apple's own spatial-video format, and the native path
+    /// plays its base layer.
+    static func routesSoftwareForMultiviewCarriage(
+        codecID: AVCodecID,
+        stereo3DType: AVStereo3DType?
+    ) -> Bool {
+        guard codecID == AV_CODEC_ID_H264 else { return false }
+        return stereo3DType == AV_STEREO3D_FRAMESEQUENCE
     }
 
     /// #232: true when the declared-interlace rule, and only that rule, is what sends this stream to
@@ -88,6 +122,27 @@ enum VideoRoutingPolicy {
             return !canHardwareDecode()
         default:
             return false
+        }
+    }
+
+    /// AE#461: the decode path a session ends up on, given what the routing concluded and what the
+    /// host asked for. Pure so the override is unit-testable next to the decisions it overrules.
+    ///
+    /// One-way by construction: `.software` moves a session onto `SoftwarePlaybackHost`, and nothing
+    /// moves one off it. Every route the engine sends to software it sends there because the native
+    /// path cannot serve it (AV1 without hardware decode, VP9, a forward-only source, MVC carriage,
+    /// a format VideoToolbox cannot hardware-decode), so a `.native` preference would buy a black
+    /// screen and does not exist. The host's evidence is only ever "this native session is not
+    /// decoding", never "this software session should be native".
+    ///
+    /// This does NOT suspend the guards that run after the routing decision. A source whose only
+    /// signal is IPT-PQ-c2 still fails the load through `softwarePathCannotRepresent`, and a
+    /// demuxed-audio live source still fails rather than playing silent: an override says which host
+    /// serves the session, not what that host is able to represent.
+    static func usesSoftwarePath(routedSoftware: Bool, preferred: DecodePath) -> Bool {
+        switch preferred {
+        case .automatic: return routedSoftware
+        case .software: return true
         }
     }
 

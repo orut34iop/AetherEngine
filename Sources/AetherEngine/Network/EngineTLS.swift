@@ -71,6 +71,26 @@ public enum EngineTLS {
         }
     }
 
+    /// Decides whether to accept a server certificate that failed system
+    /// trust evaluation, for the origin the challenge came from.
+    ///
+    /// nil, the default, keeps the system's default handling everywhere. The
+    /// blunt answer is one line (`{ _ in true }`), and a host holding a LAN
+    /// address behind a private certificate alongside a WAN address with a
+    /// real one can answer for each rather than relaxing both. A host that
+    /// wants to pin an SPKI hash reads the protection space and decides.
+    ///
+    /// Read per challenge, so replacing it applies from the next connection
+    /// without rebuilding sessions. Called off the main actor, from whichever
+    /// queue the session raised the challenge on, so it has to be
+    /// thread-safe. Lock-guarded like `EngineLog.handler`.
+    public static var serverTrustEvaluator: (@Sendable (URLProtectionSpace) -> Bool)? {
+        get { lock.lock(); defer { lock.unlock() }; return _evaluator }
+        set { lock.lock(); _evaluator = newValue; lock.unlock() }
+    }
+
+    nonisolated(unsafe) private static var _evaluator: (@Sendable (URLProtectionSpace) -> Bool)?
+
     private static let lock = NSLock()
     nonisolated(unsafe) private static var _allowedUntrustedCertificateOrigins: Set<Origin> = []
 
@@ -104,8 +124,8 @@ public enum EngineTLS {
         guard
             challenge.protectionSpace.authenticationMethod
                 == NSURLAuthenticationMethodServerTrust,
-            let origin = Origin(protectionSpace: challenge.protectionSpace),
-            isAllowed(origin),
+            (Origin(protectionSpace: challenge.protectionSpace).map(isAllowed) == true
+                || serverTrustEvaluator?(challenge.protectionSpace) == true),
             let trust = challenge.protectionSpace.serverTrust
         else {
             completionHandler(.performDefaultHandling, nil)
