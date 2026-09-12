@@ -5583,21 +5583,49 @@ public final class AetherEngine: ObservableObject {
             sessionIsPlaying: sessionIsPlaying) else { return }
         playbackPanelProbe = Task { @MainActor [weak self] in
             guard let self else { return }
+            // AE#459: ask the cheaper and better question first. A display that takes an HDR master is
+            // presenting HDR, and a display that is not refuses in well under a tenth of a second, so a
+            // master still being served after the settle window was accepted. That beats waiting twelve
+            // seconds for a headroom that has been measured staying at 1.00 through exactly this case.
+            try? await Task.sleep(
+                for: .milliseconds(DisplayCriteriaController.masterAcceptanceSettleMs))
+            guard !Task.isCancelled, self.loadGeneration == gen else { return }
+            if DisplayCriteriaController.masterAcceptanceProvesPanel(
+                servingHDRMaster: self.nativeVideoSession?.servingMasterPlaylist == true
+                    && self.nativeVideoSession?.servedSourceIsHDR == true,
+                fellBackToMedia: self.masterFallbackUsed,
+                sessionIsPlaying: self.state == .playing) {
+                self.republishPanelPresentsHDR(
+                    effectiveFormat: effectiveFormat,
+                    because: "AVFoundation accepted the HDR master, which a display presenting SDR "
+                        + "refuses with -11868/-11848")
+                return
+            }
             let presentsHDR = await self.displayCriteria.probePanelDuringPlayback()
             guard !Task.isCancelled, self.loadGeneration == gen, presentsHDR else { return }
-            let corrected = Self.presentedVideoFormat(
+            self.republishPanelPresentsHDR(
                 effectiveFormat: effectiveFormat,
-                panelPresentsHDR: true,
-                sourceVideoFormat: self.sourceVideoFormat)
-            guard corrected != self.videoFormat else { return }
-            EngineLog.emit(
-                "[AetherEngine] panel answered HDR during playback, republishing videoFormat "
-                + "\(self.videoFormat) -> \(corrected); the load-time read could not see it and this "
-                + "session was served without HDR signaling (#459)",
-                category: .engine)
-            self.videoFormat = corrected
+                because: "the panel answered HDR during playback and the load-time read could not see it")
         }
         #endif
+    }
+
+    /// AE#459: publish the label a late answer earned, from whichever of the two answers arrived.
+    ///
+    /// One funnel on purpose. The load-time read, the playback probe and now master acceptance all answer
+    /// the same question, and three call sites composing `presentedVideoFormat` themselves is how the
+    /// published format and the served stream drift apart.
+    @MainActor
+    private func republishPanelPresentsHDR(effectiveFormat: VideoFormat, because reason: String) {
+        let corrected = Self.presentedVideoFormat(
+            effectiveFormat: effectiveFormat,
+            panelPresentsHDR: true,
+            sourceVideoFormat: sourceVideoFormat)
+        guard corrected != videoFormat else { return }
+        EngineLog.emit(
+            "[AetherEngine] republishing videoFormat \(videoFormat) -> \(corrected): \(reason) (#459)",
+            category: .engine)
+        videoFormat = corrected
     }
 
     /// Receivers that failed to start on an HDR master this process, by route UID (#227). An Apple TV

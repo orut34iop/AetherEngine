@@ -10,6 +10,19 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The published `videoFormat` follows what AVFoundation accepted, not what the headroom
+  says.** On tvOS the label came from `UIScreen.currentEDRHeadroom`, which has been measured
+  reading 1.00 in a session where the same display accepted an HLG master that AVFoundation
+  then reported as `ITU_R_2100_HLG` on the item. A display that takes an HDR master is
+  presenting HDR; one that is not refuses with -11868 or -11848 in well under a tenth of a
+  second, measured at 54 to 61 ms on device. So acceptance is not a weaker substitute for the
+  headroom, it is the stronger reading, and it arrives half a second into playback instead of
+  after the twelve second probe window that reports nothing on such a panel. The label is the
+  only thing this moves: the route already reaches the master on its own, and nothing latches
+  the panel proof off it (AE#459).
+
 ### Added
 
 - **`LoadOptions.attemptsHDRMasterOnUnprovenPanel` (default `true`, VOD only): an HDR-eligible
