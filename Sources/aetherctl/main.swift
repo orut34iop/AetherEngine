@@ -875,7 +875,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     // reader's in-flight-request cancel becomes. Contract says unblock only; this measures the cost
     // of the other reading rather than leaving it to be discovered on a host.
     let customCancelLatches = takeFlag("--cancel-latches", from: &rest)
-    // AE#460 round 4: which byte axis the harness reader speaks. `join` is the reporter's shape (a
+    // AE#460 round 3: which byte axis the harness reader speaks. `join` is the reporter's shape (a
     // spool that counts from where its stream joined), `mismatched` the non-conforming control that
     // reports one axis and takes the other. `--join-offset-mb` is where in the file the join sits,
     // so the two axes are far enough apart for a disagreement to show as bytes rather than as noise.

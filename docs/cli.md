@@ -443,7 +443,7 @@ it dies is the reader's own convention: this arm returns a negative value and ge
 `AVERROR_EOF` and ends the session instead of failing it.
 
 **`--reader-axis absolute|join|mismatched` decides which byte axis the harness reader speaks**
-(AE#460 round 4), with `--join-offset-mb N` (default 4) placing the join. `absolute` is the default
+(AE#460 round 3), with `--join-offset-mb N` (default 4) placing the join. `absolute` is the default
 and the harness's own shape, every offset a position in the file. `join` is the shape of a host
 spool that joined a running stream: the reader reports and takes offsets counted from that join, so
 the cursor the alignment reads and the `SEEK_SET` it hands back compose to the identity, which is

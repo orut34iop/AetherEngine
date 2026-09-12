@@ -49,7 +49,7 @@ enum LiveReopenAlignment {
     }
 
     /// What the alignment achieved, read back from the READER rather than from the seek's own
-    /// return value (AE#460 round 4).
+    /// return value (AE#460 round 3).
     ///
     /// `avio_seek` reports the AVIO axis, which for a successful `SEEK_SET` is the offset that was
     /// asked for, so its return proves the reader accepted the seek and nothing more. Whether the

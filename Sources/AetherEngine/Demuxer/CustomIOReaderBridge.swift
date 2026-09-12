@@ -115,7 +115,7 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
             : -1
         let landed = callingHost { reader.seek(offset: max(0, here), whence: 0) }
         isSeekable = landed >= 0
-        // AE#460 round 4: the probe hands the reported position straight back as a `SEEK_SET`, so a
+        // AE#460 round 3: the probe hands the reported position straight back as a `SEEK_SET`, so a
         // reader that reports on one axis and takes `SEEK_SET` on another is MOVED by a probe whose
         // whole point is that it moves nothing, and the live alignment that follows repeats the
         // round trip at the same offset. A conforming reader answers with the position it was asked

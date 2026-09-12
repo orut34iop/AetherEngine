@@ -46,7 +46,7 @@ enum HostCarryTrim: String {
     case none, removeFirst, subdata
 }
 
-/// AE#460 round 4: which byte axis the host's reader speaks on.
+/// AE#460 round 3: which byte axis the host's reader speaks on.
 ///
 /// The engine aligns a live reopen by reading the reader's own position (`seek(0, SEEK_CUR)`) and
 /// handing it straight back as a `SEEK_SET`, so the two have to be the same axis. The reporter's
@@ -84,7 +84,7 @@ final class PacedLiveSpoolIOReader: IOReader, @unchecked Sendable {
     private var released: Int64 = 0
     private var startTime = Date()
 
-    /// AE#460 round 4. `joinOffset` is where in the file this install's stream starts, so the arms
+    /// AE#460 round 3. `joinOffset` is where in the file this install's stream starts, so the arms
     /// that count from the join have something to count from; `position` and `released` stay
     /// absolute internally, which keeps every figure the run prints comparable across arms.
     private let axis: ReaderAxis

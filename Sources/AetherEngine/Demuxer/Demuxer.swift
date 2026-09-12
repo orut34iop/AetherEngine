@@ -550,7 +550,7 @@ public final class Demuxer: @unchecked Sendable {
         ) {
         case .alignTo(let offset):
             let landed = avio_seek(provider.context, offset, SEEK_SET)
-            // AE#460 round 4: the seek's own return says the reader ACCEPTED it, never that the
+            // AE#460 round 3: the seek's own return says the reader ACCEPTED it, never that the
             // reader stayed put, so the reader is asked once more where it is. Aligning the axis
             // round-trips the reported cursor back through the host's `SEEK_SET`, which only leaves
             // the source untouched while its position report and its `SEEK_SET` argument are on the

@@ -14,7 +14,7 @@ the public-API contract.
 
 - **A custom reader whose position report and whose `SEEK_SET` are on different axes is named
   instead of being silently repositioned, and tvOS no longer observes external playback at all
-  (AE#460 round 4).** Aligning a live reopen reads the reader's cursor and hands it straight back
+  (AE#460 round 3).** Aligning a live reopen reads the reader's cursor and hands it straight back
   as a `SEEK_SET`, and so does the seekability probe at every open, so the two directions have to
   be the same axis: absolute file offsets and offsets counted from the stream's join both work (the
   reporter's spool is the second shape, measured now on a new `customio --live --reader-axis join`

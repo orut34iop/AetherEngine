@@ -5517,7 +5517,7 @@ public final class AetherEngine: ObservableObject {
     /// over-the-LAN path is inert there.
     ///
     /// tvOS reads false for a different reason, and by decision rather than by platform accident
-    /// (AE#460 round 4, cmcpherson274). AVFoundation declares the property back to tvOS 9 and an
+    /// (AE#460 round 3, cmcpherson274). AVFoundation declares the property back to tvOS 9 and an
     /// Apple TV is the RECEIVER, so nothing hands a stream anywhere; but the engine's two
     /// discriminators for such an edge (`isWirelessAirPlayRoute`, `isWiredHDMIExternalDisplay`) are
     /// both iOS-only, so a tvOS edge would be classified as a wireless receiver and buy a
@@ -5809,7 +5809,7 @@ public final class AetherEngine: ObservableObject {
     /// `usesExternalPlaybackWhileExternalScreenIsActive` flips `isExternalPlaybackActive` for both a wired screen
     /// and a wireless AirPlay receiver; the audio route tells them apart (`.HDMI` vs `.airPlay`). Wired keeps the
     /// loopback + master playlist (Sodalite#34); wireless takes the LAN-IP + MEDIA path (#86). Mirrors the port
-    /// inspection in NativeAVPlayerHost.dumpAudioRoute. iOS-only, and since AE#460 round 4 tvOS does not
+    /// inspection in NativeAVPlayerHost.dumpAudioRoute. iOS-only, and since AE#460 round 3 tvOS does not
     /// observe external playback at all, so this is no longer the line that keeps an Apple TV off the
     /// wireless branch (see `isExternalPlaybackActiveNow`).
     nonisolated private static func isWiredHDMIExternalDisplay() -> Bool {
