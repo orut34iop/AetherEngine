@@ -2034,8 +2034,11 @@ extension AetherEngine {
 
         state = .loading
         // AE#464 round 2: this branch reaches `loadSoftware` / `loadNative` rather than `load`, so it
-        // parks its own rebuild position for anything that stacks behind it.
+        // parks its own rebuild position for anything that stacks behind it. Round 3 parks the
+        // transport beside it; this branch reads `loadedOptions` field by field, and the caller has
+        // already written the session's own transport into it.
         positionUnderReconstruction = resumeAt
+        transportIntentUnderReconstruction = loadedOptions.autoplay
         let previousAudioIndex = activeAudioTrackIndex
         // Snapshot before stopInternal wipes state. Must reload on the same backend: loadNative on a SW-routed AV1 source throws unsupportedCodec (HLSVideoEngine only accepts HEVC / H.264 / VP9 / probed-AV1).
         let wasOnSoftwarePath = (playbackBackend == .software)

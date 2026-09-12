@@ -10,7 +10,44 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **A stepper's presses no longer stack one session rebuild each, and a rebuild raised while
+  another is still in flight no longer comes back paused (AE#464 round 3).** `setAudioDelay(_:)`
+  had no in-flight latch, so three presses inside one runloop turn raised three re-anchors. Round 2
+  made that survivable (the parked position rebuilt the stacked ones at the playhead instead of at
+  the head), but the work was still done three times and the two that lost the generation race each
+  reported a `CancellationError` as a FAILED re-cut naming a value that was already superseded: a
+  host reading its own log was told twice that the nudge it was in the middle of delivering had not
+  arrived. Presses arriving during a re-anchor are folded into it now, which is safe because the
+  value does not ride the call: every press writes `loadedOptions.audioDelaySeconds` first and both
+  routes read the offset from there when they rebuild. Measured on a 300 s H.264 + AAC fixture, the
+  same three presses: four loads dispatched and two superseded before, two and zero after, with the
+  same `cutting seg3+ with audio delay +150 ms` in both arms.
+
+  The paused half is round 2's own defect re-entered through the door round 2 did not close.
+  A rebuild stacked behind one in flight has no transport to read either: `state` is `.loading` and
+  the native host whose durable intent would be asked is the one that load is replacing, so both
+  readings answered "paused" about a session that was playing, the surviving generation mounted
+  paused and nothing was left to call `play()`. Measured before the fix: the session sat at
+  `state=paused cur=14.90` from t=15 to t=19 while the harness whose job is to catch that ended
+  `VERDICT: OK`. The transport intent the load in flight was handed is parked across exactly that
+  window now, the same shape and the same window as round 2's position park.
+
+- **A correction naming `autoplay` is no longer logged as applied (AE#464 round 3, reported by
+  cmcpherson274).** The field is neither refused nor applied: it describes the first mount, and a
+  rebuild comes back in the transport state the session is in, so `reloadAtCurrentPosition(applying:)`
+  accepted it, named it inside `#460: reload applying ...` and then overwrote it. `docs/api.md` had
+  said so since round 2; the log had not, and a host reads the log while its correction is happening.
+  It gets its own `#460: autoplay not applied, the session owns it` line now. The one rebuild that
+  does apply the flag, the resume after a background teardown (#357), still names it as applied.
+
+- **`setAudioDelay(_:)` called while the session is being rebuilt no longer tells the host its route
+  cannot carry an offset (AE#464 round 3).** `videoRoute` drops to `.none` at teardown, which is the
+  absence of a route to ask rather than a route that cannot move timestamps, so the call answered
+  `this session's audio timestamps are not the engine's to move (route=none)` one line above the
+  muxer cutting with the value it had just been given. The value was always delivered; only the
+  line was wrong. It now states that the load in flight reads it from the options and delivers it.
 
 ## [6.82.0] - 2026-09-12
 

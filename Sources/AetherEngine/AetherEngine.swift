@@ -2313,7 +2313,20 @@ public final class AetherEngine: ObservableObject {
     /// mid-seek comes back playing instead of paused. nil where there is no native host to ask (the
     /// software and audio routes have no competing transport owner, so `state` is authoritative there,
     /// which is the same split `togglePlayPause` makes).
-    nonisolated static func rebuildResumesPlaying(state: PlaybackState, nativeTransportIntent: Bool?) -> Bool {
+    ///
+    /// Round 3: a rebuild STACKED behind one still in flight has no transport to read either, and
+    /// both readings above then say "paused" about a session that is playing: `state` is `.loading`
+    /// for the load in flight, and the native host whose intent would be asked is the one that load
+    /// is replacing. So the surviving generation mounted paused and nothing was left to call
+    /// `play()`, which is round 2's own defect re-entered through the door round 2 did not close.
+    /// Measured on the CLI: three stepper presses in one runloop turn left the session stopped at
+    /// 14.58 s for the rest of the run, and the harness still ended `VERDICT: OK`. The intent the
+    /// load in flight was handed is the honest answer for exactly that window, the same shape and
+    /// the same window as `rebuildPosition`.
+    nonisolated static func rebuildResumesPlaying(
+        state: PlaybackState, nativeTransportIntent: Bool?, underReconstruction: Bool?
+    ) -> Bool {
+        if state == .loading, let parked = underReconstruction { return parked }
         if let nativeTransportIntent { return nativeTransportIntent }
         switch state {
         case .playing, .seeking: return true
@@ -2996,6 +3009,17 @@ public final class AetherEngine: ObservableObject {
     /// the playhead instead of at the head.
     var positionUnderReconstruction: Double?
 
+    /// AE#464 round 3: the transport intent the load in flight was handed, parked across the same
+    /// window as `positionUnderReconstruction` and for the same reason. Read only through
+    /// `sessionRebuildResumesPlaying`. See `rebuildResumesPlaying`.
+    var transportIntentUnderReconstruction: Bool?
+
+    /// AE#464 round 3: true while a re-anchor raised by `setAudioDelay` is running, so the presses
+    /// that arrive during it are folded into it instead of stacking re-anchors of their own. The
+    /// value does not ride the call (every press writes `loadedOptions.audioDelaySeconds` first), so
+    /// the rebuild already in flight delivers the newest one. See `reanchorForAudioDelay`.
+    var audioDelayReanchorInFlight = false
+
     /// The playhead a rebuild of this session has to come back to (#464 round 2).
     var positionForSessionRebuild: Double {
         Self.rebuildPosition(state: state, clock: currentTime, underReconstruction: positionUnderReconstruction)
@@ -3008,7 +3032,8 @@ public final class AetherEngine: ObservableObject {
         let nativeIntent = (nativeHost != nil && !audioAVPlayerActive && audioHost == nil && softwareHost == nil)
             ? nativeHost?.transportIntentIsPlaying
             : nil
-        return Self.rebuildResumesPlaying(state: state, nativeTransportIntent: nativeIntent)
+        return Self.rebuildResumesPlaying(state: state, nativeTransportIntent: nativeIntent,
+                                          underReconstruction: transportIntentUnderReconstruction)
     }
     /// #357: selection parked by a background teardown for the foreground reload, because on that
     /// path the two are minutes apart and `stopInternal` has wiped the state the reload snapshots
@@ -3401,6 +3426,9 @@ public final class AetherEngine: ObservableObject {
         // it is cleared below, so a reload raised while this one is still in flight has something
         // truer than the zero to snapshot. See `rebuildPosition`.
         positionUnderReconstruction = startPosition ?? 0
+        // Round 3: and the transport it is rebuilding toward, for the same window and the same
+        // reason. The host this load replaces is the one a stacked rebuild would ask.
+        transportIntentUnderReconstruction = options.autoplay
         isBuffering = false
         residentPlaylistRanges = []
         residentRanges = []

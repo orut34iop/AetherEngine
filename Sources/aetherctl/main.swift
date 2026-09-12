@@ -777,8 +777,14 @@ if first == "play" {
                 exit(64)
             }
             optionChanges.append(.isLive(flag))
+        } else if key == "autoplay" {
+            guard let flag = Bool(value) else {
+                print("ERROR: --reload-applying autoplay takes true|false, got '\(value)'")
+                exit(64)
+            }
+            optionChanges.append(.autoplay(flag))
         } else {
-            print("ERROR: --reload-applying key '\(key)' is not one of header.<Name>, audio-bridge, preferred-audio, decode-path, dolby-vision, is-live")
+            print("ERROR: --reload-applying key '\(key)' is not one of header.<Name>, audio-bridge, preferred-audio, decode-path, dolby-vision, is-live, autoplay")
             exit(64)
         }
     }
