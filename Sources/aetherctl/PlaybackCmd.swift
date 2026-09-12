@@ -42,8 +42,10 @@ struct LoadOptionCorrectionRequest {
 }
 
 /// The corrections the harness can drive. Deliberately a short list of levers whose effect is
-/// visible from a CLI run, plus `isLive`, which exists to drive the refusal path: a load-identity
-/// field has to be observably refused, not observably ignored.
+/// visible from a CLI run, plus two that exist to drive the two ways a correction can NOT happen:
+/// `isLive`, a load-identity field, which has to be observably refused rather than observably
+/// ignored, and `autoplay`, which is neither refused nor applied (the rebuild takes the session's
+/// own transport, AE#464 round 2) and could until round 3 only be read off the code.
 enum LoadOptionChange {
     case header(name: String, value: String)
     case audioBridgeMode(AudioBridgeMode)
@@ -51,6 +53,7 @@ enum LoadOptionChange {
     case decodePath(DecodePath)
     case dolbyVisionHandling(DolbyVisionHandling)
     case isLive(Bool)
+    case autoplay(Bool)
 
     var label: String {
         switch self {
@@ -60,6 +63,7 @@ enum LoadOptionChange {
         case .decodePath(let path): return "preferredDecodePath=\(path.rawValue)"
         case .dolbyVisionHandling(let handling): return "dolbyVisionHandling=\(handling.rawValue)"
         case .isLive(let value): return "isLive=\(value)"
+        case .autoplay(let value): return "autoplay=\(value)"
         }
     }
 
@@ -71,6 +75,7 @@ enum LoadOptionChange {
         case .decodePath(let path): options.preferredDecodePath = path
         case .dolbyVisionHandling(let handling): options.dolbyVisionHandling = handling
         case .isLive(let value): options.isLive = value
+        case .autoplay(let value): options.autoplay = value
         }
     }
 }
@@ -649,14 +654,24 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     // the load option it was already able to measure before.
     // AE#464 round 2: repeatable, because a stepper press is repeatable. Three of them inside
     // one runloop turn is the leg that stacked three reloads and lost the playhead.
-    for audioDelaySwitch in audioDelaySwitches {
+    //
+    // Round 3: presses that share a delay are delivered by ONE task, in argument order, with no
+    // await between them, which is what "inside one runloop turn" means. A task per press does not
+    // reproduce that: three of them three milliseconds apart arrive in whatever order the scheduler
+    // picks, measured as a 50/100/150 series landing 100, 150, 50, so the engine delivered 50 and
+    // the arm read as a defect that was the harness. The suffix still groups them, so presses at
+    // different times stay ordered by time.
+    for (delay, group) in Dictionary(grouping: audioDelaySwitches, by: \.delayMilliseconds)
+        .sorted(by: { $0.key < $1.key }) {
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, audioDelaySwitch.delayMilliseconds)) * 1_000_000)
-            print("  HOSTCALL setAudioDelay(\(audioDelaySwitch.milliseconds) ms) at "
-                  + "+\(audioDelaySwitch.delayMilliseconds) ms "
-                  + "(was \(Int((engine.audioDelaySeconds * 1000).rounded())) ms, "
-                  + "route=\(engine.videoRoute.rawValue), t=\(String(format: "%.2f", engine.currentTime))s)")
-            engine.setAudioDelay(Double(audioDelaySwitch.milliseconds) / 1000.0)
+            try? await Task.sleep(nanoseconds: UInt64(max(0, delay)) * 1_000_000)
+            for audioDelaySwitch in group {
+                print("  HOSTCALL setAudioDelay(\(audioDelaySwitch.milliseconds) ms) at "
+                      + "+\(delay) ms "
+                      + "(was \(Int((engine.audioDelaySeconds * 1000).rounded())) ms, "
+                      + "route=\(engine.videoRoute.rawValue), t=\(String(format: "%.2f", engine.currentTime))s)")
+                engine.setAudioDelay(Double(audioDelaySwitch.milliseconds) / 1000.0)
+            }
         }
     }
 
