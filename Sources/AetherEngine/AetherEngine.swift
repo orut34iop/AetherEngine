@@ -1271,6 +1271,22 @@ public final class AetherEngine: ObservableObject {
     /// reached it for none of them: every live leg ran `useMaster=false`, so a question about how a
     /// client treats what the manifest says had only ever been asked of the manifest the device
     /// usually does not read (AE#454).
+    /// AE#459: this process has seen AVFoundation refuse an HDR master for the display.
+    ///
+    /// The one readout the platform will actually give. `UIScreen.currentEDRHeadroom` has been measured
+    /// reading 1.00 on a panel whose own info display reported HDR, so an unproven panel is offered the
+    /// master and refusal answers the question the display will not. Latched for the process because the
+    /// answer costs a fallback to obtain and does not change while the output configuration does not.
+    ///
+    /// Set ONLY by the two display-rejection codes. `-1002` also reaches the same fallback and means the
+    /// manifest was filtered at parse time (#130), which is a statement about the playlist and not about
+    /// the display; latching on it would teach the process a fact about the panel from an unrelated bug.
+    ///
+    /// Not cleared when the user changes the output format mid-process, because nothing reports that
+    /// either. A stale refusal costs the master route until the app restarts, which is the behaviour this
+    /// replaces rather than a regression from it.
+    nonisolated(unsafe) static var panelRefusedHDRMaster = false
+
     nonisolated(unsafe) static var forceMasterPlaylistForTesting = false
 
     /// TEST-ONLY. Flip the master-route override for the `aetherctl live --force-master` harness.
@@ -2231,6 +2247,14 @@ public final class AetherEngine: ObservableObject {
             return
         }
         masterFallbackUsed = true
+        // AE#459: the display answered. Display-rejection codes only, never the -1002 parse failure.
+        if MasterFallbackDecision.isDisplayRejectionCode(rejection.code), !Self.panelRefusedHDRMaster {
+            Self.panelRefusedHDRMaster = true
+            EngineLog.emit(
+                "[DisplayCriteria] panel refused an HDR master (code=\(rejection.code)); this process "
+                + "routes HDR sources media-direct until it restarts",
+                category: .engine)
+        }
         session.markServingMediaAfterFallback()
         nativeSubtitleRenditionsServed = false
         // #227: while AirPlaying, the item under the rejection is the LAN-IP URL; `mediaPlaylistURL` is the
@@ -3975,6 +3999,23 @@ public final class AetherEngine: ObservableObject {
             options.suppressDisplayCriteria ? nil : displayCriteria.currentPanelIsHDR()
         let panelHDRAfterHandshake = Self.sessionPanelPresentsHDR(
             hostAsserts: options.panelIsInHDRMode, criteriaReadout: criteriaPanelReadout)
+        // AE#459: the ROUTE may assume more than the LABEL may claim. `panelHDRAfterHandshake` stays the
+        // label's answer, conservative by design; the route additionally offers an unproven but
+        // HDR-eligible display the master and lets AVFoundation's acceptance be the readout `UIScreen`
+        // has been measured getting wrong on a panel that was demonstrably presenting HDR. Live is excluded: its fallback is a rejoin at
+        // the edge rather than a restored position, and that cost has not been measured.
+        let routingPanelHDR = Self.sessionRoutesAsHDRPanel(
+            panelPresentsHDR: panelHDRAfterHandshake,
+            attemptWhenUnproven: options.attemptsHDRMasterOnUnprovenPanel && !options.isLive,
+            displayEligibleForHDR: observedDisplayCaps.supportsHDR,
+            panelRefusedHDRMaster: Self.panelRefusedHDRMaster)
+        if routingPanelHDR != panelHDRAfterHandshake {
+            EngineLog.emit(
+                "[DisplayCriteria] panel unproven but HDR-eligible: serving the master and letting "
+                + "AVPlayer answer (refusal costs one in-place media fallback)",
+                category: .session)
+        }
+
         // Only when an assertion actually claims something: a line that fires on every load stops being
         // read, and this one has to be legible next to the rejection a wrong claim can produce.
         if options.panelIsInHDRMode || options.panelPresentsDolbyVision {
@@ -4308,7 +4349,7 @@ public final class AetherEngine: ObservableObject {
                     dolbyVisionHandling: options.dolbyVisionHandling,
                     dolbyVisionRPUProfile: detectedDVRPUProfile,
                     matchContentEnabled: options.matchContentEnabled,
-                    panelIsInHDRMode: panelHDRAfterHandshake,
+                    panelIsInHDRMode: routingPanelHDR,
                     audioBridgeMode: options.audioBridgeMode,
                     isLive: options.isLive,
                     dvrWindowSeconds: options.dvrWindowSeconds,

@@ -461,6 +461,27 @@ public struct LoadOptions: Sendable, Equatable {
     /// in HDR (a user setting, its own probe) says so here.
     public var panelIsInHDRMode: Bool
 
+    /// Serve the HDR master to an HDR-eligible display whose panel state is unproven, and let AVFoundation's
+    /// acceptance or refusal be the readout. Default `true`, VOD only.
+    ///
+    /// AE#459: `UIScreen.currentEDRHeadroom` is the only tvOS property that ever reported the panel's mode,
+    /// and it is measurably unreliable. On one Apple TV 4K 3rd gen on tvOS 26.6 it read a flat 1.00
+    /// across 46 samples of HDR content while the TV's own info display reported HDR, and later the same
+    /// day, same box, same output format, same title, it read 1.20. What moves it is not established: the
+    /// output mode was blamed and then refuted by running the comparison back the other way. The cost of a
+    /// wrong 1.00 is not the picture, which media-direct carries unchanged, but the manifest: the SUBTITLES rendition, the AUDIO rendition that
+    /// is the only place AVFoundation reads an HLS language from, and SUPPLEMENTAL-CODECS.
+    ///
+    /// Refusal costs one in-place media fallback, measured at 223 ms end to end on that box (`-11868` after
+    /// 54 ms, zero `errorLog` events, position kept, no visible black frame), and it is latched for the
+    /// process, so a genuinely SDR panel pays it once rather than per title. A panel that proves itself
+    /// through the headroom never attempts anything.
+    ///
+    /// Turn it off for a host that knows its display is SDR and would rather not spend that once. Live
+    /// never attempts regardless of this flag: a live fallback is a rejoin at the edge rather than a
+    /// restored position, and that cost is unmeasured.
+    public var attemptsHDRMasterOnUnprovenPanel: Bool
+
     /// Host assertion that this display presents Dolby Vision. Default `false`. Not a capability the engine
     /// observed, a claim the host makes about hardware it knows.
     ///
@@ -829,6 +850,7 @@ public struct LoadOptions: Sendable, Equatable {
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
+        attemptsHDRMasterOnUnprovenPanel: Bool = true,
         panelPresentsDolbyVision: Bool = false,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         isLive: Bool = false,
@@ -870,6 +892,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.dolbyVisionHandling = dolbyVisionHandling
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
+        self.attemptsHDRMasterOnUnprovenPanel = attemptsHDRMasterOnUnprovenPanel
         self.panelPresentsDolbyVision = panelPresentsDolbyVision
         self.audioBridgeMode = audioBridgeMode
         self.isLive = isLive

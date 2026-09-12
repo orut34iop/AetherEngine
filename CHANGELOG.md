@@ -10,6 +10,24 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Added
+
+- **`LoadOptions.attemptsHDRMasterOnUnprovenPanel` (default `true`, VOD only): an HDR-eligible
+  display whose panel state is unproven is served the master, and AVFoundation's acceptance
+  or refusal is the readout `UIScreen` will not give.** `currentEDRHeadroom` is the only tvOS
+  property that ever reported the panel's mode, and it is measurably unreliable. On one Apple
+  TV 4K 3rd gen on tvOS 26.6 it read a flat 1.00 across 46 samples of HDR content while the
+  TV's own info display reported HDR, and later the same day, same box, same output format,
+  same title, it read 1.20. The panel was presenting HDR and the property was wrong about it;
+  what moves it is not established. The picture survived either way, the manifest did not:
+  media-direct drops the SUBTITLES rendition, the AUDIO rendition that is the only place AVFoundation reads
+  an HLS language from, and SUPPLEMENTAL-CODECS. A panel that proves itself through the
+  headroom short-circuits and attempts nothing. A refusal costs one in-place media fallback,
+  measured at 223 ms end to end (`-11868` after 54 ms, zero `errorLog` events, position kept,
+  no visible black frame), and is latched for the process. Live never attempts: its fallback
+  is a rejoin at the edge rather than a restored position, and that cost is unmeasured. The
+  published `videoFormat` is deliberately not moved by an attempt (AE#459).
+
 ### Fixed
 
 - **A Dolby Vision Profile 8.4 no longer resolves to SDR on an Apple TV whose display
