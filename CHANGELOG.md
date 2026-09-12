@@ -10,7 +10,19 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **A Dolby Vision Profile 8.4 no longer resolves to SDR on an Apple TV whose display
+  reports HLG.** `AVPlayer.availableHDRModes` under-reports HLG over HDMI: a Samsung whose
+  EDID advertises Hybrid Log-Gamma, connected straight to an Apple TV and playing HLG in the
+  TV's own player, has the mode reported absent, while an iPhone 17 Pro on its built-in panel
+  reports it present. A `false` in that table was being read as knowledge rather than as the
+  assertion it is, which is the same defect AE#493 fixed on macOS a week earlier. The table
+  may now only add a mode: `supportsHDR10` and `supportsHLG` take `eligibleForHDRPlayback` as
+  their floor, matching the rule macOS already applies where no table exists. Dolby Vision
+  stays on the table alone, where it is measured correct in both directions. The capability
+  reaches exactly one source, a Profile 8.4, which previously resolved to `effective-format=sdr`
+  while the manifest served `VIDEO-RANGE=HLG`; a plain HLG title was never clamped (AE#459).
 
 ## [6.81.0] - 2026-09-11
 

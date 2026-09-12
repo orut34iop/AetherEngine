@@ -1324,11 +1324,15 @@ public final class AetherEngine: ObservableObject {
         #if os(tvOS) || os(iOS)
         let hdrEligible = AVPlayer.eligibleForHDRPlayback
         let modes = AVPlayer.availableHDRModes
-        return DisplayCapabilities(
-            supportsHDR: hdrEligible,
-            supportsDolbyVision: modes.contains(.dolbyVision),
-            supportsHDR10: modes.contains(.hdr10),
-            supportsHLG: modes.contains(.hlg)
+        // AE#459: the table may add a mode, it may no longer subtract one. It under-reports HLG over
+        // HDMI against a panel whose EDID advertises it, so HDR10 and HLG take eligibility as their
+        // floor and Dolby Vision stays on the table alone. Reasoning and the measurements behind it are
+        // on `observedPerModeTable`.
+        return DisplayCapabilities.observedPerModeTable(
+            hdrEligible: hdrEligible,
+            hdr10: modes.contains(.hdr10),
+            hlg: modes.contains(.hlg),
+            dolbyVision: modes.contains(.dolbyVision)
         )
         #elseif os(macOS)
         // AE#493: `availableHDRModes` is `API_UNAVAILABLE(macos)`, so there is no per-mode table to read
