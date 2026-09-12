@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [6.83.0] - 2026-09-12
+
 ### Fixed
 
 - **A custom reader whose position report and whose `SEEK_SET` are on different axes is named
