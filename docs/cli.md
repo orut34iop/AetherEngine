@@ -437,7 +437,39 @@ A reach-back of 0 MB is the rebuild rejoining at the edge. Before the AE#460 fol
 reported 15.0 MB (61 s of source) and a playhead of 1.90 s: the reopen rewound the host's spool to
 its base and re-read the whole delivered window. `--cancel-latches` is the other arm, and it is a
 control rather than a defect: a reader that treats `cancel()` as terminal cannot serve the rebuild
-that reuses it, so the reopen dies on stream info and the correction throws.
+that reuses it, so the reopen dies on stream info and the correction throws. Which of the two deaths
+it dies is the reader's own convention: this arm returns a negative value and gets libavformat's
+`Operation not permitted`, while a reader that answers a closed stream with 0 is mapped to
+`AVERROR_EOF` and ends the session instead of failing it.
+
+**`--reader-axis absolute|join|mismatched` decides which byte axis the harness reader speaks**
+(AE#460 round 4), with `--join-offset-mb N` (default 4) placing the join. `absolute` is the default
+and the harness's own shape, every offset a position in the file. `join` is the shape of a host
+spool that joined a running stream: the reader reports and takes offsets counted from that join, so
+the cursor the alignment reads and the `SEEK_SET` it hands back compose to the identity, which is
+the claim this arm turns from a code read into a measurement:
+
+```
+  RELOAD at t=45s: playhead=38.82s cursor=11.5MB edge=11.5MB backend=native
+[Demuxer] live reopen aligned to the reader's cursor at 9994240 bytes
+LOOKBACK: 8 seeks, deepest reach-back 0.0 MB behind the live edge (0 s of source at this rate)
+```
+
+The aligned offset is 9.5 MB, not the 11.5 MB cursor the run prints: it is bytes since the join, and
+reading it as a file position is the mistake the arm exists to make visible. `mismatched` is the
+non-conforming control in the spirit of `--cancel-latches`, reporting absolute positions while
+taking `SEEK_SET` from the join. Each half is defensible alone and together they move the source by
+the join offset every time the engine asks it where it is:
+
+```
+[Demuxer] custom source: the reader reported byte 2097152 and answered a seek back to it with 4194304,
+so its position report and its SEEK_SET argument are not on the same axis; the source has been
+repositioned by the seekability probe
+[Demuxer] live reopen aligned the axis to 4194304 bytes, but the reader then reported 6291456: ...
+```
+
+2 MB at load and 2 MB more at the reload on that arm, after which the session sat 20 s in `loading`
+reading a stretch the host had not delivered yet.
 
 **`--reload-decode-path automatic|software` makes the correction the decode path itself** (AE#461
 follow-up), on `customio` with `--reload` and on `customio --live` with `--reload-at`. The header

@@ -113,7 +113,7 @@ func printUsage() {
                          (#95: decode the loopback audio track to mono 48k WAV, print continuity stats;
                           --software runs a real session through the SW sink, exit 3 if it yields no audible PCM)
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] [--audio-index N] [--reload-decode-path automatic|software] <file>
-      aetherctl customio --live [--rate-kbps N] [--seconds N] [--dvr-window N] [--report-size] [--no-wrap] [--malloc-census] [--foundation-reader] [--host-carry none|removeFirst|subdata] [--reload-at S] [--cancel-latches] [--reload-decode-path automatic|software] <file.ts>
+      aetherctl customio --live [--rate-kbps N] [--seconds N] [--dvr-window N] [--report-size] [--no-wrap] [--malloc-census] [--foundation-reader] [--host-carry none|removeFirst|subdata] [--reload-at S] [--cancel-latches] [--reload-decode-path automatic|software] [--reader-axis absolute|join|mismatched] [--join-offset-mb N] <file.ts>
                          (AE#445: a host-owned live spool behind MediaSource.custom, paced at the mux rate,
                           never EOF, unknown size; prints physFP and its slope against that rate)
       aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--realtime-rate X] [--fast-zap] [--preroll N] [--rewind-hold N] [--gen-highbitrate-seed]
@@ -875,6 +875,18 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     // reader's in-flight-request cancel becomes. Contract says unblock only; this measures the cost
     // of the other reading rather than leaving it to be discovered on a host.
     let customCancelLatches = takeFlag("--cancel-latches", from: &rest)
+    // AE#460 round 4: which byte axis the harness reader speaks. `join` is the reporter's shape (a
+    // spool that counts from where its stream joined), `mismatched` the non-conforming control that
+    // reports one axis and takes the other. `--join-offset-mb` is where in the file the join sits,
+    // so the two axes are far enough apart for a disagreement to show as bytes rather than as noise.
+    let customReaderAxis: ReaderAxis = takeStringFlag("--reader-axis", from: &rest).map { value in
+        guard let axis = ReaderAxis(rawValue: value) else {
+            print("ERROR: --reader-axis takes absolute|join|mismatched, got '\(value)'")
+            exit(64)
+        }
+        return axis
+    } ?? .absolute
+    let customJoinOffsetMB = takeIntFlag("--join-offset-mb", from: &rest) ?? 4
     // AE#461 follow-up: drive the decode-path correction on a CUSTOM source. `--reload-at`'s own
     // correction (an httpHeaders probe) is inert on this shape by design, so it measures the rebuild
     // and cannot measure this field; this one is the field.
@@ -950,7 +962,8 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
                                     foundationReader: customFoundationReader,
                                     carryTrim: customCarryTrim, reloadAt: customReloadAt,
                                     cancelLatches: customCancelLatches,
-                                    reloadDecodePath: customReloadDecodePath))
+                                    reloadDecodePath: customReloadDecodePath,
+                                    axis: customReaderAxis, joinOffsetMB: customJoinOffsetMB))
         }
         exit(runCustomIO(path: urlArg, inMemory: inMemory, forwardOnly: forwardOnly, audioOnly: audioOnlyFlag, reload: reloadFlag, switchAudio: switchAudioFlag, selectSubs: selectSubsFlag, extract: extractFlag, audioIndex: customAudioIndex, reloadDecodePath: customReloadDecodePath))
     default:
