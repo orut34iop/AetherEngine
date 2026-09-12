@@ -424,6 +424,27 @@ public struct LoadOptions: Sendable, Equatable {
     /// in HDR (a user setting, its own probe) says so here.
     public var panelIsInHDRMode: Bool
 
+    /// Serve the HDR master to an HDR-eligible display whose panel state is unproven, and let AVFoundation's
+    /// acceptance or refusal be the readout. Default `true`, VOD only.
+    ///
+    /// AE#459: `UIScreen.currentEDRHeadroom` is the only tvOS property that ever reported the panel's mode,
+    /// and it goes silent in the "4K HDR10+" output format. Measured on one Apple TV 4K 3rd gen on tvOS
+    /// 26.6, one app process, one title, nothing changed but that setting: "4K HDR" reads 1.20 and routes
+    /// to the master, "4K HDR10+" reads a flat 1.00 across 46 samples of HDR content and routes
+    /// media-direct, with the TV reporting HDR in both. The cost of that is not the picture, which
+    /// media-direct carries unchanged, but the manifest: the SUBTITLES rendition, the AUDIO rendition that
+    /// is the only place AVFoundation reads an HLS language from, and SUPPLEMENTAL-CODECS.
+    ///
+    /// Refusal costs one in-place media fallback, measured at 223 ms end to end on that box (`-11868` after
+    /// 54 ms, zero `errorLog` events, position kept, no visible black frame), and it is latched for the
+    /// process, so a genuinely SDR panel pays it once rather than per title. A panel that proves itself
+    /// through the headroom never attempts anything.
+    ///
+    /// Turn it off for a host that knows its display is SDR and would rather not spend that once. Live
+    /// never attempts regardless of this flag: a live fallback is a rejoin at the edge rather than a
+    /// restored position, and that cost is unmeasured.
+    public var attemptsHDRMasterOnUnprovenPanel: Bool
+
     /// Host assertion that this display presents Dolby Vision. Default `false`. Not a capability the engine
     /// observed, a claim the host makes about hardware it knows.
     ///
@@ -792,6 +813,7 @@ public struct LoadOptions: Sendable, Equatable {
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
+        attemptsHDRMasterOnUnprovenPanel: Bool = true,
         panelPresentsDolbyVision: Bool = false,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         isLive: Bool = false,
@@ -833,6 +855,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.dolbyVisionHandling = dolbyVisionHandling
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
+        self.attemptsHDRMasterOnUnprovenPanel = attemptsHDRMasterOnUnprovenPanel
         self.panelPresentsDolbyVision = panelPresentsDolbyVision
         self.audioBridgeMode = audioBridgeMode
         self.isLive = isLive
