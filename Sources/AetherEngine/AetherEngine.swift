@@ -1273,10 +1273,10 @@ public final class AetherEngine: ObservableObject {
     /// usually does not read (AE#454).
     /// AE#459: this process has seen AVFoundation refuse an HDR master for the display.
     ///
-    /// The one readout the platform will actually give. `UIScreen.currentEDRHeadroom` goes silent in the
-    /// "4K HDR10+" output mode (measured), so an unproven panel is offered the master and refusal answers
-    /// the question the display will not. Latched for the process because the answer costs 223 ms to
-    /// obtain and does not change while the output format does not.
+    /// The one readout the platform will actually give. `UIScreen.currentEDRHeadroom` has been measured
+    /// reading 1.00 on a panel whose own info display reported HDR, so an unproven panel is offered the
+    /// master and refusal answers the question the display will not. Latched for the process because the
+    /// answer costs a fallback to obtain and does not change while the output configuration does not.
     ///
     /// Set ONLY by the two display-rejection codes. `-1002` also reaches the same fallback and means the
     /// manifest was filtered at parse time (#130), which is a statement about the playlist and not about
@@ -3998,7 +3998,7 @@ public final class AetherEngine: ObservableObject {
         // AE#459: the ROUTE may assume more than the LABEL may claim. `panelHDRAfterHandshake` stays the
         // label's answer, conservative by design; the route additionally offers an unproven but
         // HDR-eligible display the master and lets AVFoundation's acceptance be the readout `UIScreen`
-        // refuses to give in the "4K HDR10+" output mode. Live is excluded: its fallback is a rejoin at
+        // has been measured getting wrong on a panel that was demonstrably presenting HDR. Live is excluded: its fallback is a rejoin at
         // the edge rather than a restored position, and that cost has not been measured.
         let routingPanelHDR = Self.sessionRoutesAsHDRPanel(
             panelPresentsHDR: panelHDRAfterHandshake,

@@ -699,11 +699,15 @@ extension AetherEngine {
     /// The label answers "what is this display presenting", and where nothing can answer it the honest
     /// value is SDR. The route answers a different question, "will AVFoundation accept an HDR master
     /// here", and there is exactly one component that knows: AVFoundation. Predicting its answer from
-    /// `UIScreen.currentEDRHeadroom` was never more than a proxy, and the proxy has now been measured
-    /// silent in a configuration a user picks on purpose. Measured on one Apple TV 4K 3rd gen on tvOS
-    /// 26.6 against one panel, same box, same cable, same title, one app process, nothing changed but the
-    /// tvOS output format entry: "4K HDR" reads 1.20 and routes to the master, "4K HDR10+" reads a flat
-    /// 1.00 across 46 samples of HDR content and routes media-direct. The panel is in HDR in both.
+    /// `UIScreen.currentEDRHeadroom` was never more than a proxy, and the proxy is measurably unreliable.
+    /// Measured on one Apple TV 4K 3rd gen on tvOS 26.6 against a panel whose own info display reported
+    /// HDR at the time: the property read a flat 1.00 across 46 samples of HDR content and the session
+    /// routed media-direct, and later the same day, same box, same output format, same title, it read
+    /// 1.20. The TV reporting HDR while the property read 1.00 is what rules out a silently dropped link,
+    /// so the panel was presenting HDR and the property was wrong about it. What moves it is NOT
+    /// established: the "4K HDR10+" output mode was blamed and then refuted by running the comparison back
+    /// the other way. The only pattern the data supports is a correlation, that every correct reading
+    /// follows a recent output-format change while every wrong one comes from a box parked in one mode.
     ///
     /// So on an unproven panel the engine serves the master and lets acceptance or refusal be the readout
     /// the display will not give. What refusal costs was measured before this was built rather than

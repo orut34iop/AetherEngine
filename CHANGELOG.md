@@ -15,11 +15,12 @@ the public-API contract.
 - **`LoadOptions.attemptsHDRMasterOnUnprovenPanel` (default `true`, VOD only): an HDR-eligible
   display whose panel state is unproven is served the master, and AVFoundation's acceptance
   or refusal is the readout `UIScreen` will not give.** `currentEDRHeadroom` is the only tvOS
-  property that ever reported the panel's mode, and it goes silent in the "4K HDR10+" output
-  format. Measured on one Apple TV 4K 3rd gen on tvOS 26.6, one app process, one title,
-  nothing changed but that setting: "4K HDR" reads 1.20 and routes to the master, "4K HDR10+"
-  reads a flat 1.00 across 46 samples of HDR content and routes media-direct, with the TV
-  reporting HDR in both. The picture survived either way, the manifest did not: media-direct
+  property that ever reported the panel's mode, and it is measurably unreliable. On one Apple
+  TV 4K 3rd gen on tvOS 26.6 it read a flat 1.00 across 46 samples of HDR content while the
+  TV's own info display reported HDR, and later the same day, same box, same output format,
+  same title, it read 1.20. The panel was presenting HDR and the property was wrong about it;
+  what moves it is not established. The picture survived either way, the manifest did not:
+  media-direct
   drops the SUBTITLES rendition, the AUDIO rendition that is the only place AVFoundation reads
   an HLS language from, and SUPPLEMENTAL-CODECS. A panel that proves itself through the
   headroom short-circuits and attempts nothing. A refusal costs one in-place media fallback,
