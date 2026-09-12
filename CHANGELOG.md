@@ -12,6 +12,23 @@ the public-API contract.
 
 _Nothing yet._
 
+## [6.84.0] - 2026-09-12
+
+### Changed
+
+- **A crash inside FFmpeg symbolicates: the bundled decode stack ships matching dSYMs
+  (FFmpegBuild 3.3.0, FFmpegBuild#4).** Every slice a shipped app can embed (iOS, tvOS and
+  visionOS device, macOS) now carries its dSYM inside the xcframework, and Xcode copies it into
+  `.xcarchive/dSYMs` when it embeds the framework, so App Store Connect stops answering an upload
+  with "The archive did not include a dSYM for the Libavcodec.framework with the UUIDs [...]" and
+  an FFmpeg frame in a crash report resolves to a function, a file and a line instead of an
+  address. Nothing for an adopter to do, and nothing added to the app: the dSYMs are not embedded.
+  The binaries are the same `n8.1.2` build as 3.2.1 apart from their UUID, the libraries just
+  compile with `-gline-tables-only` now (names, lines and inlined frames, no type information) and
+  the debug map is harvested before the shipped binary is stripped as before. Simulator slices ship
+  without dSYMs deliberately, they reach neither an archive nor a user's crash report. Reported by
+  cocoHMC.
+
 ## [6.83.0] - 2026-09-12
 
 ### Fixed
