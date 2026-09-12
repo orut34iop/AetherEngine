@@ -261,6 +261,43 @@ public struct DisplayCapabilities: Sendable, Equatable {
             supportsHLG: hdrEligible)
     }
 
+    /// AE#459: what a platform that HAS a per-mode table may honestly claim, now that the table has been
+    /// measured wrong about one of its entries.
+    ///
+    /// `AVPlayer.availableHDRModes` is that table on tvOS and iOS, and it is deprecated as of the 26 SDKs
+    /// in favour of `eligibleForHDRPlayback`, a single boolean: Apple has already collapsed the per-mode
+    /// question into "can this display do HDR at all". Measured against a display that answers for itself,
+    /// the table under-reports HLG over HDMI. A Samsung S93F connected straight to an Apple TV advertises
+    /// Hybrid Log-Gamma in its EDID and plays HLG in the TV's own player, while the table reports `.hlg`
+    /// absent; a second Apple TV on a different Samsung reports the same; an iPhone 17 Pro running this
+    /// engine on its built-in panel reports it present. So the absence is about the platform's HDMI path,
+    /// not about the panel.
+    ///
+    /// Eligibility is therefore the floor for the two modes that need nothing but EDR. HDR10 and HLG are a
+    /// transfer function, and a display AVFoundation calls eligible for HDR playback presents both, which
+    /// is the identical rule `onDemandEDRDisplay` already applies where no table exists at all. The table
+    /// can still ADD (a mode it names is a mode the display has), it can no longer subtract.
+    ///
+    /// Dolby Vision stays on the table alone, for the same reason it is unclaimed on macOS and for one
+    /// more: here the table is measured RIGHT about it in both directions, `false` on a Samsung with no
+    /// Dolby Vision and `true` on an iPhone 17 Pro the same day. Eligibility proves EDR, never that
+    /// AVFoundation will accept a DV variant, and a wrong claim there surfaces as -11868 with nothing
+    /// playing. That claim belongs to a host (`LoadOptions.panelPresentsDolbyVision`).
+    ///
+    /// What the HLG term actually reaches is narrow, and worth knowing before reading a bug into it:
+    /// `effectiveVideoFormat` opens with a guard on Dolby Vision, so `supportsHLG` is consulted only for a
+    /// DV source with an HLG base layer, meaning Profile 8.4. A plain HLG title was never clamped by any
+    /// of this.
+    static func observedPerModeTable(
+        hdrEligible: Bool, hdr10: Bool, hlg: Bool, dolbyVision: Bool
+    ) -> DisplayCapabilities {
+        DisplayCapabilities(
+            supportsHDR: hdrEligible,
+            supportsDolbyVision: dolbyVision,
+            supportsHDR10: hdr10 || hdrEligible,
+            supportsHLG: hlg || hdrEligible)
+    }
+
     /// AE#493 / AE#459: the capability a host asserts, because this one cannot be observed.
     ///
     /// `AVPlayer.availableHDRModes` is `API_UNAVAILABLE(macos)`, so a Mac has no per-mode table to read,
