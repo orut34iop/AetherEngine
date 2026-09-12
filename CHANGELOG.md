@@ -12,6 +12,33 @@ the public-API contract.
 
 ### Fixed
 
+- **A custom reader whose position report and whose `SEEK_SET` are on different axes is named
+  instead of being silently repositioned, and tvOS no longer observes external playback at all
+  (AE#460 round 4).** Aligning a live reopen reads the reader's cursor and hands it straight back
+  as a `SEEK_SET`, and so does the seekability probe at every open, so the two directions have to
+  be the same axis: absolute file offsets and offsets counted from the stream's join both work (the
+  reporter's spool is the second shape, measured now on a new `customio --live --reader-axis join`
+  arm: the reopen aligned at 9994240 bytes, its cursor counted from the join, and the reach-back
+  stayed at 0.0 MB). Reporting one axis and taking the other moves the source by the join offset on
+  a probe whose whole purpose is that it moves nothing: measured on the deliberately non-conforming
+  `--reader-axis mismatched` arm, 2 MB at load and 2 MB more at the reload, and the session then
+  spent 20 s in `loading` reading a stretch the host had not delivered yet. The probe now compares
+  its own return against the position it was just told, which costs no extra callback and covers
+  every open, and the alignment asks once more where the reader is, so a reopen cannot report an
+  alignment the reader did not hold. Both signatures of a latching `cancel()` are documented too:
+  a reader whose failed read returns a negative value dies with libavformat's `Operation not
+  permitted`, one that returns 0 is mapped to `AVERROR_EOF` and the session ENDS instead of
+  failing.
+
+  The tvOS half closes the one engine-internal route to a session-preserving reload that a host
+  could not guard. The external-playback observer was registered on every platform but visionOS,
+  and its edge handler classifies an edge with two iOS-only discriminators, so a tvOS edge would be
+  read as a wireless AirPlay receiver and buy a full rebuild for a route an Apple TV has not got,
+  which a host playing a custom live source pays for out of its own spool. tvOS now joins visionOS:
+  no observer, and `isExternalPlaybackActiveNow` is a compile-time `false`. The platform note that
+  used to carry this ("external playback never engages on tvOS") was a comment, and a comment is
+  not where the reachability of a rebuild belongs. Reported by cmcpherson274.
+
 - **A stepper's presses no longer stack one session rebuild each, and a rebuild raised while
   another is still in flight no longer comes back paused (AE#464 round 3).** `setAudioDelay(_:)`
   had no in-flight latch, so three presses inside one runloop turn raised three re-anchors. Round 2

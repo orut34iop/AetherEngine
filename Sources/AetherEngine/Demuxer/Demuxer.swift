@@ -550,12 +550,32 @@ public final class Demuxer: @unchecked Sendable {
         ) {
         case .alignTo(let offset):
             let landed = avio_seek(provider.context, offset, SEEK_SET)
-            EngineLog.emit(
-                landed == offset
-                    ? "[Demuxer] live reopen aligned to the reader's cursor at \(offset) bytes"
-                    : "[Demuxer] live reopen could not align to \(offset) bytes (avio_seek -> \(landed))",
-                category: .demux
-            )
+            // AE#460 round 4: the seek's own return says the reader ACCEPTED it, never that the
+            // reader stayed put, so the reader is asked once more where it is. Aligning the axis
+            // round-trips the reported cursor back through the host's `SEEK_SET`, which only leaves
+            // the source untouched while its position report and its `SEEK_SET` argument are on the
+            // same axis. One extra host callback, on live reopens only.
+            switch LiveReopenAlignment.verify(
+                requestedOffset: offset,
+                avioLanded: landed,
+                readerReportsAfter: provider.currentSourceOffset
+            ) {
+            case .aligned:
+                EngineLog.emit(
+                    "[Demuxer] live reopen aligned to the reader's cursor at \(offset) bytes",
+                    category: .demux)
+            case .seekRefused(let landed):
+                EngineLog.emit(
+                    "[Demuxer] live reopen could not align to \(offset) bytes (avio_seek -> \(landed))",
+                    category: .demux)
+            case .readerMovedUnderAlignment(let after):
+                EngineLog.emit(
+                    "[Demuxer] live reopen aligned the axis to \(offset) bytes, but the reader then "
+                    + "reported \(after): its position report and its SEEK_SET argument are on "
+                    + "different axes, so the source has been repositioned by the alignment "
+                    + "(see docs/formats.md, custom byte sources)",
+                    category: .demux)
+            }
         case .cannotAlignReaderSilentOnPosition:
             EngineLog.emit(
                 "[Demuxer] live reopen: the retained reader does not report its position, "

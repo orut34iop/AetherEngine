@@ -5515,8 +5515,18 @@ public final class AetherEngine: ObservableObject {
     /// `AVPlayer.isExternalPlaybackActive` is unavailable on visionOS: video goes to the wearer's
     /// displays, there is no receiver to hand the stream to, so the whole #86 / #227 serve-the-loopback-
     /// over-the-LAN path is inert there.
+    ///
+    /// tvOS reads false for a different reason, and by decision rather than by platform accident
+    /// (AE#460 round 4, cmcpherson274). AVFoundation declares the property back to tvOS 9 and an
+    /// Apple TV is the RECEIVER, so nothing hands a stream anywhere; but the engine's two
+    /// discriminators for such an edge (`isWirelessAirPlayRoute`, `isWiredHDMIExternalDisplay`) are
+    /// both iOS-only, so a tvOS edge would be classified as a wireless receiver and buy a
+    /// session-preserving reload for a route the platform has not got. A host playing a custom live
+    /// source pays that rebuild out of its own spool, which is exactly the hole the reporter found
+    /// by reading the route rather than by hitting it. Compiled out here instead of asserted in a
+    /// comment: the reachability is now a property of the build, not of Apple's behaviour.
     private var isExternalPlaybackActiveNow: Bool {
-        #if os(visionOS)
+        #if os(visionOS) || os(tvOS)
         return false
         #else
         return currentAVPlayer?.isExternalPlaybackActive ?? false
@@ -5526,7 +5536,7 @@ public final class AetherEngine: ObservableObject {
     private func observeExternalPlayback() {
         externalPlaybackObservation?.invalidate()
         externalPlaybackObservation = nil
-        #if !os(visionOS)
+        #if !os(visionOS) && !os(tvOS)
         guard let player = currentAVPlayer else { return }
         externalPlaybackObservation = player.observe(\.isExternalPlaybackActive, options: [.new]) { [weak self] _, change in
             let active = change.newValue ?? false
@@ -5799,7 +5809,9 @@ public final class AetherEngine: ObservableObject {
     /// `usesExternalPlaybackWhileExternalScreenIsActive` flips `isExternalPlaybackActive` for both a wired screen
     /// and a wireless AirPlay receiver; the audio route tells them apart (`.HDMI` vs `.airPlay`). Wired keeps the
     /// loopback + master playlist (Sodalite#34); wireless takes the LAN-IP + MEDIA path (#86). Mirrors the port
-    /// inspection in NativeAVPlayerHost.dumpAudioRoute. iOS-only; external playback never engages on tvOS.
+    /// inspection in NativeAVPlayerHost.dumpAudioRoute. iOS-only, and since AE#460 round 4 tvOS does not
+    /// observe external playback at all, so this is no longer the line that keeps an Apple TV off the
+    /// wireless branch (see `isExternalPlaybackActiveNow`).
     nonisolated private static func isWiredHDMIExternalDisplay() -> Bool {
         #if os(iOS)
         return AVAudioSession.sharedInstance().currentRoute.outputs.contains { $0.portType == .HDMI }
