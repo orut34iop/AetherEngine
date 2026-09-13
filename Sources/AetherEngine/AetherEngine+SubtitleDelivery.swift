@@ -29,5 +29,15 @@ extension AetherEngine {
             playhead: playhead,
             tally: tally)
         EngineLog.emit(SubtitleDeliveryStatement.format(statement), category: .engine)
+        if let store = activeSubtitlePacketStore {
+            let window = store.diagnosticWindow(
+                streamIndex: streamIndex,
+                from: playhead - Self.subtitleDrainBackscanSeconds,
+                through: playhead + Self.subtitleDrainLeadSeconds)
+            EngineLog.emit(
+                "[AetherEngine] #357 subtitle-packet-window stream=\(streamIndex) "
+                    + "playhead=\(String(format: "%.2f", playhead)) " + window,
+                category: .engine)
+        }
     }
 }

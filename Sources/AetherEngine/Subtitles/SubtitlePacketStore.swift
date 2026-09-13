@@ -106,6 +106,25 @@ final class SubtitlePacketStore: @unchecked Sendable {
     private var protectedStreams: Set<Int32> = []
     private var lastTouchByStream: [Int32: UInt64] = [:]
     private var touchCounter: UInt64 = 0
+    private var capEvictionsByStream: [Int32: UInt64] = [:]
+
+    /// Numeric-only evidence for a drain window that delivers nothing. Capture under the
+    /// store lock: the pump and prefetcher can append while the main actor diagnoses a tick.
+    func diagnosticWindow(streamIndex: Int32, from: Double, through: Double) -> String {
+        lock.lock(); defer { lock.unlock() }
+        let entries = entriesByStream[streamIndex] ?? []
+        let inWindow = entries.filter { $0.ptsSeconds >= from && $0.ptsSeconds <= through }.count
+        let pendingBytes = pendingSetByStream.filter { $0.key.streamIndex == streamIndex }
+            .values.reduce(0) { $0 + $1.payload.count }
+        func pts(_ value: Double?) -> String {
+            value.map { String(format: "%.2f", $0) } ?? "none"
+        }
+        return "windowFrom=\(pts(from)) windowThrough=\(pts(through)) "
+            + "stored=\(entries.count) windowPackets=\(inWindow) "
+            + "firstPTS=\(pts(entries.first?.ptsSeconds)) lastPTS=\(pts(entries.last?.ptsSeconds)) "
+            + "bytes=\(bytesByStream[streamIndex] ?? 0) cap=\(perStreamCap) "
+            + "capEvictions=\(capEvictionsByStream[streamIndex] ?? 0) pendingBytes=\(pendingBytes)"
+    }
 
     init(perStreamByteCap: Int = SubtitlePacketStore.perStreamByteCap,
          aggregateByteCap: Int = SubtitlePacketStore.aggregateByteCap) {
@@ -216,6 +235,7 @@ final class SubtitlePacketStore: @unchecked Sendable {
         bytes += payload.count
         while bytes > perStreamCap, entries.count > 1 {
             bytes -= entries.removeFirst().payload.count
+            capEvictionsByStream[streamIndex, default: 0] &+= 1
         }
         entriesByStream[streamIndex] = entries
         bytesByStream[streamIndex] = bytes
@@ -261,6 +281,7 @@ final class SubtitlePacketStore: @unchecked Sendable {
             var bytes = bytesByStream[idx] ?? 0
             while totalBytes > aggregateCap, !entries.isEmpty {
                 let removed = entries.removeFirst().payload.count
+                capEvictionsByStream[idx, default: 0] &+= 1
                 bytes -= removed
                 totalBytes -= removed
             }
@@ -465,6 +486,7 @@ final class SubtitlePacketStore: @unchecked Sendable {
         totalBytes = 0
         touchCounter = 0
         appendCounter = 0
+        capEvictionsByStream.removeAll()
         coverage = SubtitleHarvestCoverage()
     }
 }
