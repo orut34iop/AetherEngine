@@ -1149,7 +1149,7 @@ public final class AetherEngine: ObservableObject {
     /// Nil for SRT/VTT and when markup preservation is off.
     @Published public internal(set) var sidecarASSHeader: String? = nil
 
-    /// Cues for the secondary subtitle track (#47). Text-only (bitmap rejected); independent of primary.
+    /// Cues for the secondary subtitle track, including bitmap cues; independent of primary.
     @Published public internal(set) var secondarySubtitleCues: [SubtitleCue] = []
     @Published public internal(set) var isLoadingSecondarySubtitles: Bool = false
     @Published public internal(set) var isSecondarySubtitleActive: Bool = false
@@ -1157,10 +1157,9 @@ public final class AetherEngine: ObservableObject {
     /// channel is off or uses the compatibility one-shot sidecar API, mirroring
     /// `activeSubtitleTrackIndex` on the primary channel.
     @Published public internal(set) var activeSecondarySubtitleTrackIndex: Int?
-    /// Secondary bitmap subtitles deliberately fail closed until a real two-channel bitmap
-    /// selection/decode fixture exists. Hosts should use this capability instead of inferring from
-    /// codec lists or accepting the historical text-only comment as runtime enforcement.
-    public nonisolated var secondaryBitmapSupported: Bool { false }
+    /// The secondary cue channel supports bitmap decoding. Hosts must render its image cues
+    /// in a separate layer and apply secondary visibility, delay and position independently.
+    public nonisolated var secondaryBitmapSupported: Bool { true }
     /// ASS/SSA script header for the active secondary sidecar when `preserveASSMarkup` is enabled.
     /// Pair with `secondarySubtitleCues`, whose text bodies then carry raw ASS event lines.
     @Published public internal(set) var secondarySidecarASSHeader: String? = nil

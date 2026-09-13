@@ -154,7 +154,9 @@ extension AetherEngine {
         selectSubtitleTrack(index: Int(index), startAt: anchor > 0 ? anchor : sourceTime)
     }
 
-    /// Activate an embedded subtitle stream as the secondary companion track (issue #47). Text-only; bitmap codecs are rejected. Runs a second side demuxer concurrently. External ids (#88) route onto the secondary sidecar decode.
+    /// Activate an embedded subtitle stream as the independent secondary companion track.
+    /// Text and bitmap streams use separate channel decoders, cursors and PGS gates.
+    /// External ids (#88) route onto the secondary sidecar decode.
     public func selectSecondarySubtitleTrack(index: Int) {
         selectSecondarySubtitleTrack(index: index, startAt: sourceTime)
     }
@@ -168,12 +170,6 @@ extension AetherEngine {
         // One TrackInfo identity cannot occupy both bilingual roles. Reject without clearing the
         // current secondary selection so an accidental duplicate picker action is non-destructive.
         guard activeSubtitleTrackIndex != index else { return }
-        // The first-release contract is text/ASS/external only. The previous implementation only
-        // documented this rule; the packet-store drainer would still decode a selected PGS track.
-        if let track = subtitleTracks.first(where: { $0.id == index }),
-           Self.isBitmapSubtitleCodec(track.codec) {
-            return
-        }
         if let external = externalSubtitleRegistry[index] {
             cancelSidecarTask(channel: .secondary)
             startSecondarySidecarDecode(url: external.url, httpHeaders: external.httpHeaders,
@@ -223,15 +219,6 @@ extension AetherEngine {
         cues.filter { cue in
             guard case .image = cue.body else { return false }
             return cue.startTime <= playhead && playhead < cue.endTime
-        }
-    }
-
-    /// The secondary public contract is text-only. Centralized so embedded drainer events and
-    /// whole-file external decodes cannot drift into different bitmap behavior.
-    nonisolated static func secondarySubtitleCuesSupported(_ cues: [SubtitleCue]) -> Bool {
-        !cues.contains { cue in
-            if case .image = cue.body { return true }
-            return false
         }
     }
 
@@ -975,9 +962,6 @@ extension AetherEngine {
                                     to cues: inout [SubtitleCue],
                                     channel: SubtitleChannel) -> SubtitleDeliveryStatement.Application {
         guard isSubtitleActive(for: channel) else { return .init() }
-        if channel == .secondary, !Self.secondarySubtitleCuesSupported(event.cues) {
-            return .init()
-        }
 
         // #357: primary-only, and budgeted per seek generation rather than per load, so a seek
         // sequence stays observable to its end. The playhead is `sourceTime`, the axis cue
@@ -1605,12 +1589,6 @@ extension AetherEngine {
                 if let externalTrackID,
                    self.activeSubtitleTrackIndex == externalTrackID
                     || self.externalSubtitleRegistry[externalTrackID] == nil {
-                    self.isLoadingSecondarySubtitles = false
-                    return
-                }
-                // External containers may hide a bitmap stream behind an unknown extension or
-                // format hint. Enforce the capability again on decoded bodies before publication.
-                guard Self.secondarySubtitleCuesSupported(result.cues) else {
                     self.isLoadingSecondarySubtitles = false
                     return
                 }

@@ -26,7 +26,7 @@ struct DualSubtitleContractTests {
     func publicStateDefaults() throws {
         let engine = try AetherEngine()
         #expect(engine.activeSecondarySubtitleTrackIndex == nil)
-        #expect(engine.secondaryBitmapSupported == false)
+        #expect(engine.secondaryBitmapSupported)
         #expect(engine.secondarySidecarASSHeader == nil)
     }
 
@@ -55,12 +55,12 @@ struct DualSubtitleContractTests {
         #expect(engine.isSecondarySubtitleActive)
     }
 
-    @Test("secondary bitmap selection fails closed without disturbing either role")
-    func bitmapFailsClosed() throws {
+    @Test("secondary bitmap selection owns a separate decoder target and clears independently")
+    func bitmapRolesAreIndependent() throws {
         let engine = try AetherEngine()
         engine.loadedURL = URL(string: "https://media.example/movie.mkv")!
         engine.subtitleTracks = [
-            track(1, codec: "subrip"),
+            track(1, codec: "hdmv_pgs_subtitle"),
             track(2, codec: "ass"),
             track(3, codec: "hdmv_pgs_subtitle"),
         ]
@@ -70,22 +70,13 @@ struct DualSubtitleContractTests {
         engine.selectSecondarySubtitleTrack(index: 3)
 
         #expect(engine.activeSubtitleTrackIndex == 1)
-        #expect(engine.activeSecondarySubtitleTrackIndex == 2)
-        #expect(engine.subtitleDrainTargets[.secondary] == 2)
-
-        let context = try #require(CGContext(
-            data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
-        let image = try #require(context.makeImage())
-        #expect(AetherEngine.secondarySubtitleCuesSupported([
-            SubtitleCue(
-                id: 1, startTime: 0, endTime: 1,
-                body: .image(SubtitleImage(cgImage: image, position: .zero)))
-        ]) == false)
-        #expect(AetherEngine.secondarySubtitleCuesSupported([
-            SubtitleCue(id: 2, startTime: 0, endTime: 1, body: .text("safe"))
-        ]))
+        #expect(engine.activeSecondarySubtitleTrackIndex == 3)
+        #expect(engine.subtitleDrainTargets[.secondary] == 3)
+        #expect(engine.subtitleDrainTargets[.primary] == 1)
+        engine.clearSecondarySubtitle()
+        #expect(engine.activeSecondarySubtitleTrackIndex == nil)
+        #expect(engine.subtitleDrainTargets[.secondary] == nil)
+        #expect(engine.subtitleDrainTargets[.primary] == 1)
     }
 
     @Test("two registered text streams publish to their own channel and clear independently")

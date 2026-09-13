@@ -1,6 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 TASK_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+case "${1:-}" in
+    "") TASK_TEST_SOURCE=SubtitlePacketDiagnosticsStandalone.swift ;;
+    --dual-pgs) TASK_TEST_SOURCE=DualPGSDecodeStandalone.swift ;;
+    *) echo "Usage: $0 [--dual-pgs]" >&2; exit 2 ;;
+esac
 TASK_FFMPEG_ROOT="${AETHER_FFMPEG_CHECKOUT:-$TASK_ROOT/.build/checkouts/FFmpegBuild}"
 TASK_EXPECTED_REVISION=$(/usr/bin/ruby -rjson -e 'puts JSON.parse(File.read(ARGV[0])).fetch("pins").find { |p| p.fetch("identity") == "ffmpegbuild" }.fetch("state").fetch("revision")' "$TASK_ROOT/Package.resolved")
 TASK_ACTUAL_REVISION=$(git -C "$TASK_FFMPEG_ROOT" rev-parse HEAD)
@@ -19,5 +24,5 @@ xcrun swiftc -swift-version 6 "${TASK_FRAMEWORK_ARGS[@]}" \
     "$TASK_ROOT/Sources/AetherEngine/Subtitles/SubtitlePacketStore.swift" \
     "$TASK_ROOT/Sources/AetherEngine/Subtitles/SubtitleHarvestCoverage.swift" \
     "$TASK_ROOT/Sources/AetherEngine/Subtitles/WebVTTCueSettings.swift" \
-    "$TASK_ROOT/Scripts/tests/SubtitlePacketDiagnosticsStandalone.swift" -o "$TASK_TMP/check"
+    "$TASK_ROOT/Scripts/tests/$TASK_TEST_SOURCE" -o "$TASK_TMP/check"
 "$TASK_TMP/check"
