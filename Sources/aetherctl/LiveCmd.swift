@@ -120,6 +120,7 @@ func runLive(
     realtime: Bool = false,
     fastZap: Bool = false,
     pacingPreroll: Double? = nil,
+    pacingRate: Double? = nil,
     freezeAfter: Double? = nil,
     unfreezeAfter: Double? = nil,
     rewindBeforeFreeze: Double? = nil,
@@ -127,7 +128,8 @@ func runLive(
     rewindHold: Double? = nil,
     blockingReload: Bool? = nil,
     liveOnly: Bool = false,
-    forceMaster: Bool = false
+    forceMaster: Bool = false,
+    startPosition: Double? = nil
 ) -> Int32 {
     // Relative timestamps make join latency (readyToPlay et al.) readable off the log (AE#195).
     let logEpoch = Date()
@@ -177,6 +179,11 @@ func runLive(
     if let preroll = pacingPreroll {
         fixture.pacingPrerollSeconds = preroll
         print("aetherctl live: --preroll \(preroll)s (0 = strict-realtime origin, no backlog burst)")
+    }
+    if let rate = pacingRate {
+        fixture.pacingRateMultiple = rate
+        print("aetherctl live: --realtime-rate \(rate)x (origin keeps handing over "
+              + "\(rate)x faster than the content happens, for the whole run)")
     }
     if fastZap {
         print("aetherctl live: --fast-zap set, LoadOptions.liveJoinProfile = .fastZap (AE#195)")
@@ -250,7 +257,8 @@ func runLive(
         box.value = await liveSmokeTest(url: liveURL, seconds: playSeconds, fastZap: fastZap,
                                         dvrWindow: dvrWindow, measureRSS: measureRSS,
                                         reportCacheBytes: reportCacheBytes,
-                                        checkMonotonic: discontinuityAt != nil)
+                                        checkMonotonic: discontinuityAt != nil,
+                                        startPosition: startPosition)
         fixture.stop()
         CFRunLoopStop(CFRunLoopGetMain())
     }
@@ -264,7 +272,8 @@ private func liveSmokeTest(url: URL, seconds playSeconds: Double,
                            dvrWindow: Double? = nil,
                            measureRSS: Bool = false,
                            reportCacheBytes: Bool = false,
-                           checkMonotonic: Bool = false) async -> Int32 {
+                           checkMonotonic: Bool = false,
+                           startPosition: Double? = nil) async -> Int32 {
     let engine: AetherEngine
     do {
         engine = try AetherEngine()
@@ -282,7 +291,10 @@ private func liveSmokeTest(url: URL, seconds playSeconds: Double,
     // a --realtime fixture A/Bs between profiles.
     let loadStartedAt = Date()
     do {
-        try await engine.load(url: url, options: options)
+        // AE#509: a live join with a host-supplied resume anchor had no harness. The anchor a host
+        // holds is on the PUBLISHED axis (the only one it is shown), the mount seek spends it on the
+        // ITEM axis, and on a live source the two are `playlistShiftSeconds` apart.
+        try await engine.load(url: url, startPosition: startPosition, options: options)
     } catch {
         print("VERDICT: live FAIL: load error: \(error.localizedDescription)")
         engine.stop()
@@ -368,6 +380,14 @@ private func liveSmokeTest(url: URL, seconds playSeconds: Double,
             tickLine += String(format: " origin=%.1fMB restarts=%d",
                                Double(telemetry.demuxerBytesFetched) / 1_048_576,
                                telemetry.producerRestartCount)
+        }
+        // AE#509: `t=` is the published clock, which carries the shift. `item=` is what AVPlayer
+        // says about its own item, which is the field a reporter's dump prints. A session where
+        // those two do not differ by the shift is a session where something put the item somewhere
+        // it cannot reach, and that difference is invisible from either number alone.
+        if let itemReading = await engine.nativeItemReading() {
+            tickLine += String(format: " item=%.2fs ranges=%d status=%d",
+                               itemReading.playhead, itemReading.loadedRangeCount, itemReading.status)
         }
         print(tickLine)
         // Print RSS sample every 30 s when --measure-rss is set.

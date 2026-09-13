@@ -522,8 +522,6 @@ enum H264CompositionOffsetRepair {
 final class H264PictureOrderReader {
     private var parser: UnsafeMutablePointer<AVCodecParserContext>?
     private var context: UnsafeMutablePointer<AVCodecContext>?
-
-    /// The Matroska repair only accepts complete frame pictures, not individual fields.
     var isFramePicture: Bool { parser?.pointee.picture_structure == AV_PICTURE_STRUCTURE_FRAME }
 
     init?(codecParameters: UnsafePointer<AVCodecParameters>, timeBase: AVRational) {
@@ -572,7 +570,8 @@ final class H264PictureOrderReader {
     }
 }
 
-/// Per-demuxer runtime for the #409 repair: samples the head, decides once, then rewrites.
+/// Per-demuxer runtime for #409. The original all-missing policy decides at the head;
+/// a corroborated healthy head also enables bounded detection of later partial-ctts regions.
 ///
 /// Sampling holds packets instead of rewinding the source. A rewind is not available to every
 /// session (a custom source cannot be reopened, and a probe demuxer handed to playback must not be
@@ -675,17 +674,16 @@ final class H264CompositionOffsetRepairSession: H264TimestampRepairSession {
     /// repaired packets cut segment 2 one picture past its keyframe, which is a segment AVPlayer
     /// cannot start at.
     var decodeTimestampOffset: Int64? {
-        if monitorsPartialOffsets { return 0 }
         guard phase == .repairing, let rewriter else { return nil }
         return rewriter.plan.shift - rewriter.plan.decodeLead
     }
 
     /// Returns true when the packet was taken over by the session and must not be emitted yet.
     /// A packet the session keeps is owned by it until `dequeue()` hands it back.
-    func ingest(_ packet: UnsafeMutablePointer<AVPacket>) throws -> Bool {
+    func ingest(_ packet: UnsafeMutablePointer<AVPacket>) -> Bool {
         switch phase {
         case .off:
-            return monitorsPartialOffsets ? try partialRepairCandidate?.ingest(packet) ?? false : false
+            return monitorsPartialOffsets ? partialRepairCandidate?.ingest(packet) ?? false : false
         case .repairing:
             guard packet.pointee.stream_index == streamIndex else { return false }
             applyRepair(to: packet, pictureOrderCount: reader?.pictureOrderCount(for: packet))
@@ -723,9 +721,9 @@ final class H264CompositionOffsetRepairSession: H264TimestampRepairSession {
     }
 
     /// EOF during sampling. Decides on what is there, so the held packets are still delivered.
-    func endOfStream() throws {
+    func endOfStream() {
         if phase == .sampling { decide() }
-        if monitorsPartialOffsets { try partialRepairCandidate?.endOfStream() }
+        if monitorsPartialOffsets { partialRepairCandidate?.endOfStream() }
     }
 
     func noteSeek() {
@@ -771,6 +769,9 @@ final class H264CompositionOffsetRepairSession: H264TimestampRepairSession {
     }
 
     var summary: String {
+        if monitorsPartialOffsets, let partialRepairCandidate, partialRepairCandidate.hasDecision {
+            return partialRepairCandidate.summary
+        }
         var text = "phase=\(phase) verdict=\(verdictDescription)"
         if let rewriter {
             text += " repaired=\(rewriter.repairedPictures) unrepaired=\(rewriter.unrepairedPictures)"
@@ -866,8 +867,8 @@ final class H264CompositionOffsetRepairSession: H264TimestampRepairSession {
                 category: .demux
             )
         case .healthy:
-            // Corroborate the edit/index lead with an actual healthy origin picture. A random
-            // nonzero B-picture offset is not enough evidence to retime a later region.
+            // An actual healthy origin corroborates the container's edit/index lead. A random
+            // nonzero B-picture offset is not evidence for retiming a later region.
             if let first = samples.first, first.isKeyframe, first.pictureOrderCount == 0,
                first.dts == ladderStart, first.pts == streamStartTime {
                 monitorsPartialOffsets = partialRepairCandidate != nil

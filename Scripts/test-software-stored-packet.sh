@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 TASK_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-TASK_FFMPEG_ROOT="$TASK_ROOT/build/tvos-6.71.0/SourcePackages/checkouts/FFmpegBuild"
+TASK_FFMPEG_ROOT="${AETHER_FFMPEG_CHECKOUT:-$TASK_ROOT/.build/checkouts/FFmpegBuild}"
 TASK_EXPECTED_REVISION=$(/usr/bin/ruby -rjson -e \
   'pin = JSON.parse(File.read(ARGV.fetch(0))).fetch("pins").find { |p| p.fetch("identity") == "ffmpegbuild" }; abort "Missing FFmpegBuild pin" unless pin; puts pin.fetch("state").fetch("revision")' \
   "$TASK_ROOT/Package.resolved")
@@ -23,7 +23,7 @@ for TASK_LIBRARY in AetherLibavcodec AetherLibavutil AetherLibswresample AetherL
 done
 # Low-level host command-line packet test against the already-pinned binary dependency.
 # This does not build/resolve a package, build a macOS/iOS app, or modify package caches.
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swiftc -swift-version 6 \
+xcrun swiftc -swift-version 6 \
   "${TASK_FRAMEWORK_ARGS[@]}" -framework AetherLibavcodec -framework AetherLibavutil \
   "$TASK_ROOT/Sources/AetherEngine/Diagnostics/PacketBalanceTracker.swift" \
   "$TASK_ROOT/Sources/AetherEngine/Native/SoftwareStoredPacket.swift" \

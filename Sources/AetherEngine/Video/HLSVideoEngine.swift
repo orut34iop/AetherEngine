@@ -51,6 +51,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// route, and only while `effectiveDvMode` is false.
     let forceDolbyVisionOnNonDVDisplay: Bool
 
+    /// From `LoadOptions.dolbyVisionHandling`; default `.automatic`. `.baseLayerOnly` sends a Dolby
+    /// Vision source with a presentable base layer down the plain hvc1 / av01 route on every display
+    /// (`VideoRoutingPolicy.presentsDolbyVisionBaseLayer`), ahead of every DV branch including AE#455.
+    let dolbyVisionHandling: DolbyVisionHandling
+
+    /// AE#532: the profile this source's own RPU reports, when the container record was worth doubting
+    /// (`DolbyVisionRecordAudit`). nil when nothing was read, which is every source but a Profile 5
+    /// record over a BT.2020 YCbCr HDR VUI. The route believes it over the record.
+    let dolbyVisionRPUProfile: Int?
+
     /// Match Content master toggle at load time; one input to the master-vs-media-playlist routing decision.
     private let matchContentEnabled: Bool
 
@@ -449,6 +459,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// no audio track and a source whose audio could not be delivered both leave it nil, and only the
     /// second is a reason for a fallback ladder to demote. Set at each of the cascade's three exits.
     public internal(set) var audioDelivery: AudioDelivery = .none
+
+    /// AE#520: the stream-copied audio bitstream carries JOC, so this session's `ec-3` track is
+    /// Atmos and reaches the receiver as a 2-channel MAT carrier. A host that reads a channel count
+    /// off the HDMI route has to know that, or it reads the carrier as a downmix.
+    public internal(set) var audioIsAtmosStreamCopy = false
 
     /// Producer's `videoShiftPts` in seconds, updated on every gate open. AVPlayer clock =
     /// `source_pts - playlistShiftSeconds`. Lock-guarded: written on pump thread, read on others.
@@ -861,6 +876,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         displaySupportsHDR: Bool = true,
         keepDvh1TagWithoutDV: Bool = false,
         forceDolbyVisionOnNonDVDisplay: Bool = false,
+        dolbyVisionHandling: DolbyVisionHandling = .automatic,
+        dolbyVisionRPUProfile: Int? = nil,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         audioSourceStreamIndexOverride: Int32? = nil,
@@ -881,6 +898,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         probesize: Int64? = nil,
         maxAnalyzeDuration: Int64? = nil,
         sequentialOrigin: Bool = false,
+        heldSourceConnection: Bool = false,
         declaredDurationSeconds: Double? = nil,
         forwardBufferSegments: Int? = nil,
         sessionCacheByteBudget: Int? = nil
@@ -888,16 +906,23 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.sourceURL = url
         self.sourceHTTPHeaders = sourceHTTPHeaders
         self.sequentialOrigin = sequentialOrigin
+        self.heldSourceConnection = heldSourceConnection
         self.declaredDurationSeconds = declaredDurationSeconds
         // Caller-bounded find_stream_info budget (#68); nil keeps the .playback default. Applied only to the
         // fallback open / live reopen here; the happy path reuses the already-budgeted preopenedDemuxer.
+        // #377: the held transport is carried too. It is chosen at open time, so a reopen that leaves
+        // it out puts the session silently back on ranged requests against the one kind of origin the
+        // host turned it on for, and the flag reads as having stopped working half way through.
         self.openProfile = DemuxerOpenProfile.playback.withProbeBudget(
             probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration)
             .withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDurationSeconds)
+            .withHeldSourceConnection(heldSourceConnection)
         self.dvModeAvailable = dvModeAvailable
         self.displaySupportsHDR = displaySupportsHDR
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
         self.forceDolbyVisionOnNonDVDisplay = forceDolbyVisionOnNonDVDisplay
+        self.dolbyVisionHandling = dolbyVisionHandling
+        self.dolbyVisionRPUProfile = dolbyVisionRPUProfile
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.audioSourceStreamIndexOverride = audioSourceStreamIndexOverride
@@ -1019,6 +1044,19 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// `.playback` unless the caller set `LoadOptions.probesize` / `maxAnalyzeDuration`. Read in the
     /// `+LiveReopen` extension, so it cannot be file-private.
     let openProfile: DemuxerOpenProfile
+    /// #377: opt-in held source transport, carried onto every open this session makes itself.
+    let heldSourceConnection: Bool
+
+    /// The profile the VOD scrub restart opens its replacement demuxer with. Bounded
+    /// find_stream_info budget, and the same SOURCE declarations as the first open: a ranged reopen
+    /// would splice fabricated-position bytes into a sequential pump, and one that dropped the held
+    /// transport would put a session the host asked to hold a connection back on ranged requests
+    /// against the origin that punishes them, half way through and with nothing saying so.
+    var restartReopenProfile: DemuxerOpenProfile {
+        DemuxerOpenProfile.restartReopen
+            .withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDurationSeconds)
+            .withHeldSourceConnection(heldSourceConnection)
+    }
 
     /// `LoadOptions.sequentialOrigin` for this session. Gates the VOD readError revive
     /// (`+LiveReopen`): a revive's fresh demuxer can only reopen from byte 0 and then fails its
@@ -1086,6 +1124,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
         demuxer = dem
         dem.onNetworkPhaseChanged = onNetworkPhaseChanged   // surface source stall/reconnect to playbackPhase (#85)
+        dem.playIntentProvider = playIntentProvider   // a held connection ends on a pause, not on a parked producer
 
         let videoIndex = dem.videoStreamIndex
         guard videoIndex >= 0, let videoStream = dem.stream(at: videoIndex) else {
@@ -1430,8 +1469,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // already signaled (full-range P5 is legal, #20); unspecified defaults to limited.
         // The AE#455 P8.1-as-P5 route needs the same guarantee for the same reason, and lands on the
         // same tuple: an HDR10 base layer is BT.2020 / PQ / BT.2020-NCL by definition.
+        // Keyed on the sample entry the route chose, not on the variant: a Profile 5 record served as
+        // its base layer (`dolbyVisionHandling = .baseLayerOnly`) is plain hvc1 whose VUI the muxer
+        // stream-copies as it stands.
         let p5ColorOverride: MP4SegmentMuxer.ColorOverride?
-        if dvVariant == .profile5 || doviConfig == .rewriteToProfile5 {
+        if codecTagOverride == "dvh1" {
             let sourceRange = codecpar.pointee.color_range
             p5ColorOverride = MP4SegmentMuxer.ColorOverride(
                 primaries: AVCOL_PRI_BT2020,
@@ -1736,6 +1778,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 // The only EAC3 case that can't stream-copy is EAC3-from-MKV without dec3 extradata;
                 // `probeWriteHeader` in buildProducerWithAudioCascade catches and bridges that.
                 let isJOC = compat == .eac3 && acp.profile == 30
+                audioIsAtmosStreamCopy = isJOC
                 audioHLSCodecs = compat.hlsCodecsString
                 EngineLog.emit(
                     "[HLSVideoEngine] audio: codec=\(compat) → stream-copy as `\(audioHLSCodecs ?? "?")` "
@@ -1744,8 +1787,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     category: .session
                 )
             } else {
+                // Not video-only, and the line used to say so. The bridge cascade below asks for a
+                // decoder by id, not for a routing-table entry, so a codec the table does not name
+                // still gets sound as long as the FFmpeg build carries its decoder (measured
+                // 2026-09-10 on Nellymoser-in-FLV before its table entry existed: this line, then a
+                // NELLYMOSER -> FLAC bridge and a session with audio). What the missing entry costs
+                // is the stream-copy decision, which is why the next thing that happens is a bridge.
+                // The genuinely silent case is one line further down: no decoder in the build at
+                // all, which the cascade reports as `falling back to SILENT video-only`.
                 EngineLog.emit(
-                    "[HLSVideoEngine] audio: codec id=\(codecID.rawValue) unsupported, video-only",
+                    "[HLSVideoEngine] audio: codec id=\(codecID.rawValue) is not in the routing table, "
+                    + "no stream-copy decision to make; the bridge cascade decides whether it plays",
                     category: .session
                 )
             }
@@ -3776,8 +3828,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     // reopen would splice fabricated-position bytes into the new pump.
                     try fresh.open(
                         url: sourceURL, extraHeaders: sourceHTTPHeaders,
-                        profile: DemuxerOpenProfile.restartReopen
-                            .withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDurationSeconds),
+                        profile: restartReopenProfile,
                         isLive: false)
                     dem.markClosed() // abort any wedged read now that the replacement is ready
                     freshDemuxer = fresh
@@ -3848,6 +3899,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // delivery even though it already served this session's `find_stream_info` into a nil sink.
             dem.onNetworkPhaseChanged = nil
             freshDemuxer.onNetworkPhaseChanged = onNetworkPhaseChanged   // re-wire stall signal onto the reopened demuxer (#85)
+            freshDemuxer.playIntentProvider = playIntentProvider   // and the pause bound its held connection is judged on (#377)
         }
         do {
             let newProd = try makeProducer(baseIndex: idx)

@@ -3,6 +3,45 @@
 This public fork carries AetherEngine changes required by the Moonfin tvOS
 application.
 
+## Canonical 6.84.0 integration — 2026-09-13
+
+This branch merges canonical/main at `565f5ec9cdc5033d085d6cb556faf16875efb4f0`
+(stable 6.84.0), not a floating dependency. Both engine and Moonfin host have the
+annotated, pushed checkpoint `moonfin/pre-aether-6.84.0-20260913-105925`.
+The engine checkpoint is `c16e23dc28dafc85d5864b407230e30b51313730`; the host
+checkpoint is `117a70c925f5de658341a70bff9713ec221033ee`, pinning `b72fa6bb`.
+
+Use upstream's streaming Matroska slot permutation and partial-ctts ladder,
+including fail-open packet delivery, unchanged Matroska DTS/index, and bounded
+mini-GOP lookahead. The old whole-sequence Matroska runtime is removed. Its pure
+numeric policy/fixtures remain historical regression evidence, not a demux route.
+Moonfin's structured identity-free diagnostics are adapted to the new runtimes;
+they observe decisions and do not rewrite timestamps. Retain the measured
+recovery-point software compatibility route pending AE#510 resolution.
+
+Take upstream retained-cache limits, asynchronous seek cleanup, adaptive producer
+QoS (#519), and backward-scrub park-clock fix (#528). Preserve host-requested
+session byte budgets, exact-origin TLS/sidecar headers, dual subtitle ownership,
+generation guards, fine-timescale muxing, and native frame diagnostics. Subtitle
+changes upstream concern prefetch re-anchoring and cancellation reasons, not
+rendering/style. No host UI, focus, remote interaction, translation eligibility,
+audio-delay UI, or optional network/DV feature is enabled by this integration.
+
+FFmpegBuild is 3.3.0 (`4e58942403d37cceff3a3212e3e026f4205146a2`), LibDovi 2.1.0
+and SMBClient 0.3.1 remain fixed. FFmpeg license texts are byte-identical to the
+previous reviewed assets. tvOS arm64 package compilation passes. Focused
+standalone checks cover recovery-point recognition, compressed packet/cache
+ownership, partial-ctts long-GOP/seek/fail-open controls and structured diagnostics.
+Generated MP4/MKV controls compare actual bundled-decoder frame times, packet
+payload/side-data preservation, unchanged Matroska DTS, and zero packet leaks.
+Use `AETHER_FFMPEG_CHECKOUT` to select the exact frozen checkout for runtime tests;
+the scripts reject a revision mismatch. Evidence: `build/integration-6.84.0/`.
+
+Host integration, consolidated review and Apple TV original-asset acceptance are
+recorded separately in Moonfin's `docs/testing/aetherengine-6.84.0-upgrade.md`.
+An engine compile is not physical playback acceptance. Keep checkpoint tags;
+after push use revert commits, never reset/rebase/force-push shared history.
+
 ## Upstream submissions — 2026-09-07
 
 The user approved three independent PRs against canonical main

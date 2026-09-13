@@ -26,7 +26,7 @@ struct H264TimestampRuntimeTests {
         let expectedRepair = ProcessInfo.processInfo.environment["AETHER_EXPECT_TIMESTAMP_REPAIR"]
             .map { $0 == "1" } ?? matroska
         guard let session: any H264TimestampRepairSession = matroska
-            ? H264MatroskaTimestampRepairSession(stream: stream, streamIndex: index)
+            ? H264MatroskaSlotPermutationSession(containerFormatName: name, stream: stream, streamIndex: index)
             : H264CompositionOffsetRepairSession(containerFormatName: name, stream: stream, streamIndex: index, ladderStart: 0)
         else { throw Failure.session }
         let raw = try decoder(par, timeBase: stream.pointee.time_base)
@@ -57,6 +57,7 @@ struct H264TimestampRuntimeTests {
                     precondition(actual.bytes == expected.bytes && actual.sideData == expected.sideData)
                     precondition(actual.duration == expected.duration && actual.flags == expected.flags)
                     precondition(actual.position == expected.position && actual.streamIndex == expected.streamIndex)
+                    if matroska { precondition(actual.dts == expected.dts, "upstream slot permutation preserves DTS") }
                     if !expectedRepair { precondition(actual == expected) }
                     try decode(fixed, packet: packet, into: &fixedPTS)
                 } else { precondition(actual == expected) }
@@ -81,9 +82,9 @@ struct H264TimestampRuntimeTests {
                     videoRead += 1
                     try decode(raw, packet: packet, into: &rawPTS)
                 }
-                if try !session.ingest(packet) { try emit(packet) }
+                if !session.ingest(packet) { try emit(packet) }
             }
-            try session.endOfStream()
+            session.endOfStream()
             while let packet = session.dequeue() { try emit(packet) }
             try decode(raw, packet: nil, into: &rawPTS)
             try decode(fixed, packet: nil, into: &fixedPTS)
@@ -105,7 +106,7 @@ struct H264TimestampRuntimeTests {
     }
 
     static func lifecycleChecks(format: UnsafeMutablePointer<AVFormatContext>, stream: UnsafeMutablePointer<AVStream>, index: Int32) throws {
-        guard let session = H264MatroskaTimestampRepairSession(stream: stream, streamIndex: index) else { throw Failure.session }
+        guard let session = H264MatroskaSlotPermutationSession(containerFormatName: "matroska", stream: stream, streamIndex: index) else { throw Failure.session }
         // Seek with both unpublished input and a partly consumed ready queue. Those old packets
         // must be freed rather than replayed into the new source position.
         for goal in [3, 170] {
@@ -113,31 +114,34 @@ struct H264TimestampRuntimeTests {
             session.noteSeek()
             for _ in 0..<goal {
                 guard let packet = trackedPacketAlloc(), av_read_frame(format, packet) >= 0 else { throw Failure.demux }
-                if try !session.ingest(packet) { av_packet_free_safe(packet) }
+                if !session.ingest(packet) { av_packet_free_safe(packet) }
             }
             if let first = session.dequeue() { av_packet_free_safe(first) }
             session.noteSeek()
             precondition(session.dequeue() == nil && PacketBalanceTracker.alive == 0)
         }
-        // After activation, an unparseable sequence is an explicit failure; no changed-axis
-        // half-sequence or leaked packet is allowed to escape.
+        // Upstream #511 now fails open: malformed evidence must not terminate playback or
+        // consume a packet without handing it back. Index/DTS remain on the original axis.
         guard let malformed = trackedPacketAlloc() else { throw Failure.demux }
         malformed.pointee.stream_index = index
-        do { _ = try session.ingest(malformed); throw Failure.session }
-        catch H264MatroskaTimestampRepairSession.RepairError.sequenceNoLongerRepairable { }
+        if !session.ingest(malformed) { av_packet_free_safe(malformed) }
+        session.endOfStream()
+        while let packet = session.dequeue() { av_packet_free_safe(packet) }
         precondition(PacketBalanceTracker.alive == 0)
-        guard let bounded = H264MatroskaTimestampRepairSession(stream: stream, streamIndex: index) else { throw Failure.session }
+        guard let bounded = H264MatroskaSlotPermutationSession(containerFormatName: "matroska", stream: stream, streamIndex: index) else { throw Failure.session }
+        var held = 0
+        var released = 0
         for _ in 0..<1024 {
             guard let packet = trackedPacketAlloc() else { throw Failure.demux }
             packet.pointee.stream_index = index + 1
-            let taken = try bounded.ingest(packet)
-            precondition(taken)
+            let taken = bounded.ingest(packet)
+            if taken { held += 1 } else { av_packet_free_safe(packet); released += 1 }
         }
         precondition(bounded.isDecided)
-        var released = 0
+        precondition(held == H264MatroskaSlotPermutation.heldPacketCeiling)
         while let packet = bounded.dequeue() { av_packet_free_safe(packet); released += 1 }
         precondition(released == 1024 && PacketBalanceTracker.alive == 0)
-        print("PASS lifecycle=seek-during-sampling,seek-with-ready-and-pending,active-fail-closed,all-stream-packet-budget packet_balance=0")
+        print("PASS lifecycle=seek-during-sampling,seek-with-ready-and-pending,active-fail-open,all-stream-packet-budget packet_balance=0")
     }
 
     static func decoder(_ parameters: UnsafeMutablePointer<AVCodecParameters>, timeBase: AVRational) throws

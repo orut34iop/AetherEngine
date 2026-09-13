@@ -8,6 +8,47 @@ func av_packet_free_safe(_ packet: UnsafeMutablePointer<AVPacket>) {
     trackedPacketFree(&owned)
 }
 
+// Test-only snapshot: no dependency on the independent software packet-cache proposal.
+struct TimestampPacketSnapshot: Codable, Sendable, Equatable {
+    struct SideData: Codable, Sendable, Equatable {
+        let type: UInt32
+        let bytes: Data
+    }
+    let pts: Int64
+    let dts: Int64
+    let duration: Int64
+    let position: Int64
+    let streamIndex: Int32
+    let flags: Int32
+    let timeBaseNumerator: Int32
+    let timeBaseDenominator: Int32
+    let bytes: Data
+    let sideData: [SideData]
+
+}
+extension TimestampPacketSnapshot {
+    enum PacketError: Error { case invalidPacket, allocationFailed }
+
+    init(copying packet: UnsafeMutablePointer<AVPacket>) throws {
+        let p = packet.pointee
+        guard p.size >= 0, p.side_data_elems >= 0,
+              p.size == 0 || p.data != nil,
+              p.side_data_elems == 0 || p.side_data != nil else { throw PacketError.invalidPacket }
+        var sides: [SideData] = []
+        for index in 0..<Int(p.side_data_elems) {
+            let side = p.side_data[index]
+            guard side.size == 0 || side.data != nil else { throw PacketError.invalidPacket }
+            sides.append(SideData(type: side.type.rawValue,
+                                  bytes: side.size == 0 ? Data() : Data(bytes: side.data, count: side.size)))
+        }
+        self.init(pts: p.pts, dts: p.dts, duration: p.duration, position: p.pos,
+                  streamIndex: p.stream_index, flags: p.flags,
+                  timeBaseNumerator: p.time_base.num, timeBaseDenominator: p.time_base.den,
+                  bytes: p.size == 0 ? Data() : Data(bytes: p.data, count: Int(p.size)), sideData: sides)
+    }
+
+}
+
 @main
 struct H264PartialCompositionRuntimeTests {
     enum Failure: Error { case open, decoder, demux, decode, session, boundedRead }
@@ -25,9 +66,7 @@ struct H264PartialCompositionRuntimeTests {
         let matroska = name.contains("matroska")
         guard !matroska else { throw Failure.session }
         let ladderStart = avformat_index_get_entry(stream, 0)?.pointee.timestamp ?? Int64.min
-        guard let session: any H264TimestampRepairSession = matroska
-            ? H264MatroskaTimestampRepairSession(stream: stream, streamIndex: index)
-            : H264CompositionOffsetRepairSession(containerFormatName: name, stream: stream, streamIndex: index, ladderStart: ladderStart)
+        guard let session = H264CompositionOffsetRepairSession(containerFormatName: name, stream: stream, streamIndex: index, ladderStart: ladderStart)
         else { throw Failure.session }
         let raw = try decoder(par, timeBase: stream.pointee.time_base)
         let fixed = try decoder(par, timeBase: stream.pointee.time_base)
@@ -35,7 +74,7 @@ struct H264PartialCompositionRuntimeTests {
             var a: UnsafeMutablePointer<AVCodecContext>? = raw; avcodec_free_context(&a)
             var b: UnsafeMutablePointer<AVCodecContext>? = fixed; avcodec_free_context(&b)
         }
-        var inputs: [UInt: SoftwareStoredPacket] = [:]
+        var inputs: [UInt: TimestampPacketSnapshot] = [:]
         let positions = CommandLine.arguments.dropFirst(2).compactMap(Double.init)
         for position in positions.isEmpty ? [0] : positions {
             if position >= 0 {
@@ -49,7 +88,7 @@ struct H264PartialCompositionRuntimeTests {
             func emit(_ packet: UnsafeMutablePointer<AVPacket>) throws {
                 defer { var owned: UnsafeMutablePointer<AVPacket>? = packet; trackedPacketFree(&owned) }
                 let expected = inputs.removeValue(forKey: UInt(bitPattern: packet))!
-                let actual = try SoftwareStoredPacket(copying: packet)
+                let actual = try TimestampPacketSnapshot(copying: packet)
                 // Exact packet payload/side-data/flags/duration/audio preservation, not just a
                 // model calculation. Only the selected video PTS/DTS may differ.
                 if packet.pointee.stream_index == index {
@@ -63,7 +102,7 @@ struct H264PartialCompositionRuntimeTests {
             }
             while !stop {
                 while let packet = session.dequeue() { try emit(packet) }
-                guard reads < 10000, videoRead < 2000 else { throw Failure.boundedRead }
+                guard reads < 40000, videoRead < 8000 else { throw Failure.boundedRead }
                 guard let packet = trackedPacketAlloc() else { throw Failure.demux }
                 let status = av_read_frame(format, packet)
                 if status < 0 {
@@ -73,41 +112,45 @@ struct H264PartialCompositionRuntimeTests {
                     break
                 }
                 reads += 1
-                inputs[UInt(bitPattern: packet)] = try SoftwareStoredPacket(copying: packet)
+                inputs[UInt(bitPattern: packet)] = try TimestampPacketSnapshot(copying: packet)
                 if packet.pointee.stream_index == index {
                     let key = packet.pointee.flags & AV_PKT_FLAG_KEY != 0
-                    stop = videoRead >= 180 && key
+                    stop = videoRead >= 1200 && key
                     videoRead += 1
                     try decode(raw, packet: packet, into: &rawPTS)
                 }
-                if try !session.ingest(packet) { try emit(packet) }
-                observedRepair = observedRepair || session.diagnostic(sourceSeekable: true, isISOBaseMediaFile: true, isH264: true)
-                    .reason == .confirmedPartialCompositionOffsets
+                if !session.ingest(packet) { try emit(packet) }
+                observedRepair = observedRepair || session.summary.contains("confirmed_partial_composition_offsets")
+                if session.summary.contains("confirmed_partial_composition_offsets") {
+                    let snapshot = session.diagnostic(sourceSeekable: true, isISOBaseMediaFile: true, isH264: true)
+                    precondition(snapshot.reason == .confirmedPartialCompositionOffsets)
+                    precondition(snapshot.outcome == .repairing && snapshot.repairedPictures > 0)
+                }
             }
-            try session.endOfStream()
+            session.endOfStream()
             while let packet = session.dequeue() { try emit(packet) }
             try decode(raw, packet: nil, into: &rawPTS)
             try decode(fixed, packet: nil, into: &fixedPTS)
             precondition(inputs.isEmpty && PacketBalanceTracker.alive == 0)
             let rawRegressions = zip(rawPTS, rawPTS.dropFirst()).filter { $1 <= $0 }.count
             let fixedRegressions = zip(fixedPTS, fixedPTS.dropFirst()).filter { $1 <= $0 }.count
-            let diagnostic = session.diagnostic(sourceSeekable: true, isISOBaseMediaFile: !matroska, isH264: true)
-            observedRepair = observedRepair || diagnostic.reason == .confirmedPartialCompositionOffsets
-            FileHandle.standardError.write(Data("MEASURE seek=\(position) raw=\(rawRegressions) fixed=\(fixedRegressions) offset=\(session.decodeTimestampOffset ?? 0) state=\(diagnostic.reason.rawValue) lead=\(diagnostic.planDecodeLead ?? 0) shift=\(diagnostic.planShift ?? 0)\n".utf8))
+            let diagnostic = session.summary
+            observedRepair = observedRepair || diagnostic.contains("confirmed_partial_composition_offsets")
+            FileHandle.standardError.write(Data("MEASURE seek=\(position) raw=\(rawRegressions) fixed=\(fixedRegressions) offset=\(session.decodeTimestampOffset ?? 0) state=\(diagnostic) lead=\(0) shift=\(0)\n".utf8))
             precondition(rawPTS.count == fixedPTS.count && !fixedPTS.isEmpty)
             precondition(fixedRegressions == 0)
             if rawRegressions > 0 {
                 precondition(observedRepair)
-                precondition(session.decodeTimestampOffset == 0)
+                precondition(session.decodeTimestampOffset == nil)
             } else { precondition(rawPTS == fixedPTS, "healthy head remains exactly unchanged") }
-            print("PASS source_kind=\(matroska ? "matroska" : "mp4") seek=\(position) decoded=\(fixedPTS.count) original_regressions=\(rawRegressions) repaired_regressions=\(fixedRegressions) packets=\(delivered) reason=\(diagnostic.reason.rawValue) decode_offset=\(session.decodeTimestampOffset ?? 0) packet_balance=0")
+            print("PASS source_kind=\(matroska ? "matroska" : "mp4") seek=\(position) decoded=\(fixedPTS.count) original_regressions=\(rawRegressions) repaired_regressions=\(fixedRegressions) packets=\(delivered) reason=\(diagnostic) decode_offset=\(session.decodeTimestampOffset ?? 0) packet_balance=0")
         }
         if positions.count > 1 {
             try lifecycleChecks(session: session, format: format, stream: stream, index: index, position: positions[1])
         }
     }
 
-    static func lifecycleChecks(session: any H264TimestampRepairSession,
+    static func lifecycleChecks(session: H264CompositionOffsetRepairSession,
         format: UnsafeMutablePointer<AVFormatContext>, stream: UnsafeMutablePointer<AVStream>, index: Int32,
         position: Double) throws {
         func seek() throws {
@@ -117,7 +160,7 @@ struct H264PartialCompositionRuntimeTests {
         func read() throws {
             guard let packet = trackedPacketAlloc() else { throw Failure.demux }
             guard av_read_frame(format, packet) >= 0 else { av_packet_free_safe(packet); throw Failure.demux }
-            if try !session.ingest(packet) { av_packet_free_safe(packet) }
+            if !session.ingest(packet) { av_packet_free_safe(packet) }
         }
         for goal in [3, 500] {
             try seek()
@@ -127,36 +170,56 @@ struct H264PartialCompositionRuntimeTests {
             precondition(session.dequeue() == nil && PacketBalanceTracker.alive == 0,
                 "seek must release both pending input and partly drained output")
         }
-        for malformedDTS: Int64 in [Int64.min, 0] {
+        // A shape this policy cannot own costs the repair, never the session. After confirmation a
+        // malformed timestamp hands every held packet back and the reads that follow keep coming.
+        for malformed: (dts: Int64, pts: Int64) in [(Int64.min, Int64.min), (0, 0)] {
             try seek()
             var confirmed = false
-            for _ in 0..<2000 {
+            for _ in 0..<4000 {
                 try read()
-                if session.diagnostic(sourceSeekable: true, isISOBaseMediaFile: true, isH264: true)
-                    .reason == .confirmedPartialCompositionOffsets { confirmed = true; break }
+                if session.summary.contains("confirmed_partial_composition_offsets") { confirmed = true; break }
             }
             precondition(confirmed)
-            guard let malformed = trackedPacketAlloc() else { throw Failure.demux }
-            malformed.pointee.stream_index = index
-            malformed.pointee.dts = malformedDTS
-            do { _ = try session.ingest(malformed); throw Failure.session }
-            catch H264PartialCompositionRepairSession.RepairError.sequenceNoLongerRepairable { }
-            precondition(PacketBalanceTracker.alive == 0 && session.dequeue() == nil)
+            guard let packet = trackedPacketAlloc() else { throw Failure.demux }
+            packet.pointee.stream_index = index
+            packet.pointee.dts = malformed.dts
+            packet.pointee.pts = malformed.pts
+            if !session.ingest(packet) { av_packet_free_safe(packet) }
+            while let packet = session.dequeue() { av_packet_free_safe(packet) }
+            let snapshot = session.diagnostic(sourceSeekable: true, isISOBaseMediaFile: true, isH264: true)
+            precondition(snapshot.reason == .partialCompositionSequenceUnproven)
+            precondition(snapshot.outcome == .inconclusive && snapshot.unrepairedPictures > 0)
+            precondition(PacketBalanceTracker.alive == 0, "a refusal still owns every packet it took")
+            // A refused sequence streams through the session rather than out of its queue, so
+            // count both ways a packet can come back.
+            var delivered = 0
+            for _ in 0..<400 {
+                guard let next = trackedPacketAlloc() else { throw Failure.demux }
+                guard av_read_frame(format, next) >= 0 else { av_packet_free_safe(next); break }
+                if !session.ingest(next) { av_packet_free_safe(next); delivered += 1 }
+                while let packet = session.dequeue() { av_packet_free_safe(packet); delivered += 1 }
+            }
+            precondition(delivered > 0, "a refused sequence still has to stream through")
             session.noteSeek()
+            precondition(PacketBalanceTracker.alive == 0)
         }
         try seek()
-        for _ in 0..<3 { try read() }
-        // Pending video plus empty auxiliary packets must hit the all-stream bound without
-        // reading arbitrarily far. Even refusal owns and returns every original packet.
-        for _ in 0..<1024 {
+        for _ in 0..<32 { try read() }
+        // Interleaving, not reordering, is what can still make the wait large. The all-stream budget
+        // is the ceiling on that, and crossing it ends the hold rather than the delivery.
+        var heldForeign = 0
+        for _ in 0..<(4 * H264PartialCompositionRepair.maximumHeldPackets) {
             guard let packet = trackedPacketAlloc() else { throw Failure.demux }
             packet.pointee.stream_index = index + 1
-            if try !session.ingest(packet) { av_packet_free_safe(packet) }
+            if session.ingest(packet) { heldForeign += 1 } else { av_packet_free_safe(packet) }
         }
+        precondition(heldForeign > 0 && heldForeign <= H264PartialCompositionRepair.maximumHeldPackets,
+                     "the all-stream budget has to end the hold, held \(heldForeign)")
         while let packet = session.dequeue() { av_packet_free_safe(packet) }
         session.noteSeek()
         precondition(PacketBalanceTracker.alive == 0)
-        print("PASS partial lifecycle: seek-pending, seek-ready-and-pending, confirmed-fail-closed, all-stream-budget packet_balance=0")
+        print("PASS partial lifecycle: seek-pending, seek-ready-and-pending, confirmed-fails-open,"
+            + " all-stream-budget held=\(heldForeign) packet_balance=0")
     }
 
     static func decoder(_ parameters: UnsafeMutablePointer<AVCodecParameters>, timeBase: AVRational) throws

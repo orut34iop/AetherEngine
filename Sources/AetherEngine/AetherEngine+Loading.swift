@@ -470,7 +470,18 @@ extension AetherEngine {
                     // Only an explicit user pause; ignore transient pre-roll paused at load. AE#440: the
                     // pre-play reading is delivered AFTER the autostart has written .playing, so before
                     // the first roll a .paused is the outgoing value rather than anyone's intent.
-                    if self.hasTransportRolled, self.state == .playing { self.state = .paused }
+                    // Unless the session was ASKED to pause before it ever rolled (a host that pauses
+                    // the resumed frame after a background reload): its own pause carries the same
+                    // status and must still land, or `state` stays where the start left it on a
+                    // transport that is not moving and the phase reads `.loading` for good.
+                    // `.loading` is a source state here, not just `.playing`: this bypass autostarts
+                    // without writing `.playing` (the sink does that when AVPlayer renders), so a pause
+                    // that lands during startup finds `.loading` and has nowhere else to settle.
+                    // `.seeking` is left alone, the seek finalize owns it.
+                    if Self.publishesTransportPause(
+                        hasTransportRolled: self.hasTransportRolled,
+                        transportIntentIsPlaying: self.nativeHost?.transportIntentIsPlaying ?? true
+                    ), self.state == .playing || self.state == .loading { self.state = .paused }
                 @unknown default:
                     break
                 }
@@ -678,6 +689,8 @@ extension AetherEngine {
         audioSourceStreamIndex: Int32? = nil,
         keepDvh1TagWithoutDV: Bool = false,
         forceDolbyVisionOnNonDVDisplay: Bool = false,
+        dolbyVisionHandling: DolbyVisionHandling = .automatic,
+        dolbyVisionRPUProfile: Int? = nil,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
@@ -743,6 +756,8 @@ extension AetherEngine {
             displaySupportsHDR: sessionDisplayCaps.supportsHDR,
             keepDvh1TagWithoutDV: keepDvh1TagWithoutDV,
             forceDolbyVisionOnNonDVDisplay: forceDolbyVisionOnNonDVDisplay,
+            dolbyVisionHandling: dolbyVisionHandling,
+            dolbyVisionRPUProfile: dolbyVisionRPUProfile,
             matchContentEnabled: matchContentEnabled,
             panelIsInHDRMode: panelIsInHDRMode,
             audioSourceStreamIndexOverride: audioSourceStreamIndex,
@@ -765,6 +780,9 @@ extension AetherEngine {
             probesize: loadedOptions.probesize,
             maxAnalyzeDuration: loadedOptions.maxAnalyzeDuration,
             sequentialOrigin: loadedOptions.sequentialOrigin,
+            // #377: the session's own opens (fallback, live reopen, restart reopen) keep the transport
+            // the host asked for; without it the flag lasts exactly as long as the pre-opened demuxer.
+            heldSourceConnection: loadedOptions.heldSourceConnection,
             declaredDurationSeconds: loadedOptions.declaredDurationSeconds,
             forwardBufferSegments: loadedOptions.forwardBufferSegments,
             sessionCacheByteBudget: loadedOptions.sessionCacheByteBudget
@@ -1293,6 +1311,17 @@ extension AetherEngine {
             }
             .store(in: &nativeCancellables)
         startLiveWindowTimer(host: host)
+        // AE#515: the same parse `loadRemoteHLS` mirrors, read here as an upgrade only. This route has a
+        // probe, so `sourceVideoFormat` is already answered and `videoFormat` is the clamped label; what
+        // the item adds is the one thing the clamp cannot know on a platform without a capability table,
+        // namely that AVFoundation is playing a Dolby Vision sample entry. Mirroring the sink instead
+        // would overwrite a tvOS label the panel answered for.
+        host.$detectedVideoFormat
+            .compactMap { $0 }
+            .sink { [weak self] fmt in
+                self?.applyDolbyVisionLabelUpgrade(itemFormat: fmt)
+            }
+            .store(in: &nativeCancellables)
         wireCommonHostSinks(
             duration: host.$duration,
             isReady: host.$isReady,
@@ -1352,7 +1381,18 @@ extension AetherEngine {
                     // has already declared .playing, so latching it before the first roll published a
                     // millisecond of `.paused` on every native start. Before the transport has moved
                     // once, a .paused is the status the item was mounted with, not a pause.
-                    if self.hasTransportRolled, self.state != .paused { self.state = .paused }
+                    //
+                    // A pause the engine was ASKED for is the exception, and it has the same shape: the
+                    // background-return reload autostarts, the host pauses on the resumed frame before
+                    // the rate rolls, and AVPlayer's pre-pause .waitingToPlayAtSpecifiedRate lands after
+                    // that pause and re-declares .playing. Swallowing the .paused that follows left the
+                    // session at `state == .playing` with no roll to come, which the phase reports as
+                    // `.loading` forever: a host spinner over a black screen that only a Play press
+                    // could clear.
+                    if Self.publishesTransportPause(
+                        hasTransportRolled: self.hasTransportRolled,
+                        transportIntentIsPlaying: self.nativeHost?.transportIntentIsPlaying ?? true
+                    ), self.state != .paused { self.state = .paused }
                 case .playing, .waitingToPlayAtSpecifiedRate:
                     if self.state != .playing { self.state = .playing }
                 @unknown default:
@@ -1412,7 +1452,7 @@ extension AetherEngine {
                         }
                     }
                     guard let self, let host,
-                          let player = self.currentAVPlayer else { return }
+                          self.currentAVPlayer != nil else { return }
                     // Stage 1: nudge seek. Device-proven to reach AVPlayer (rate re-asserts)
                     // but NOT always to revive its loader; stage 2 covers that.
                     // AE#422: same read the wedge path already takes from the mirror. This one was
@@ -1584,7 +1624,11 @@ extension AetherEngine {
                   contract: .init(
                       isLive: isLive,
                       // AE#440: the join tail, opt-in. The host itself gates this on `isLive`.
-                      liveJoinStartsImmediately: loadedOptions.liveJoinStartsImmediately))
+                      liveJoinStartsImmediately: loadedOptions.liveJoinStartsImmediately,
+                      // AE#520: the session knows whether the bitstream it stream-copied carries JOC;
+                      // the HDMI route cannot, because Atmos passthrough and a stereo LPCM route
+                      // report the same two channels.
+                      audioIsAtmosStreamCopy: nativeVideoSession?.audioIsAtmosStreamCopy == true))
         forceNativeLegibleDeselectedUntilHostSelects()
     }
 
@@ -1759,6 +1803,7 @@ extension AetherEngine {
         let probesize = loadedOptions.probesize
         let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
         let sequentialOrigin = loadedOptions.sequentialOrigin
+        let heldSourceConnection = loadedOptions.heldSourceConnection
         let declaredDuration = loadedOptions.declaredDurationSeconds
         // Built on the main actor, captured into the detach: surfaces source stall/reconnect to playbackPhase (#85).
         let networkPhaseSink: @Sendable (ReaderNetworkPhase) -> Void = { [weak self] phase in
@@ -1768,13 +1813,13 @@ extension AetherEngine {
         let forwardBufferSegments = loadedOptions.forwardBufferSegments
         let sessionCacheByteBudget = loadedOptions.sessionCacheByteBudget
         try await Task.detached(priority: .userInitiated) {
-            [host, preopenedDemuxer, url, sourceHTTPHeaders, isLive, dvrWindowSeconds, probesize, maxAnalyzeDuration, sequentialOrigin, declaredDuration, networkPhaseSink] in
+            [host, preopenedDemuxer, url, sourceHTTPHeaders, isLive, dvrWindowSeconds, probesize, maxAnalyzeDuration, sequentialOrigin, heldSourceConnection, declaredDuration, networkPhaseSink] in
             let dem: Demuxer
             if let pre = preopenedDemuxer {
                 dem = pre
             } else {
                 dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration), isLive: isLive)
+                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection), isLive: isLive)
             }
             dem.onNetworkPhaseChanged = networkPhaseSink
             try await host.load(
@@ -1837,6 +1882,7 @@ extension AetherEngine {
         let probesize = loadedOptions.probesize
         let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
         let sequentialOrigin = loadedOptions.sequentialOrigin
+        let heldSourceConnection = loadedOptions.heldSourceConnection
         let declaredDuration = loadedOptions.declaredDurationSeconds
         // Built on the main actor, captured into the detach: surfaces source stall/reconnect to playbackPhase (#85).
         let networkPhaseSink: @Sendable (ReaderNetworkPhase) -> Void = { [weak self] phase in
@@ -1844,13 +1890,13 @@ extension AetherEngine {
         }
         if loadGeneration == generation { recordStartupCheckpoint(.sessionConstructed) }   // #361
         try await Task.detached(priority: .userInitiated) {
-            [host, preopenedDemuxer, url, sourceHTTPHeaders, probesize, maxAnalyzeDuration, sequentialOrigin, declaredDuration, networkPhaseSink] in
+            [host, preopenedDemuxer, url, sourceHTTPHeaders, probesize, maxAnalyzeDuration, sequentialOrigin, heldSourceConnection, declaredDuration, networkPhaseSink] in
             let dem: Demuxer
             if let pre = preopenedDemuxer {
                 dem = pre
             } else {
                 dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration))
+                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection))
             }
             dem.onNetworkPhaseChanged = networkPhaseSink
             try await host.load(
@@ -2020,8 +2066,11 @@ extension AetherEngine {
 
         state = .loading
         // AE#464 round 2: this branch reaches `loadSoftware` / `loadNative` rather than `load`, so it
-        // parks its own rebuild position for anything that stacks behind it.
+        // parks its own rebuild position for anything that stacks behind it. Round 3 parks the
+        // transport beside it; this branch reads `loadedOptions` field by field, and the caller has
+        // already written the session's own transport into it.
         positionUnderReconstruction = resumeAt
+        transportIntentUnderReconstruction = loadedOptions.autoplay
         let previousAudioIndex = activeAudioTrackIndex
         // Snapshot before stopInternal wipes state. Must reload on the same backend: loadNative on a SW-routed AV1 source throws unsupportedCodec (HLSVideoEngine only accepts HEVC / H.264 / VP9 / probed-AV1).
         let wasOnSoftwarePath = (playbackBackend == .software)
@@ -2187,6 +2236,10 @@ extension AetherEngine {
                     audioSourceStreamIndex: audioStreamIndex,
                     keepDvh1TagWithoutDV: loadedOptions.keepDvh1TagWithoutDV,
                     forceDolbyVisionOnNonDVDisplay: loadedOptions.forceDolbyVisionOnNonDVDisplay,
+                    dolbyVisionHandling: loadedOptions.dolbyVisionHandling,
+                    // AE#532: the verdict the load reached, not a second audit: the source has not
+                    // changed and the probe that could answer it is gone.
+                    dolbyVisionRPUProfile: sourceDolbyVisionRPUProfile,
                     matchContentEnabled: loadedOptions.matchContentEnabled,
                     panelIsInHDRMode: loadedOptions.panelIsInHDRMode,
                     audioBridgeMode: loadedOptions.audioBridgeMode,
@@ -2378,5 +2431,25 @@ extension AetherEngine {
         guard videoFormat == .hdr10 else { return }
         EngineLog.emit("[AetherEngine] HDR10+ T.35 detected, upgrading videoFormat .hdr10 → .hdr10Plus", category: .engine)
         videoFormat = .hdr10Plus
+    }
+
+    /// AE#515: republish a clamped Dolby Vision label once the item AVFoundation is playing says so.
+    /// Called from the loopback route's item-format sink; `dolbyVisionLabelUpgrade` carries the rule and
+    /// the reason for every term. `sourceVideoFormat` is untouched: the probe answered that one already,
+    /// and better than a sample entry can.
+    @MainActor
+    private func applyDolbyVisionLabelUpgrade(itemFormat: VideoFormat) {
+        guard let upgraded = Self.dolbyVisionLabelUpgrade(
+            publishedFormat: videoFormat,
+            sourceFormat: sourceVideoFormat,
+            itemFormat: itemFormat,
+            perModeCapabilitiesObservable: Self.perModeDisplayCapabilitiesObservable
+        ) else { return }
+        EngineLog.emit(
+            "[AetherEngine] item carries a Dolby Vision sample entry, upgrading videoFormat "
+            + "\(videoFormat) → \(upgraded); this display reports no per-mode capabilities and the "
+            + "clamp had nothing to read (#515)",
+            category: .engine)
+        videoFormat = upgraded
     }
 }

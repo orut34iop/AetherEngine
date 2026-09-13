@@ -4,54 +4,59 @@ import AetherLibavformat
 import AetherLibavutil
 
 /// Enabled only by a healthy head whose IDR offset agrees with the container edit/index axis.
-/// Healthy packets remain a zero-hold fast path. A zero-offset IDR starts one bounded sequence
-/// probe; all interleaved packets are owned until its complete POC permutation is established.
-/// DTS NEVER changes, so an already published keyframe index remains valid across region changes.
+/// Healthy packets stay a zero-hold fast path. A zero-offset IDR opens a sequence whose pictures
+/// claim their own display slots as those slots are read, so a picture waits its mini-GOP and the
+/// hold never grows with the sequence. DTS never changes, so an already published keyframe index
+/// stays valid across a region change.
+///
+/// Every refusal hands the packets back exactly as they arrived. A repair that later cannot say
+/// where a picture belongs still has to deliver it: the judder it was built to remove is a far
+/// smaller failure than a session that stops.
 final class H264PartialCompositionRepairSession {
     private struct Entry {
         let packet: UnsafeMutablePointer<AVPacket>
-        let poc: Int64?
+        /// nil for a packet of another stream: it holds its place in the container's order and
+        /// carries no claim of its own.
+        let rank: Int?
+        let decodeIndex: Int
     }
-    enum RepairError: Error { case sequenceNoLongerRepairable }
     private let streamIndex: Int32
-    private let videoDelay: Int
     private let timeBase: AVRational
     private let lead: Int64
+    private let reorderDepth: Int
     private let framing: VideoNALFraming
     private let reader: H264PictureOrderReader
     private var pending: [Entry] = []
     private var ready: [UnsafeMutablePointer<AVPacket>] = []
     private var readyIndex = 0
     private var bytes = 0
-    private var videoCount = 0
+    private var ladder = H264PartialCompositionRepair.SlotLadder()
+    private var decodeIndex = 0
+    private var inSequence = false
+    private var sequenceReordered = false
     private var confirmed = false
-    private var failed = false
+    private var abandoned = false
     private var repairedCount = 0
-    private var sampleCount = 0
-    private var heldCount = 0
-    private var heldBytes = 0
-    private var regressions = 0
-    private var firstDTS: Int64?
-    private var minStep: Int64?
-    private var maxStep: Int64?
-    private(set) var outcome: H264CompositionOffsetRepairOutcome = .healthy
-    private(set) var reason: H264CompositionOffsetRepairReason = .compositionOffsetsPresent
+    private var unrepairedCount = 0
+    private var abandonedSequences = 0
+    private var deepestWait = 0
+    private(set) var reason = "composition_offsets_present"
 
     init?(stream: UnsafeMutablePointer<AVStream>, streamIndex: Int32, presentationLead: Int64) {
         guard presentationLead > 0, let par = stream.pointee.codecpar,
-              (1...16).contains(par.pointee.video_delay),
+              (1...Int32(H264PartialCompositionRepair.maximumReorderDepth)).contains(par.pointee.video_delay),
               let reader = H264PictureOrderReader(codecParameters: par, timeBase: stream.pointee.time_base)
         else { return nil }
         self.reader = reader
         self.streamIndex = streamIndex
+        self.reorderDepth = Int(par.pointee.video_delay)
         lead = presentationLead
-        videoDelay = Int(par.pointee.video_delay)
         timeBase = stream.pointee.time_base
         framing = A53SEIParser.nalFraming(codec: .h264, extradata: par.pointee.extradata, size: Int(par.pointee.extradata_size))
     }
 
     deinit { releasePackets() }
-    var hasDecision: Bool { reason != .compositionOffsetsPresent }
+    var hasDecision: Bool { reason != "composition_offsets_present" }
 
     private func isIDR(_ packet: UnsafeMutablePointer<AVPacket>) -> Bool {
         guard packet.pointee.flags & AV_PKT_FLAG_KEY != 0,
@@ -63,103 +68,149 @@ final class H264PartialCompositionRepairSession {
         return result
     }
 
-    func ingest(_ packet: UnsafeMutablePointer<AVPacket>) throws -> Bool {
-        if failed {
-            var owned: UnsafeMutablePointer<AVPacket>? = packet; trackedPacketFree(&owned)
-            throw RepairError.sequenceNoLongerRepairable
-        }
-        if packet.pointee.stream_index != streamIndex {
+    /// Returns true when the packet was taken over and must not be emitted yet.
+    func ingest(_ packet: UnsafeMutablePointer<AVPacket>) -> Bool {
+        guard packet.pointee.stream_index == streamIndex else {
             guard !pending.isEmpty else { return false }
-            append(packet, poc: nil)
-            try checkBounds()
+            append(packet, rank: nil)
+            drain()
+            enforceBounds()
             return true
         }
         let idr = isIDR(packet)
-        if idr, videoCount > 0 {
-            do { try finishSequence(nextDTS: packet.pointee.dts) }
-            catch { var owned: UnsafeMutablePointer<AVPacket>? = packet; trackedPacketFree(&owned); throw error }
-        }
-        // A missing timestamp differs numerically from a valid one but is NOT evidence of
-        // healthy composition offsets. Preserve ownership and use the same refusal policy.
-        if packet.pointee.pts == Int64.min || packet.pointee.dts == Int64.min {
-            append(packet, poc: nil); videoCount += 1
-            try refuse()
-            return true
-        }
-        let offsets = packet.pointee.pts != packet.pointee.dts
-        if offsets {
-            // Genuine composition offsets always win. A mixed/unsupported sequence is emitted
-            // unchanged; do not let its boundary packet overtake packets already held.
+        if idr, inSequence { closeSequence() }
+        // A missing timestamp differs numerically from a valid one but is not evidence of healthy
+        // composition offsets, so it takes the same route as an unsupported picture.
+        let missing = packet.pointee.pts == Int64.min || packet.pointee.dts == Int64.min
+        if !missing, packet.pointee.pts != packet.pointee.dts {
+            // Genuine composition offsets always win, and a boundary packet must not overtake
+            // packets already held behind it.
             publishPending()
+            resetSequence()
             confirmed = false
-            outcome = .healthy; reason = .compositionOffsetsPresent
-            if readyIndex < ready.count { ready.append(packet); return true }
-            return false
+            reason = "composition_offsets_present"
+            return handBack(packet)
         }
-        if pending.isEmpty {
-            guard idr else {
-                if readyIndex < ready.count { ready.append(packet); return true }
-                return false
-            }
+        if !inSequence {
+            guard idr, !missing else { return handBack(packet) }
             reader.reset()
+            inSequence = true
         }
+        if abandoned { unrepairedCount += 1; return handBack(packet) }
+        guard !missing, ladder.append(dts: packet.pointee.dts) else { return failOpen(with: packet) }
         let poc = reader.pictureOrderCount(for: packet)
-        let invalid = packet.pointee.dts == Int64.min || poc == nil || !reader.isFramePicture
-            || (videoCount == 0 && poc != 0)
-            || (packet.pointee.flags & AV_PKT_FLAG_KEY != 0 && (!idr || poc != 0))
-        append(packet, poc: poc)
-        videoCount += 1
-        if invalid { try refuse(); return true }
-        try checkBounds()
+        // Complete, closed, progressive sequences only. Fields, open-GOP leading pictures and a
+        // parser that cannot read an order are not guessed at.
+        guard let poc, reader.isFramePicture, poc >= 0, poc % 2 == 0,
+              decodeIndex > 0 || poc == 0,
+              packet.pointee.flags & AV_PKT_FLAG_KEY == 0 || (idr && poc == 0)
+        else { return failOpen(with: packet) }
+        let rank = Int(poc / 2)
+        if rank != decodeIndex { sequenceReordered = true }
+        append(packet, rank: rank)
+        decodeIndex += 1
+        drain()
+        enforceBounds()
         return true
     }
 
-    private func append(_ packet: UnsafeMutablePointer<AVPacket>, poc: Int64?) {
-        pending.append(Entry(packet: packet, poc: poc))
+    /// The sequence has to show its reordering before a single picture is rewritten: a zero-offset
+    /// run that never reorders is not evidence that the offsets were lost.
+    private func drain() {
+        guard confirmed || sequenceReordered else { return }
+        while let first = pending.first {
+            guard let rank = first.rank else { promoteFirst(); continue }
+            switch ladder.claim(rank: rank, decodeIndex: first.decodeIndex, lead: lead, reorderDepth: reorderDepth) {
+            case .wait:
+                deepestWait = max(deepestWait, pending.count)
+                return
+            case .refuse:
+                failOpen()
+                return
+            case .time(let pts):
+                first.packet.pointee.pts = pts
+                repairedCount += 1
+                if !confirmed {
+                    confirmed = true
+                    reason = "confirmed_partial_composition_offsets"
+                    EngineLog.emit(
+                        "[Demuxer] partial H264 composition offsets confirmed: reorder_depth=\(reorderDepth)"
+                        + " presentation_lead=\(lead) decode_offset=0 time_base=\(timeBase.num)/\(timeBase.den)",
+                        category: .demux
+                    )
+                }
+                promoteFirst()
+            }
+        }
+    }
+
+    private func append(_ packet: UnsafeMutablePointer<AVPacket>, rank: Int?) {
+        pending.append(Entry(packet: packet, rank: rank, decodeIndex: decodeIndex))
         bytes += Int(max(0, packet.pointee.size))
     }
 
-    private func checkBounds() throws {
-        if bytes >= 32 << 20 || pending.count >= 1024 || videoCount > 512 { try refuse() }
+    private func promoteFirst() {
+        let entry = pending.removeFirst()
+        bytes -= Int(max(0, entry.packet.pointee.size))
+        ready.append(entry.packet)
     }
 
-    private func finishSequence(nextDTS: Int64) throws {
-        let video = pending.filter { $0.packet.pointee.stream_index == streamIndex }
-        let pictures = video.map { H264PartialCompositionRepair.Picture(dts: $0.packet.pointee.dts, poc: $0.poc ?? -1) }
-        guard let corrected = H264PartialCompositionRepair.presentationTimes(
-            pictures, nextDTS: nextDTS, presentationLead: lead, previouslyConfirmed: confirmed
-        ) else { try refuse(); return }
-        if !confirmed {
-            sampleCount = video.count; heldCount = pending.count; heldBytes = bytes
-            regressions = zip(pictures, pictures.dropFirst()).filter { $1.poc < $0.poc }.count
-            firstDTS = pictures.first?.dts
-            let steps = zip(pictures, pictures.dropFirst()).map { $1.dts - $0.dts }
-            minStep = steps.min(); maxStep = steps.max()
-            EngineLog.emit("[Demuxer] partial H264 composition offsets confirmed: pictures=\(sampleCount) poc_regressions=\(regressions) presentation_lead=\(lead) decode_offset=0 time_base=\(timeBase.num)/\(timeBase.den)", category: .demux)
+    /// Interleaving depth, not reordering, is what can still make the wait large. Exceeding it
+    /// costs the repair, never the packets.
+    private func enforceBounds() {
+        if pending.count >= H264PartialCompositionRepair.maximumHeldPackets
+            || bytes >= H264PartialCompositionRepair.maximumHeldBytes
+            || (!confirmed && !sequenceReordered && decodeIndex > H264PartialCompositionRepair.maximumProofPictures) {
+            failOpen()
         }
-        // The policy validates the ENTIRE sequence before mutating any packet. Packet payload,
-        // DTS, duration, flags, side data, and every non-video stream remain bit-for-bit intact.
-        for (entry, pts) in zip(video, corrected) { entry.packet.pointee.pts = pts }
-        repairedCount += video.count
-        confirmed = true
-        outcome = .repairing; reason = .confirmedPartialCompositionOffsets
-        publishPending()
     }
 
-    private func refuse() throws {
-        outcome = .inconclusive; reason = .partialCompositionSequenceUnproven
-        if confirmed {
-            failed = true
-            releasePackets()
-            throw RepairError.sequenceNoLongerRepairable
+    /// Hands every held packet back untouched and lets the rest of this sequence stream through.
+    /// The next IDR starts a new candidate; nothing about the session is given up.
+    @discardableResult
+    private func failOpen(with packet: UnsafeMutablePointer<AVPacket>? = nil) -> Bool {
+        unrepairedCount += pending.filter { $0.packet.pointee.stream_index == streamIndex }.count
+        if let packet, packet.pointee.stream_index == streamIndex { unrepairedCount += 1 }
+        if !abandoned, inSequence {
+            abandoned = true
+            abandonedSequences += 1
+            if reason == "confirmed_partial_composition_offsets" {
+                reason = "partial_composition_sequence_unproven_after_repair"
+            } else {
+                reason = "partial_composition_sequence_unproven"
+            }
         }
         publishPending()
+        guard let packet else { return true }
+        return handBack(packet)
+    }
+
+    /// A packet this session does not own. It still cannot overtake packets already held.
+    private func handBack(_ packet: UnsafeMutablePointer<AVPacket>) -> Bool {
+        guard readyIndex < ready.count else { return false }
+        ready.append(packet)
+        return true
+    }
+
+    private func closeSequence() {
+        drain()
+        // Anything still waiting is waiting for a slot this sequence never carried.
+        if !pending.isEmpty { failOpen() }
+        resetSequence()
+    }
+
+    private func resetSequence() {
+        ladder = H264PartialCompositionRepair.SlotLadder()
+        decodeIndex = 0
+        inSequence = false
+        sequenceReordered = false
+        abandoned = false
     }
 
     private func publishPending() {
         ready.append(contentsOf: pending.map(\.packet))
         pending.removeAll(keepingCapacity: true)
-        bytes = 0; videoCount = 0
+        bytes = 0
     }
 
     func dequeue() -> UnsafeMutablePointer<AVPacket>? {
@@ -169,42 +220,46 @@ final class H264PartialCompositionRepairSession {
         return packet
     }
 
-    func endOfStream() throws {
-        if failed { throw RepairError.sequenceNoLongerRepairable }
-        guard !pending.isEmpty else { return }
-        guard let last = pending.last(where: { $0.packet.pointee.stream_index == streamIndex }) else {
-            publishPending(); return
-        }
-        let (end, overflow) = last.packet.pointee.dts.addingReportingOverflow(max(1, last.packet.pointee.duration))
-        guard !overflow else { try refuse(); return }
-        try finishSequence(nextDTS: end)
+    func endOfStream() {
+        guard inSequence else { publishPending(); return }
+        closeSequence()
     }
 
     func noteSeek() {
-        releasePackets(); reader.reset()
-        confirmed = false; failed = false
-        outcome = .healthy; reason = .compositionOffsetsPresent
+        releasePackets()
+        reader.reset()
+        resetSequence()
+        confirmed = false
+        reason = "composition_offsets_present"
     }
 
     private func releasePackets() {
         for entry in pending { var owned: UnsafeMutablePointer<AVPacket>? = entry.packet; trackedPacketFree(&owned) }
         for packet in ready.dropFirst(readyIndex) { var owned: UnsafeMutablePointer<AVPacket>? = packet; trackedPacketFree(&owned) }
         pending.removeAll(keepingCapacity: true); ready.removeAll(keepingCapacity: true)
-        readyIndex = 0; bytes = 0; videoCount = 0
+        readyIndex = 0; bytes = 0
     }
 
-    func diagnostic(sourceSeekable: Bool, isISOBaseMediaFile: Bool, isH264: Bool) -> H264CompositionOffsetRepairDiagnostic {
-        H264CompositionOffsetRepairDiagnostic(
-            outcome: outcome, reason: reason, sourceSeekable: sourceSeekable,
-            isISOBaseMediaFile: isISOBaseMediaFile, isH264: isH264, videoDelay: videoDelay,
-            sampleCount: sampleCount, heldPacketCount: heldCount, heldBytes: heldBytes,
-            ptsEqualsDTSCount: sampleCount, firstKeyframe: sampleCount > 0 ? true : nil,
-            firstPictureOrderCount: sampleCount > 0 ? 0 : nil,
-            minimumDecodeStep: minStep, maximumDecodeStep: maxStep,
+    var summary: String {
+        "reason=\(reason) repaired=\(repairedCount) abandoned_sequences=\(abandonedSequences)"
+            + " deepest_wait=\(deepestWait) reorder_depth=\(reorderDepth)"
+            + " presentation_lead=\(lead) decode_offset=0"
+    }
+
+    /// Preserve the host's structured diagnostics while using upstream's streaming slot ladder.
+    func diagnostic(sourceSeekable: Bool, isISOBaseMediaFile: Bool, isH264: Bool)
+        -> H264CompositionOffsetRepairDiagnostic {
+        let repairing = reason == "confirmed_partial_composition_offsets"
+        let healthy = reason == "composition_offsets_present"
+        return H264CompositionOffsetRepairDiagnostic(
+            outcome: repairing ? .repairing : (healthy ? .healthy : .inconclusive),
+            reason: repairing ? .confirmedPartialCompositionOffsets
+                : (healthy ? .compositionOffsetsPresent : .partialCompositionSequenceUnproven),
+            sourceSeekable: sourceSeekable, isISOBaseMediaFile: isISOBaseMediaFile,
+            isH264: isH264, videoDelay: reorderDepth, sampleCount: decodeIndex,
+            heldPacketCount: pending.count + ready.count - readyIndex, heldBytes: bytes,
             streamTimeBaseNumerator: timeBase.num, streamTimeBaseDenominator: timeBase.den,
-            firstDecodeTimestamp: firstDTS, pictureOrderRegressionCount: regressions,
-            planDecodeLead: lead, planShift: lead, planPictureOrderStep: 2,
-            repairedPictures: repairedCount
-        )
+            planDecodeLead: 0, planShift: lead,
+            repairedPictures: repairedCount, unrepairedPictures: unrepairedCount)
     }
 }
