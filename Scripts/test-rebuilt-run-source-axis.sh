@@ -4,6 +4,6 @@ TASK_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TASK_TMP=$(mktemp -d "${TMPDIR:-/tmp}/aether-source-axis.XXXXXX")
 trap 'rm -f "$TASK_TMP/check"; rmdir "$TASK_TMP"' EXIT
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swiftc -swift-version 6 \
-  "$TASK_ROOT/Sources/AetherEngine/Video/RebuiltRunSourceAxis.swift" \
+  "$TASK_ROOT/Sources/AetherEngine/Video/EpochAxisTable.swift" \
   "$TASK_ROOT/Scripts/tests/RebuiltRunSourceAxisStandalone.swift" -o "$TASK_TMP/check"
 "$TASK_TMP/check"

@@ -55,6 +55,37 @@ the public-API contract.
 - Adopted FFmpegBuild 3.0.0 namespaced frameworks and LibDovi 2.1.0.
 
 
+## [6.85.0] - 2026-09-14
+
+### Fixed
+
+- **The VOD axis composes what AVPlayer's timeline is displaced by, not the whole shift (PR #533
+  follow-up).** Every AE#418 rule is about one of the two quantities in the axis: how far AVPlayer
+  put a placed segment from its playlist position. The other one is the source-to-item
+  normalization the bytes carry, and adding both per placement added the source origin again each
+  time. Measured on the same 600 s twin: a second placement worth 596.833 s composed onto a
+  standing 599.625 s published **1196.458 s** and put the seam at item -531.625 s, so for as long
+  as that composition stood the session mapped every cue and every position a whole source origin
+  away; a placement that cannot be read back keeps it for the rest of the session (AE#418 round 7).
+  The composition now adds the gate's backoff and the normalization is added once, by the epoch
+  that wrote the bytes: the same chain publishes 590.625 s and the reading that follows lands on
+  591.000 s, which is what the picture reads. On a source whose timestamps start at zero the two
+  quantities are one number and nothing moves: the AE#418 chain still composes -9.000 s then
+  -18.000 s, and the fixture arms are unchanged run for run.
+
+- **A source whose timestamps do not start at zero keeps its axis across a rebuilt VOD landing
+  (PR #533, thanks to @orut34iop).** The AE#481 landing rule reads the axis off the run holding a
+  seek landing, and where that run opens at the segment's own playlist position it published what
+  the segment is worth to a PLACEMENT, which inside a run is nothing. Those bytes still carry the
+  source-to-item normalization the producer folded into them, so on a source whose timestamps
+  begin at 600 s the session went on to map item time onto itself: bitmap subtitles were queried
+  600 s away from the picture, and the reported position went negative. Measured on
+  `tc-cues-lie.mkv` remuxed with `-output_ts_offset 600` over a 600 kbps / 300 ms origin, the
+  landing published `0.000s` where the run carries `600.000s`, the host clock read `-515.10s`, and
+  `capErr` jumped from -600.000 to +0.017 in one tick; afterwards every tick sits within one frame
+  of the truth. A source that starts at zero is unchanged, byte for byte, because there the two
+  quantities are the same number, which is what hid this through nine rounds of measurement.
+
 ## [6.84.0] - 2026-09-12
 
 ### Changed
