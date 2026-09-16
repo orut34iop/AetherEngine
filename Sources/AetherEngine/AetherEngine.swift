@@ -493,7 +493,8 @@ public final class AetherEngine: ObservableObject {
     /// The release runs just after the teardown rather than inside it. `setActive(false)` is an XPC round
     /// trip that takes roughly half a second on an Atmos MAT passthrough route, which inline would be half
     /// a second of frozen UI before the host's dismiss can start. A `load()` that follows cancels a release
-    /// that has not run yet, so a stop/load pair never loses its session.
+    /// that has not run yet, so a stop/load pair never loses its session, and a stop that lands while a
+    /// software or audio-only load is still activating releases the session after that activation (AE#538).
     public var deactivatesAudioSessionOnStop: Bool = false
 
     @Published public internal(set) var duration: Double = 0
@@ -1400,24 +1401,67 @@ public final class AetherEngine: ObservableObject {
 
     // MARK: - View binding
 
-    /// Weak: dropping the view reference must not leak the surface through the engine singleton.
-    private weak var boundView: AetherPlayerView?
+    /// Every surface bound and not yet unbound, in bind order. Weak: dropping the view reference must
+    /// not leak the surface through the engine singleton, and a released view drops out on its own.
+    ///
+    /// One reference was not enough (AE#536). A host that remounts its surface by identity while
+    /// keeping the engine gets the incoming view made and bound first, and SwiftUI then still updates
+    /// the OUTGOING view on its way out, which rebinds to it (the #188 rebind), before dismantling it.
+    /// With a single weak reference the engine ended up bound to a view that was about to go, then to
+    /// nothing, and the next session's fresh layer attached nowhere: audio over a black picture. The
+    /// list keeps the incoming view as the fallback that takes over when the outgoing one leaves.
+    private var boundSurfaces: [BoundSurface] = []
+
+    private struct BoundSurface {
+        weak var view: AetherPlayerView?
+    }
+
+    /// The surface the layer is presented on: the most recently bound one that is still alive.
+    private var boundView: AetherPlayerView? {
+        boundSurfaces.last { $0.view != nil }?.view
+    }
 
     /// Bind a render surface. Attaches the active layer immediately; re-attaches on session swaps.
-    /// Binding a different view detaches the old one.
+    /// Binding a different view detaches the old one, which stays the fallback until it is unbound or
+    /// released. A view another engine held is taken over from that engine.
     public func bind(view: AetherPlayerView) {
+        if let previousEngine = view.bindingEngine, previousEngine !== self {
+            previousEngine.surfaceWasTakenOver(view)
+        }
+        view.bindingEngine = self
         if let existing = boundView, existing !== view {
             existing.detach()
         }
-        boundView = view
+        boundSurfaces.removeAll { $0.view == nil || $0.view === view }
+        boundSurfaces.append(BoundSurface(view: view))
         presentCurrentLayer()
     }
 
-    /// Unbind a view. Idempotent.
+    /// Unbind a view. Idempotent. Unbinding the surface the layer is on detaches it and presents the
+    /// layer on the most recently bound surface that is still alive, if any.
     public func unbind(view: AetherPlayerView) {
-        guard boundView === view else { return }
+        guard boundSurfaces.contains(where: { $0.view === view }) else { return }
+        let wasPresenting = boundView === view
+        boundSurfaces.removeAll { $0.view == nil || $0.view === view }
+        if view.bindingEngine === self {
+            view.bindingEngine = nil
+        }
+        guard wasPresenting else { return }
         view.detach()
-        boundView = nil
+        presentCurrentLayer()
+    }
+
+    /// Another engine bound `view` (#188's engine swap on a reused view). It is no longer ours to
+    /// present on or to fall back to. Detached before our layer moves to a remaining surface: the view
+    /// would otherwise still record the layer as its own, and the new engine's attach would pull it
+    /// back out of the surface it just moved to. Both happen inside the new engine's bind, in one
+    /// run-loop turn, so the view shows no gap.
+    private func surfaceWasTakenOver(_ view: AetherPlayerView) {
+        let wasPresenting = boundView === view
+        boundSurfaces.removeAll { $0.view == nil || $0.view === view }
+        guard wasPresenting else { return }
+        view.detach()
+        presentCurrentLayer()
     }
 
     /// Attaches nativeHost.playerLayer or softwareHost.displayLayer to the bound view. No-op when no host.
@@ -1497,6 +1541,13 @@ public final class AetherEngine: ObservableObject {
     /// #65: thread-safe mirror of AVPlayer's rendered (playlist-axis) position, updated on the main actor by
     /// the $renderedTime sink. Read off-main by the producer when it re-anchors on a backpressure wedge.
     let renderedPositionMirror = AtomicDouble(0)
+
+    /// AE#520 round 2: thread-safe mirror of how long the consumer can keep playing out of what it
+    /// already holds (the loaded range the playhead is inside), written by `LiveTelemetrySampler` at
+    /// 1 Hz off the main actor. Read on the playlist-build thread by the outage close, which spends a
+    /// depth and until this existed could only see the half of it the consumer had not fetched yet.
+    /// nil while there is no native item to read one off (software path, between item swaps).
+    let consumerContiguousBufferMirror = AtomicOptionalDouble(nil)
 
     /// #65: thread-safe mirror of AVPlayer's play intent (`timeControlStatus != .paused`), updated on the main
     /// actor by the $timeControlStatus sink. Read off-main by the producer to suspend its backpressure wedge
@@ -1594,6 +1645,9 @@ public final class AetherEngine: ObservableObject {
     /// still say whether the viewer was parked in the DVR window or sitting at the edge.
     var liveBehindWhenLastAdvancing: Double = 0
     var lastPublishedLivePlayhead: Double? = nil
+    /// Sodalite#104 round 2: playhead at the last cadence sample, which rate-limits the samples to one
+    /// every half second of media. See `LiveWindow.trackingCadenceSeconds`.
+    var lastLiveCadenceSamplePlayhead: Double? = nil
     /// AE#524: when the live runway was last checked, so the check stays at 1 Hz whatever rate the
     /// clock publishes at, and whether it has already been reported as thin (one line per episode,
     /// not one per second).
@@ -3162,6 +3216,27 @@ public final class AetherEngine: ObservableObject {
     /// Pending off-main deactivation (#215). See `scheduleAudioSessionDeactivation()`.
     private var audioSessionDeactivationTask: Task<Void, Never>?
     #endif
+
+    /// The most recent off-main activation or release of the shared session. See `enqueueAudioSessionTransition`.
+    private var audioSessionTransition: Task<Void, Never>?
+
+    /// Run a session activation or release off the main actor, after every one asked for before it.
+    ///
+    /// Since AE#538 both halves are detached tasks, and two detached tasks carry no order between them.
+    /// While the renderer activation still ran synchronously on the main actor a `stop()` could not land
+    /// inside it, so the #215 release always followed it; without the queue a stop during a software or
+    /// audio-only load's activation can send `setActive(false)` first and leave the session active after a
+    /// final teardown. Each transition awaits its predecessor, including a cancelled one, which then drops
+    /// on its own guard. Not platform-gated, so the order is testable where the session does not exist.
+    func enqueueAudioSessionTransition(_ body: @escaping @Sendable () async -> Void) -> Task<Void, Never> {
+        let previous = audioSessionTransition
+        let transition = Task.detached(priority: .userInitiated) {
+            await previous?.value
+            await body()
+        }
+        audioSessionTransition = transition
+        return transition
+    }
 
     #if os(iOS) || os(tvOS)
     /// Route-sharing policy the engine declares with the session category. Platform-split (#116):
@@ -4798,9 +4873,22 @@ public final class AetherEngine: ObservableObject {
                                      itemAxisOffset: liveItemAxisOffsetSeconds)
               }
             : nil
-        let target: Double = isLive
+        var target: Double = isLive
             ? (liveLanding?.sessionTarget ?? seconds)
             : max(0, min(seconds, duration))
+        if isLive, softwareHost != nil, nativeHost == nil, let window = liveWindow {
+            let landing = Self.softwareLiveLanding(requested: target, window: window)
+            if landing < target {
+                EngineLog.emit(
+                    "[AetherEngine] #104 SW live landing held \(String(format: "%.2f", target - landing))s "
+                    + "back: requested=\(String(format: "%.2f", target))s "
+                    + "landing=\(String(format: "%.2f", landing))s "
+                    + "edge=\(String(format: "%.2f", window.edgeTime))s, "
+                    + "so the ring holds the rebuffer lead instead of the clock waiting for it",
+                    category: .engine)
+            }
+            target = landing
+        }
         // AE#446 round 4: a rejoin on a session that advertises no rewind is the one landing measured
         // against something other than what `seekableLiveRange` states, so it says so. Whether the
         // place survived is the whole question the reader of this line has, so the line answers it.
@@ -4851,7 +4939,14 @@ public final class AetherEngine: ObservableObject {
                 guard loadGeneration == loadGen, seekGeneration == seekGen else { return }
                 clock.currentTime = target
                 clock.sourceTime = target
-                state = .playing
+                // Sodalite#104 round 2: the transport this publishes is the HOST's, the same way the
+                // VOD landing below reads it off the host it just drove (#122, #292). The live branch
+                // returns early and never got that rule, so a rewind issued while paused published
+                // `.playing` over a host that `seekLiveDVR` had just anchored at rate 0: measured on
+                // the harness, five ticks of `state=playing` over a clock that did not move, and the
+                // next press then spent on a pause the host had already applied ("press Play, nothing;
+                // press it again, it plays").
+                state = (softwareHost?.isPlaying ?? true) ? .playing : .paused
                 setProgrammaticSeek(inFlight: false, target: nil)
                 closeSeekTicket(&programmaticSeekTicket, with: .landed(renderedTime: target))
                 return
@@ -4899,7 +4994,21 @@ public final class AetherEngine: ObservableObject {
         // -11.000 all survive one). The target above is deliberately computed on the axis AVPlayer
         // still had when the seek was issued; from the landing forward the clock describes the axis
         // it will have instead.
-        nativeVideoSession?.snapAxisAfterSeek(landingItemSeconds: clockTarget)
+        // AE#534: whether AVPlayer already HOLDS the landing, which is what decides if this seek
+        // rebuilds its timeline and therefore whether it throws the axis away at all. Measured at
+        // exactly this point before it went in: 0.10 ms median and 0.70 ms worst of 215 seeks, on an
+        // idle and on a loaded box, including seeks issued on top of unsettled ones. That is the size
+        // of `prepareSeekLanding` below, an off-main hop this path already takes unconditionally, so
+        // this adds a second hop of a size already accepted here rather than a first one.
+        //
+        // An item that answers nothing reads as not placed, which is the behaviour this rule had
+        // before, so a failed read costs the axis and never the session.
+        let landingIsPlaced = nativeVideoSession != nil && nativeHost != nil
+            ? await avPlayerLoadedRanges().contains { clockTarget >= $0.0 && clockTarget <= $0.1 }
+            : false
+        guard loadGeneration == loadGen, seekGeneration == seekGen else { return }
+        nativeVideoSession?.snapAxisAfterSeek(
+            landingItemSeconds: clockTarget, landingIsPlaced: landingIsPlaced)
         // AE#481: and what the landing's run carries is a READING, not the composition it inherits. A
         // seek that opens a new run at a segment written on its planned position lands on a source-true
         // stretch, which nothing else in the session ever looks at: measured on the #418 chain with the
@@ -6285,9 +6394,10 @@ public final class AetherEngine: ObservableObject {
     /// `loadGeneration` was bumped by the `stopInternal` that scheduled this, so any `load()` starting in
     /// the meantime bumps it again and the pending deactivation drops rather than releasing the session
     /// out from under the new item. `stopInternal` also cancels a pending task before scheduling a new one.
+    /// The release queues behind a renderer activation still in flight (AE#538), see `enqueueAudioSessionTransition`.
     private func scheduleAudioSessionDeactivation() {
         let generation = loadGeneration
-        audioSessionDeactivationTask = Task.detached(priority: .userInitiated) { [weak self] in
+        audioSessionDeactivationTask = enqueueAudioSessionTransition { [weak self] in
             guard let self else { return }
             guard !Task.isCancelled, await self.loadGeneration == generation else { return }
             AetherEngine.deactivateSharedAudioSession()
@@ -6551,6 +6661,7 @@ public final class AetherEngine: ObservableObject {
         liveWindow = nil
         liveBehindWhenLastAdvancing = 0
         lastPublishedLivePlayhead = nil
+        lastLiveCadenceSamplePlayhead = nil
         clock.liveEdgeTime = 0
         clock.seekableLiveRange = nil
         clock.isAtLiveEdge = false

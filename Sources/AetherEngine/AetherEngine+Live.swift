@@ -441,6 +441,15 @@ extension AetherEngine {
         // Sodalite#104 round 4: the cadence the playlist declares, which outranks how the source
         // happened to deliver. nil on the paths that serve no playlist of ours.
         w.noteTargetDuration(liveTargetDurationSeconds)
+        // Sodalite#104 round 2: does this tick describe a session keeping up by playback alone? Only
+        // such a tick's distance says what THIS source costs a client at the edge, and the samples are
+        // rate-limited so twelve of them span a stretch of media rather than a stretch of ticks (the
+        // publish rate follows `$currentTime`, not the wall clock).
+        let advance = lastPublishedLivePlayhead.map { currentTime - $0 } ?? 0
+        let sampleDue = lastLiveCadenceSamplePlayhead.map { currentTime - $0 >= 0.5 } ?? true
+        let tracking = state == .playing && !isSeeking && advance > 0 && advance < 1.5 && sampleDue
+        if tracking { lastLiveCadenceSamplePlayhead = currentTime }
+        w.settleEdgeVerdict(tracking: tracking)
         auditLiveRejoinPlacement()
         liveWindow = w
         // AE#442: tick-to-tick advancement, not a running maximum: a backward DVR seek drops the
@@ -461,7 +470,9 @@ extension AetherEngine {
                 + "edge=\(String(format: "%.2f", w.edgeTime))s "
                 + "lastEdgeStep=\(String(format: "%.2f", w.lastEdgeStepSeconds))s "
                 + "targetDuration=\(w.targetDurationSeconds.map { String(format: "%.2f", $0) + "s" } ?? "none") "
-                + "tolerance=\(String(format: "%.2f", w.edgeToleranceSeconds))s",
+                + "trackingCadence=\(w.trackingCadenceSeconds.map { String(format: "%.2f", $0) + "s" } ?? "none") "
+                + "tolerance=\(String(format: "%.2f", w.edgeToleranceSeconds))s "
+                + "exitAbove=\(String(format: "%.2f", w.edgeToleranceSeconds + LiveWindow.edgeExitSlack))s",
                 category: .session
             )
         }
@@ -591,6 +602,23 @@ extension AetherEngine {
         return (sessionTarget, clockTarget)
     }
 
+    /// Sodalite#104 round 3: where a software live seek lands, given where it was asked to land.
+    ///
+    /// The software path plays out of a ring the reader fills at the rate the source delivers, so a
+    /// landing AT the frontier has nothing ahead of it: the pump finds the ring dry, the clock parks,
+    /// and it resumes once `rebufferResumeLeadSeconds` of audio stands ahead of it. On a real-time
+    /// source that lead arrives exactly as slowly as it is deep, and the frontier moves on by the same
+    /// amount meanwhile, so the session resumes that far behind the frontier after a frozen picture
+    /// of the same length. Measured from a device on a tuner: `lead=0.13s` to `lead=2.05s` in 1.92 s
+    /// on every Return to Live, while a rewind into content the ring already held reached its first
+    /// frame in 223 to 258 ms.
+    ///
+    /// Landing the lead behind the frontier reaches the same place with the same cushion and spends
+    /// nothing on the way. A target the ring already holds that lead for is untouched.
+    nonisolated static func softwareLiveLanding(requested: Double, window: LiveWindow) -> Double {
+        window.clamp(Swift.min(requested, window.edgeTime - AudioLookaheadPolicy.rebufferResumeLeadSeconds))
+    }
+
     /// AE#454: how close the fresh item has to be to the place it was asked for before the correcting
     /// seek is not worth its cost.
     ///
@@ -638,20 +666,30 @@ extension AetherEngine {
 
     /// Seek to the current live edge. No-op when not live.
     public func seekToLiveEdge() async {
-        guard isLive, let w = liveWindow else { return }
+        // Sodalite#104 round 3: both early exits discard a press the viewer made, so both say so, the
+        // same way `seek(to:)` logs its refusals. Silence here reads exactly like a press that never
+        // arrived.
+        guard isLive, let w = liveWindow else {
+            EngineLog.emit("[AetherEngine] seekToLiveEdge() ignored: no live session (state=\(state), live=\(isLive))",
+                           category: .engine)
+            return
+        }
         // Live-only (no DVR window): seek(to:) refuses; drive native host directly to seekableEnd as the recovery move after eviction.
         guard w.windowSeconds != nil else {
-            if let host = nativeHost {
-                let clockTarget = max(0, host.seekableEnd)
-                EngineLog.emit(
-                    "[AetherEngine] live-only edge snap: clockTarget=\(String(format: "%.1f", clockTarget))",
-                    category: .engine
-                )
-                await host.seek(to: clockTarget)
-                nativeClockSeconds = clockTarget
-                clock.currentTime = clockTarget + playlistShiftSeconds
-                clock.sourceTime = currentTime
+            guard let host = nativeHost else {
+                EngineLog.emit("[AetherEngine] seekToLiveEdge() ignored: live-only session with no native item to snap",
+                               category: .engine)
+                return
             }
+            let clockTarget = max(0, host.seekableEnd)
+            EngineLog.emit(
+                "[AetherEngine] live-only edge snap: clockTarget=\(String(format: "%.1f", clockTarget))",
+                category: .engine
+            )
+            await host.seek(to: clockTarget)
+            nativeClockSeconds = clockTarget
+            clock.currentTime = clockTarget + playlistShiftSeconds
+            clock.sourceTime = currentTime
             return
         }
         await seek(to: w.edgeTime)

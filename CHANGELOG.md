@@ -55,6 +55,162 @@ the public-API contract.
 - Adopted FFmpegBuild 3.0.0 namespaced frameworks and LibDovi 2.1.0.
 
 
+## [6.89.1] - 2026-09-15
+
+### Fixed
+
+- **A surface remounted by identity keeps the engine's picture (AE#536).** The engine held one weak
+  reference to its bound view. A host that keys `AetherPlayerSurface` with `.id(...)` and keeps the
+  engine across the swap (a next-episode flow) gets the incoming view made and bound first, and SwiftUI
+  then still updates the outgoing view on its way out, which rebinds to it through #188's rebind, before
+  dismantling it. The engine was left bound to nothing, and the next `load()` built a layer that
+  reported `isReadyForDisplay` with no superlayer and a zero frame: audio over a black picture,
+  measured on an iPhone 16e, iOS 26.7. The engine now keeps every bound surface weakly in bind order
+  and presents on the most recently bound one still alive, so when the presenting view is unbound or
+  released the layer moves to the next one. `AetherPlayerSurface` unbinds synchronously on dismantle
+  instead of detaching in a `Task`, and a view taken over by another engine drops out of the previous
+  engine's fallbacks. An `AetherPlayerView` now removes a previously hosted layer only while that
+  layer still sits in it, so a layer an engine has moved to another surface is not pulled back out.
+  No public API changed.
+- **The renderer paths activate the audio session off the main actor (AE#538).**
+  `activateRendererAudioSession()`, which the software and audio-only loads call because AVKit is not
+  there to do it, ran `setActive(true)` and the channel preference synchronously on the main actor, and
+  iOS/tvOS 27 flag that as a hang risk ("This method can lead to UI unresponsiveness if called on the
+  main thread"). Both now run in a detached `userInitiated` task, the pattern #114 and #215 already use
+  for the category declaration and the teardown release, and the load awaits it, so the session is still
+  active before the host is built. A load superseded during that wait unwinds before it builds anything.
+  The activation and the #215 teardown release now share one queue: while the activation ran on the
+  main actor a `stop()` could not land inside it, and as two independent detached tasks a stop during
+  a renderer load's activation could release the session first and leave it active after a final
+  teardown.
+
+## [6.89.0] - 2026-09-15
+
+### Fixed
+
+- **Return to Live on the software path no longer freezes the picture for two seconds (Sodalite#104
+  round 3).** A live seek there landed exactly at the reader's frontier, where the ring holds nothing
+  ahead of the playhead, so the pump parked the clock on the spot and resumed once
+  `rebufferResumeLeadSeconds` (2.0 s) of audio stood ahead of it. On a real-time source that lead
+  takes as long to arrive as it is deep: measured from a tuner, `lead=0.13s` to `lead=2.05s` in
+  1.92 s on every return, against 223 to 258 ms for a rewind into content the ring already held. A
+  landing nearer the frontier than that lead is now held back by it, which reaches the same distance
+  behind live with the same cushion and without the wait. Measured on the harness across three arm
+  pairs at two origin leads: 3 of 3 underrun-and-rebuffer cycles before, 0 of 3 after, the distance
+  held after the return unchanged (1.35 to 2.54 s before, 1.24 to 2.65 s after), and the edge verdict
+  AT EDGE from the first publish in every arm. A held-back landing says so in the log.
+- **`seekToLiveEdge()` says when it ignores a press (Sodalite#104 round 3).** Both early exits, no
+  live session and a live-only session with no native item to snap, returned without a word while
+  every refusal in `seek(to:)` logs one, so a device capture could not tell them from a press that
+  never reached the engine.
+
+## [6.88.0] - 2026-09-15
+
+### Fixed
+
+- **A live outage close spends what the consumer can still play, not only what it has yet to fetch
+  (AE#520 round 2).** The runway it measured is the content the window LISTS above the consumer's
+  fetch point, which leaves out everything the consumer has already fetched and still holds. For a
+  viewer at the live edge that half is most of what they have: measured on the harness at
+  TARGETDURATION 6, the window closed on 4.0 s listed while AVPlayer held another 4.9 s, and the
+  source delivered again 1.84 s later. Deferring costs nothing in the seam it was avoiding, because
+  the swap lands when the consumer reaches the end of the closed window and not when the ENDLIST is
+  served (closed at +70.51, swapped at +89.5 with 0.79 s of buffer left). The depth is read off a
+  mirror the telemetry sampler writes at 1 Hz rather than off an AVFoundation call on a
+  playlist-build thread, and a session with nothing to report one, the software path or the gap
+  between two items, reads exactly as it did before. The gate that decides whether there is anything
+  to serve as a finished asset asks the same depth now: it used to ask whether SEGMENTS were listed,
+  so a consumer playing out of its own buffer could not be closed on at all, walked down to 0.1 s
+  with the window open, and rejoined forward with 4 segments skipped. Harness, same command line per
+  pair: an edge viewer's 12 s gap goes from an item swap to `gap absorbed`, its 30 s outage still
+  holds its position (closing at 16.07 s of silence on 6.0 s of depth, none of it listed), and
+  AE#520's own control, AE#523 round 2's arm and a 30 s outage at depth are all unchanged.
+
+### Added
+
+- `aetherctl live` prints `item=` (the item's own playhead) and `buf=` (how long the consumer can
+  keep playing out of what it holds) per tick. The freeze leg could only report the published
+  session clock, which is item time plus a shift, so the depth an outage decision spends was not
+  observable at all.
+
+## [6.87.0] - 2026-09-15
+
+### Fixed
+
+- **A live outage closes the window when the CONTENT runs out, not when a clock that shares its
+  axis does (AE#523 round 2).** The close was bounded twice, by a deadline on the silence and by
+  the runway ahead of the consumer, and the two were never on different axes: while the source is
+  quiet the consumer keeps walking the window, so `runway + silence` is fixed and
+  `runway <= deadline - silence` is decided the first time it is asked and never changes its answer
+  afterwards. A consumer holding more than a deadline's worth of content was therefore never closed
+  on by the runway at all, and the clock took the irreversible decision with every second of that
+  content still in hand. Measured on the harness at TARGETDURATION 6, a viewer 30 s inside the
+  window against a 22 s freeze: late at 10.07 s of silence with 24.0 s of runway, closed at 20.10 s
+  with the same 24.0 s, item swapped, source delivering again 2 s later. Reported from the field on
+  6.84.0 as 5 closes in 40 delivery gaps of a 45 minute session, each with 5.8 to 8.5 s of runway
+  in hand. The wait now ends one poll before the content does (one TARGETDURATION, against a
+  measured poll interval of `0.81 x TD` with the blocking-reload advert withdrawn), which is the
+  last moment an ENDLIST still reaches a consumer with something to play out; the clock keeps only
+  the bound it owns alone, the 35 s at which the producer gives up a source that cuts nothing, less
+  a patience so the close is served before that exit fires. Harness, same command line per pair:
+  the reported shape goes from an item swap to `gap absorbed`, AE#520's control and an edge viewer
+  are unchanged, and a genuine 30 s outage holds its position at three rewind depths.
+
+- **A seek keeps the axis AVPlayer never rebuilt (AE#534, first half).** The sub-second axis snap
+  asked how BIG the standing axis was. What AVPlayer discards an offset at is a seek that makes it
+  rebuild its timeline, and a seek landing in what it already holds rebuilds nothing, so it keeps
+  the displacement and the rule has to keep it too. The size test fitted the earlier arms only
+  because all of them left the buffer. The placement is now read off `AVPlayerItem.loadedTimeRanges`
+  and off nothing else: the producer's own buffered frontier disagrees with it in both directions on
+  these very arms (95.62 against a placed 84.337, and 75.62 against a placed 80.343), because a
+  fetch is not a placement. Measured on `tc-cues-lie.mkv` over a 600 kbps / 300 ms origin, 3 runs
+  per arm: a held landing goes from `capErr -0.400` to `-0.025`, the unheld control is untouched,
+  and the 600 s offset twin is unchanged. The read costs 0.10 ms median and 0.70 ms worst over 215
+  seeks, and an item that answers nothing reads as not placed, so a failed read costs the axis and
+  never the session. Expressing the test on the displacement rather than on the axis is the second
+  half and is not in this release.
+
+- **The all-clear line says how close the episode came.** A gap that was absorbed now reports the
+  widest silence and the lowest runway it reached against the reserve a close would have needed, so
+  a comfortable session can be told apart from a near miss without another round of captures.
+
+## [6.86.0] - 2026-09-14
+
+### Fixed
+
+- **A software live seek publishes the transport its host actually took (Sodalite#104).** The VOD
+  landing reads the transport off the host it just drove, which is what #122 and #292 put there: a
+  scrub issued while paused lands paused. The live branch returns early, before that reconcile, so
+  it wrote `.playing` over a `seekLiveDVR` that had just anchored the clock at rate 0 and set
+  `pausedByHost`. Measured on the harness (`play --live --sw --dvr-window 60 --host-calls
+  pauseseek`), before: `SEEKLANDED target=0.00 (clock=0.00, state=playing)` followed by five ticks
+  of `state=playing` over a clock that did not move. After: `state=paused`, and the resume moves
+  the clock on the first press. A host draws its play button and its next press from that field, so
+  the field being wrong cost a press: the one after a rewind confirmed while paused went into
+  pausing a host that was already parked.
+
+- **The live-edge verdict holds, and measures what its own source costs (Sodalite#104).** A host
+  draws a LIVE badge and a focusable Return to Live chip from `isAtEdge`, and that flag was a bare
+  threshold on a quantity that sawtooths by construction. On a read frontier both halves of the
+  comparison move: `lastEdgeStepSeconds` there measures the PUBLISH RATE, since it is however much
+  media arrived since the last tick, so the tolerance dithered between 2.03 and 3.32 s while the
+  distance sawtoothed across it. Measured against a loopback origin running 6 s ahead of the wall
+  clock, the verdict flipped two seconds after a return-to-live press, which puts the chip back in
+  the button row a viewer had just cleared. Leaving the edge now costs one more slack than entering
+  it, and where no playlist declares a cadence the tolerance takes the distance the session holds
+  WHILE the verdict already says it is at the edge, as a robust maximum. The sample gate is the
+  point: a session that is behind contributes nothing, so a deliberate rewind cannot teach the
+  tolerance patience. Fifteen ticks and one transition after the fix, on the run that flipped before.
+
+### Changed
+
+- `LiveWindow.isAtEdge` is the settled verdict with hysteresis; `isWithinEdgeTolerance` is the
+  instantaneous test the old name stood for. Both are internal.
+
+- `aetherctl live` gained `--origin-lead N`, how far ahead of the wall clock the paced origin is
+  allowed to run, which is the standing distance a raw live client ends up reading behind it. The
+  built-in 2 s sits exactly on the old edge tolerance and hides both sides of it.
+
 ## [6.85.0] - 2026-09-14
 
 ### Fixed
