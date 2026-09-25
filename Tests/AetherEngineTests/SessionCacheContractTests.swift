@@ -139,17 +139,19 @@ struct SessionCacheLifecycleContractTests {
         _ = cache.close(reason: .loadFailed)
     }
 
-    @Test("A failed staging-file adopt cannot leave phantom resident bytes")
-    func adoptFailureDropsMissingDestinationAccounting() throws {
+    @Test("A failed replacement preserves the previous generation and its accounting")
+    func adoptFailurePreservesResidentGeneration() throws {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let cache = SegmentCache(baseDirectory: root, sessionID: "current")
         defer { _ = cache.close(reason: .sessionStopped) }
         #expect(cache.store(index: 0, data: Data(repeating: 1, count: 32)))
+        let resident = try #require(cache.peek(index: 0))
         let missing = root.appendingPathComponent("missing-staging.m4s")
         #expect(cache.adopt(index: 0, stagingPath: missing, byteCount: 64) == false)
-        #expect(cache.totalBytes == 0)
-        #expect(cache.peek(index: 0) == nil)
+        #expect(cache.totalBytes == 32)
+        #expect(cache.peek(index: 0) == resident)
+        #expect(resident == Data(repeating: 1, count: 32))
         #expect(cache.lastFailure == .adoptFailed)
     }
 

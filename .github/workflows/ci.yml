@@ -17,9 +17,9 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: maxim-lobanov/setup-xcode@v1
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
         with:
           xcode-version: latest-stable
 
@@ -30,6 +30,12 @@ jobs:
 
       - name: swift build
         run: swift build
+
+      # Every other Swift step here is Debug, and aetherctl is not a product, so no consumer compiles
+      # it either: a DEBUG-only engine hook called without a guard kept Release broken from 7.6.0 to
+      # 7.14.0 without anything noticing (AE#610).
+      - name: swift build -c release (aetherctl)
+        run: swift build -c release --product aetherctl
 
       # A test process that dies mid-run reads as exit 1 with no ✘, no backtrace and no swift-testing
       # summary: `swift test` collapses every abnormal child exit to a plain 1, and a signal takes the
@@ -64,9 +70,9 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: maxim-lobanov/setup-xcode@v1
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
         with:
           xcode-version: latest-stable
 
@@ -113,9 +119,9 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: maxim-lobanov/setup-xcode@v1
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
         with:
           xcode-version: latest-stable
 
@@ -148,9 +154,9 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: maxim-lobanov/setup-xcode@v1
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
         with:
           xcode-version: latest-stable
 
@@ -160,6 +166,61 @@ jobs:
             -scheme AetherEngine \
             -destination 'generic/platform=visionOS Simulator' \
             -derivedDataPath .build/xcode-visionos \
+            CODE_SIGNING_ALLOWED=NO
+
+  # The Xcode 27 lane. Every job above resolves `latest-stable` on macos-15, which is Xcode 26.3,
+  # while the engine is consumed and released from Xcode 27, and Swift 6.4 rejects isolation shapes
+  # 6.3 accepted (the Sodalite test target stopped compiling on exactly that, 2026-09-16). These two
+  # jobs compile the package and both test targets against the 27 toolchain, for macOS and for the
+  # tvOS 27 SDK.
+  #
+  # They build and do not run the tests, on purpose. `xcode-27` is GitHub's preview image and runs a
+  # BETA macOS 27 (26A5406e) under Xcode 27 beta 6: measured on two attempts of the first run, Vision
+  # text recognition returns nil there and the loopback-origin tests starve (a global-queue block not
+  # scheduled within 30 s, a TLS relay request timing out), a different set of network tests each
+  # time, while all 2983 pass on macOS 27 GA on a Mac. A lane that is red for its image teaches
+  # everyone to ignore red. Run `swift test` here once a GA macOS 27 image ships, and that is also
+  # the point to move to its label; the preview label disappearing fails these jobs loudly first.
+  # This lane replaces the weekly beta SDK watcher, whose one subject (#351) the 7.0 platform floor
+  # closed.
+  build-macos-xcode27:
+    name: swift build --build-tests (macOS, Xcode 27)
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: swift build --build-tests
+        run: swift build --build-tests
+
+  build-tvos-xcode27:
+    name: xcodebuild (tvOS Simulator, Xcode 27)
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build for tvOS Simulator
+        run: |
+          xcodebuild build \
+            -scheme AetherEngine \
+            -destination 'generic/platform=tvOS Simulator' \
+            -derivedDataPath .build/xcode-tvos \
+            CODE_SIGNING_ALLOWED=NO
+
+      # See the tvOS job above for why the test target needs its own build and why x86_64 is excluded.
+      - name: Build the tests for tvOS Simulator
+        run: |
+          xcodebuild build-for-testing \
+            -scheme AetherEngineTests \
+            -destination 'generic/platform=tvOS Simulator' \
+            -derivedDataPath .build/xcode-tvos-tests \
+            EXCLUDED_ARCHS=x86_64 \
             CODE_SIGNING_ALLOWED=NO
 
   # The docs site (aetherengine-website) validates every heading anchor at build time, but it
@@ -173,7 +234,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Validate relative links and heading anchors in the published docs
         run: python3 Scripts/check-doc-links.py

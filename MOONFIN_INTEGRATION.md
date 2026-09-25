@@ -3,6 +3,42 @@
 This public fork carries AetherEngine changes required by the Moonfin tvOS
 application.
 
+## Canonical 7.17.0 integration — 2026-09-25
+
+Merge stable `5b917c006c97b3b26c3fc99bf6ac35b3188f9b9a` into packaged fork
+`98e5e3c257d486569b3014c89e9ada5ae190cc72`. Both repositories have the pushed
+checkpoint `moonfin/pre-aether-7.17.0-20260925-210720`. FFmpegBuild advances
+to 3.5.0 (`dcc8041eeeb08aedceb1b053f2a03a27fd12020a`); LibDovi 2.1.0 and
+SMBClient 0.3.1 remain fixed. License asset hashes are unchanged.
+
+Take upstream Matroska pending-rank settlement, decoder seek-epoch fences,
+superseded-pump cancellation, pause/resume recovery, bounded packet coverage,
+network credential/range safeguards and off-main PGS decode. Preserve the
+recovery-point compatibility probe, identity-free timestamp diagnostics,
+exact-origin TLS exceptions, explicit cache budgets and dual-subtitle ownership.
+Resolve cache conflicts with unique generation filenames AND fallible Bool
+results: a failed replacement preserves the previous resident generation and
+its byte ledger. Keep the outer serialized TLS suite while adopting upstream's
+cancellable Python-origin launcher, including the fork's redirect environment.
+
+The PiP subtitle compositor and its tests remain byte-identical to the packaged
+baseline pending separate user approval for drawing changes (upstream
+`1e59deb7`). No host UI, subtitle styling, remote-control interaction, recording
+controls or scrub-thumbnail surface is added.
+
+tvOS arm64 library compilation and all twelve focused standalone checks passed,
+including generated MP4/MKV timestamp controls against the exact FFmpeg build.
+Evidence is under `build/integration-7.17.0/`; focused library suites and host
+candidate acceptance are recorded in Moonfin's
+`docs/testing/aetherengine-7.17.0-upgrade.md`. Compilation and synthetic tests do
+not establish original-media physical playback acceptance.
+
+Consolidated integration review found no unresolved fork-contract conflict.
+Final focused host library tests passed: 95 Swift Testing tests across 17 suites,
+plus the selected secondary-subtitle XCTest cases. They cover live TLS/redirect
+handshakes, dual subtitles, off-main PGS byte equivalence, session-cache replacement
+failure, timestamp policies, paused-clock recovery and ranged-response integrity.
+
 ## Canonical 6.84.0 integration — 2026-09-13
 
 This branch merges canonical/main at `565f5ec9cdc5033d085d6cb556faf16875efb4f0`

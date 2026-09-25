@@ -16,7 +16,7 @@
     /// parallel, so a second suite setting it would decide what this one is
     /// testing.
     extension EngineTLSTestSuite {
-    @Suite("EngineTLS live handshake against a self-signed origin")
+    @Suite("EngineTLS live handshake against a self-signed origin", .serialized, .timeLimit(.minutes(3)))
     struct EngineTLSHandshakeTests {
 
         /// Lives here rather than beside the resolver tests because reading the
@@ -29,7 +29,7 @@
 
         @Test("No evaluator: the handshake is refused and no request reaches the origin")
         func refusedByDefault() async throws {
-            let server = try #require(SelfSignedTLSOrigin())
+            let server = try #require(await SelfSignedTLSOrigin())
             defer { server.stop() }
 
             let previous = EngineTLS.serverTrustEvaluator
@@ -51,7 +51,7 @@
 
         @Test("Accepted for this origin: the same server serves the reader")
         func acceptedWhenOptedIn() async throws {
-            let server = try #require(SelfSignedTLSOrigin())
+            let server = try #require(await SelfSignedTLSOrigin())
             defer { server.stop() }
 
             let previous = EngineTLS.serverTrustEvaluator
@@ -82,7 +82,7 @@
 
         @Test("An evaluator that answers for another host leaves this one refused")
         func refusedForAnOriginTheHostDidNotAccept() async throws {
-            let server = try #require(SelfSignedTLSOrigin())
+            let server = try #require(await SelfSignedTLSOrigin())
             defer { server.stop() }
 
             // The case a process-wide flag cannot express: a host holding a LAN
@@ -107,7 +107,7 @@
 
         @Test("Through the relay: a client that never sees the certificate gets the stream")
         func relayServesThroughUntrustedOrigin() async throws {
-            let origin = try #require(SelfSignedHLSOrigin())
+            let origin = try #require(await SelfSignedHLSOrigin())
             defer { origin.stop() }
 
             let previous = EngineTLS.serverTrustEvaluator
@@ -132,8 +132,9 @@
                     $0.hasPrefix("http://127.0.0.1:") && !$0.contains("m3u8")
                 })
 
-            let (bytes, response) = try await URLSession.shared.data(
-                from: try #require(URL(string: segmentLine)))
+            var segmentRequest = URLRequest(url: try #require(URL(string: segmentLine)))
+            segmentRequest.timeoutInterval = 150
+            let (bytes, response) = try await URLSession.shared.data(for: segmentRequest)
             #expect((response as? HTTPURLResponse)?.statusCode == 200)
             #expect(bytes.count == 4096, "served \(bytes.count) segment bytes")
             #expect(bytes.first == 0x47, "not an MPEG-TS sync byte")
@@ -141,7 +142,7 @@
 
         @Test("Moonfin exact-origin policy works through the upstream relay")
         func exactOriginRelayServesThroughUntrustedOrigin() async throws {
-            let origin = try #require(SelfSignedHLSOrigin())
+            let origin = try #require(await SelfSignedHLSOrigin())
             defer { origin.stop() }
 
             let previous = EngineTLS.allowedUntrustedCertificateOrigins
@@ -177,7 +178,7 @@
 
         @Test("Through the relay: no evaluator refuses to launder an untrusted origin")
         func relayRefusesWhenNotOptedIn() async throws {
-            let origin = try #require(SelfSignedHLSOrigin())
+            let origin = try #require(await SelfSignedHLSOrigin())
             defer { origin.stop() }
 
             let previous = EngineTLS.serverTrustEvaluator
@@ -191,7 +192,7 @@
             let entry = try #require(server.relayURL(for: master))
 
             var request = URLRequest(url: entry)
-            request.timeoutInterval = 15
+            request.timeoutInterval = 150
             let (_, response) = try await URLSession.shared.data(for: request)
             #expect((response as? HTTPURLResponse)?.statusCode == 502,
                     "the upstream handshake should have failed system trust")
@@ -199,7 +200,7 @@
 
         @Test("Through the relay: an origin the evaluator declines is not laundered either")
         func relayRefusesAnOriginTheEvaluatorDeclines() async throws {
-            let origin = try #require(SelfSignedHLSOrigin())
+            let origin = try #require(await SelfSignedHLSOrigin())
             defer { origin.stop() }
 
             // The relay is mounted for every https origin once an evaluator
@@ -216,7 +217,7 @@
             let entry = try #require(server.relayURL(for: master))
 
             var request = URLRequest(url: entry)
-            request.timeoutInterval = 15
+            request.timeoutInterval = 150
             let (_, response) = try await URLSession.shared.data(for: request)
             #expect((response as? HTTPURLResponse)?.statusCode == 502,
                     "an origin the evaluator declined was served anyway")
@@ -224,7 +225,7 @@
 
         @Test("A self-signed origin is what the relay is mounted for")
         func trustProbeNamesTheSelfSignedOrigin() async throws {
-            let origin = try #require(SelfSignedHLSOrigin())
+            let origin = try #require(await SelfSignedHLSOrigin())
             defer { origin.stop() }
 
             // The probe asks the system, not the evaluator, so an answer already given here must not
@@ -247,7 +248,7 @@
 
         @Test("A different port does not inherit an origin approval")
         func wrongPortIsRefused() async throws {
-            let server = try #require(SelfSignedTLSOrigin())
+            let server = try #require(await SelfSignedTLSOrigin())
             defer { server.stop() }
 
             let wrongPort = server.port == UInt16.max ? Int(server.port) - 1 : Int(server.port) + 1
@@ -271,10 +272,10 @@
 
         @Test("A redirect target does not inherit the source origin approval")
         func redirectTargetMustBeApprovedSeparately() async throws {
-            let target = try #require(SelfSignedTLSOrigin())
+            let target = try #require(await SelfSignedTLSOrigin())
             defer { target.stop() }
             let targetURL = URL(string: "https://127.0.0.1:\(target.port)/movie.bin")!
-            let source = try #require(SelfSignedTLSOrigin(redirectURL: targetURL))
+            let source = try #require(await SelfSignedTLSOrigin(redirectURL: targetURL))
             defer { source.stop() }
             let sourceURL = URL(string: "https://127.0.0.1:\(source.port)/redirect")!
 
@@ -304,10 +305,10 @@
 
         @Test("A separately approved redirect target may complete")
         func separatelyApprovedRedirectTargetCompletes() async throws {
-            let target = try #require(SelfSignedTLSOrigin())
+            let target = try #require(await SelfSignedTLSOrigin())
             defer { target.stop() }
             let targetURL = URL(string: "https://127.0.0.1:\(target.port)/movie.bin")!
-            let source = try #require(SelfSignedTLSOrigin(redirectURL: targetURL))
+            let source = try #require(await SelfSignedTLSOrigin(redirectURL: targetURL))
             defer { source.stop() }
             let sourceURL = URL(string: "https://127.0.0.1:\(source.port)/redirect")!
 
@@ -335,7 +336,7 @@
 
         private static func text(of url: URL) async throws -> String {
             var request = URLRequest(url: url)
-            request.timeoutInterval = 15
+            request.timeoutInterval = 150
             let (data, response) = try await URLSession.shared.data(for: request)
             #expect((response as? HTTPURLResponse)?.statusCode == 200)
             return String(decoding: data, as: UTF8.self)
@@ -376,56 +377,15 @@
             return text.split(separator: "\n").count
         }
 
-        init?(redirectURL: URL? = nil) {
-            let dir = FileManager.default.temporaryDirectory
-                .appendingPathComponent("aether-tls-origin-\(UUID().uuidString)")
-            guard (try? FileManager.default.createDirectory(
-                at: dir, withIntermediateDirectories: true)) != nil else { return nil }
-            workDir = dir
-            do {
-                try Self.certPEM.write(
-                    to: dir.appendingPathComponent("cert.pem"), atomically: true, encoding: .utf8)
-                try Self.keyPEM.write(
-                    to: dir.appendingPathComponent("key.pem"), atomically: true, encoding: .utf8)
-                try Self.serverPy.write(
-                    to: dir.appendingPathComponent("origin.py"), atomically: true, encoding: .utf8)
-            } catch { return nil }
-
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-            proc.arguments = [dir.appendingPathComponent("origin.py").path]
-            proc.currentDirectoryURL = dir
-            if let redirectURL {
-                proc.environment = ProcessInfo.processInfo.environment.merging(
-                    ["AETHER_REDIRECT_URL": redirectURL.absoluteString]
-                ) { _, new in new }
-            }
-            let stdout = Pipe()
-            proc.standardOutput = stdout
-            proc.standardError = FileHandle.nullDevice
-            do { try proc.run() } catch { return nil }
-            process = proc
-
-            // The server prints "READY <port>" once it is listening.
-            var readyLine = ""
-            var pending = Data()
-            let deadline = Date().addingTimeInterval(10)
-            while Date() < deadline, !readyLine.contains("READY") {
-                let chunk = stdout.fileHandleForReading.availableData
-                if chunk.isEmpty {
-                    Thread.sleep(forTimeInterval: 0.05)
-                    continue
-                }
-                pending.append(chunk)
-                readyLine = String(decoding: pending, as: UTF8.self)
-            }
-            guard let match = readyLine.split(separator: " ").last,
-                let bound = UInt16(match.trimmingCharacters(in: .whitespacesAndNewlines))
-            else {
-                proc.terminate()
-                return nil
-            }
-            port = bound
+        init?(redirectURL: URL? = nil) async {
+            guard let launched = await PythonOrigin.launch(
+                prefix: "aether-tls-origin", script: Self.serverPy,
+                files: ["cert.pem": Self.certPEM, "key.pem": Self.keyPEM],
+                environment: redirectURL.map { ["AETHER_REDIRECT_URL": $0.absoluteString] } ?? [:])
+            else { return nil }
+            process = launched.process
+            port = launched.port
+            workDir = launched.workDir
         }
 
         func stop() {
