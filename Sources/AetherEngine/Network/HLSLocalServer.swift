@@ -243,6 +243,9 @@ final class HLSLocalServer: @unchecked Sendable {
 
     /// Kernel-assigned ephemeral port. Zero until start() succeeds.
     private(set) var port: UInt16 = 0
+    /// Actual kernel-reported listening address, not the AVPlayer URL.
+    private(set) var listeningAddress: String?
+    private let loopbackOnly: Bool
 
     /// URL passed to AVPlayer. Points at master.m3u8 when the provider has master metadata, else media.m3u8.
     var playlistURL: URL? {
@@ -419,7 +422,8 @@ final class HLSLocalServer: @unchecked Sendable {
     /// A relay-only server has no provider: nothing here produces segments, every byte comes
     /// from the origin, and the master is whatever the origin served.
     init(provider: HLSSegmentProvider? = nil, subResourceBaseURL: URL? = nil,
-         relay: HLSOriginRelay? = nil) {
+         relay: HLSOriginRelay? = nil, loopbackOnly: Bool = false) {
+        self.loopbackOnly = loopbackOnly
         self.provider = provider
         self.subResourceBaseURL = subResourceBaseURL
         self.relay = relay
@@ -461,10 +465,10 @@ final class HLSLocalServer: @unchecked Sendable {
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = 0 // kernel picks ephemeral
-        // Bind all interfaces (not just loopback) so an AirPlay receiver can reach the stream over the LAN
+        // Unless the host requires loopback-only access, bind all interfaces so an AirPlay receiver can reach the stream over the LAN
         // via the device's WiFi IP (#86, DrHurt). Local playback still uses 127.0.0.1; the URL host is only
         // swapped to the LAN IP while external playback is active. Ephemeral port, serves the current stream only.
-        addr.sin_addr.s_addr = inet_addr("0.0.0.0")
+        addr.sin_addr.s_addr = inet_addr(loopbackOnly ? "127.0.0.1" : "0.0.0.0")
 
         let bindResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
@@ -502,6 +506,7 @@ final class HLSLocalServer: @unchecked Sendable {
         stateLock.lock()
         listenFd = fd
         port = assignedPort
+        listeningAddress = String(cString: inet_ntoa(actual.sin_addr))
         shouldStop = false
         stateLock.unlock()
 

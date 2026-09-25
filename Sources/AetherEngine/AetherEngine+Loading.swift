@@ -603,7 +603,8 @@ extension AetherEngine {
 
         guard let prepared = await RemoteHLSSubtitleProxy.prepare(
             originURL: originURL, tracks: tracks, httpHeaders: options.httpHeaders,
-            needsRelay: needsRelay) else { return nil }
+            needsRelay: needsRelay,
+            loopbackOnly: options.localServerLoopbackOnly) else { return nil }
         // The playlist fetches suspend; a load()/stop() can have superseded this session meanwhile, and a
         // proxy nobody owns would keep its socket and decode task for the rest of the process.
         guard loadGeneration == expectedGeneration else {
@@ -752,6 +753,7 @@ extension AetherEngine {
         let session = HLSVideoEngine(
             url: url,
             sourceHTTPHeaders: sourceHTTPHeaders,
+            localServerLoopbackOnly: loadedOptions.localServerLoopbackOnly,
             dvModeAvailable: sessionDisplayCaps.supportsDolbyVision,
             displaySupportsHDR: sessionDisplayCaps.supportsHDR,
             keepDvh1TagWithoutDV: keepDvh1TagWithoutDV,

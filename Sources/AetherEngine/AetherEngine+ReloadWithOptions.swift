@@ -192,6 +192,7 @@ enum SessionOptionCorrection {
     /// The fields that NAME the session rather than tune it. Each opens the source on a different
     /// pipeline, and the engine writes the last two itself, so a host write races its determination.
     static let loadIdentityFields: [String] = [
+        "localServerLoopbackOnly",
         "isLive",
         "audioOnly",
         "nativeRemoteHLS",
@@ -227,6 +228,9 @@ enum SessionOptionCorrection {
     /// torn down, so it does not ride on reflection.
     static func refusedFields(from current: LoadOptions, to proposed: LoadOptions) -> [String] {
         var refused: [String] = []
+        if proposed.localServerLoopbackOnly != current.localServerLoopbackOnly {
+            refused.append("localServerLoopbackOnly")
+        }
         if proposed.isLive != current.isLive { refused.append("isLive") }
         if proposed.audioOnly != current.audioOnly { refused.append("audioOnly") }
         if proposed.nativeRemoteHLS != current.nativeRemoteHLS { refused.append("nativeRemoteHLS") }
@@ -310,6 +314,7 @@ enum SessionOptionCorrection {
     /// right for a tuning lever and wrong for an identity one, so the choice has to be made
     /// deliberately. Update this list and, if the field names the session, `loadIdentityFields`.
     static let knownFields: [String] = [
+        "localServerLoopbackOnly",
         "omitCriteriaColorExtensions", "suppressDisplayCriteria", "httpHeaders",
         "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "matchContentEnabled",
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",

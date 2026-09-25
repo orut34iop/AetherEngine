@@ -52,13 +52,13 @@ enum RemoteHLSSubtitleProxy {
     static func prepare(originURL: URL,
                         tracks: [RemoteHLSSubtitleProvider.Track],
                         httpHeaders: [String: String],
-                        needsRelay: Bool) async -> Prepared? {
+                        needsRelay: Bool, loopbackOnly: Bool = false) async -> Prepared? {
         guard !tracks.isEmpty || needsRelay else { return nil }
         if !tracks.isEmpty {
             do {
                 let prepared = try await build(
                     originURL: originURL, tracks: tracks, httpHeaders: httpHeaders,
-                    needsRelay: needsRelay)
+                    needsRelay: needsRelay, loopbackOnly: loopbackOnly)
                 EngineLog.emit(
                     "[AetherEngine] #316: serving \(tracks.count) external subtitle rendition(s) over a "
                     + "rewritten master at \(prepared.masterURL.absoluteString), media "
@@ -73,15 +73,15 @@ enum RemoteHLSSubtitleProxy {
             }
         }
         guard needsRelay else { return nil }
-        return relayOnly(originURL: originURL, httpHeaders: httpHeaders)
+        return relayOnly(originURL: originURL, httpHeaders: httpHeaders, loopbackOnly: loopbackOnly)
     }
 
     /// The AE#495 half with nothing to inject: no provider, no playlist reads, and the player is
     /// pointed at the relay's own address for the origin.
-    private static func relayOnly(originURL: URL, httpHeaders: [String: String]) -> Prepared? {
+    private static func relayOnly(originURL: URL, httpHeaders: [String: String], loopbackOnly: Bool) -> Prepared? {
         let relay = HLSOriginRelay()
         relay.admit(originURL, httpHeaders: httpHeaders)
-        let server = HLSLocalServer(relay: relay)
+        let server = HLSLocalServer(relay: relay, loopbackOnly: loopbackOnly)
         do {
             try server.start()
         } catch {
@@ -118,7 +118,7 @@ enum RemoteHLSSubtitleProxy {
     private static func build(originURL: URL,
                               tracks: [RemoteHLSSubtitleProvider.Track],
                               httpHeaders: [String: String],
-                              needsRelay: Bool) async throws -> Prepared {
+                              needsRelay: Bool, loopbackOnly: Bool) async throws -> Prepared {
         let session = makeSession()
         defer { session.finishTasksAndInvalidate() }
 
@@ -137,7 +137,7 @@ enum RemoteHLSSubtitleProxy {
                                                  defaultHeaders: httpHeaders)
         let relay: HLSOriginRelay? = needsRelay ? HLSOriginRelay() : nil
         relay?.admit(finalURL, httpHeaders: httpHeaders)
-        let server = HLSLocalServer(provider: provider, relay: relay)
+        let server = HLSLocalServer(provider: provider, relay: relay, loopbackOnly: loopbackOnly)
         do {
             try server.start()
         } catch {

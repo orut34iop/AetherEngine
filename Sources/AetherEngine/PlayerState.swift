@@ -523,6 +523,9 @@ public enum DolbyVisionHandling: String, Sendable, Equatable, CaseIterable {
 }
 
 public struct LoadOptions: Sendable, Equatable {
+    /// Restrict internal HTTP listeners to 127.0.0.1, disabling LAN/AirPlay access.
+    /// False preserves the existing network-listener behavior for other hosts.
+    public var localServerLoopbackOnly: Bool
     /// Diagnostic lever: omit BT.2020 / transfer / YCbCr matrix from AVDisplayCriteria so AVPlayer re-reads color from the bitstream. Default off.
     public var omitCriteriaColorExtensions: Bool
     /// Skip display-criteria handshake entirely. For previews and `aetherctl` where no panel exists. Default off.
@@ -974,6 +977,7 @@ public struct LoadOptions: Sendable, Equatable {
 
     public init(
         omitCriteriaColorExtensions: Bool = false,
+        localServerLoopbackOnly: Bool = false,
         suppressDisplayCriteria: Bool = false,
         httpHeaders: [String: String] = [:],
         keepDvh1TagWithoutDV: Bool = false,
@@ -1017,6 +1021,7 @@ public struct LoadOptions: Sendable, Equatable {
         preferredDecodePath: DecodePath = .automatic
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
+        self.localServerLoopbackOnly = localServerLoopbackOnly
         self.suppressDisplayCriteria = suppressDisplayCriteria
         self.httpHeaders = httpHeaders
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV

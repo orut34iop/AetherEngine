@@ -53,11 +53,12 @@ struct HLSLocalServerSessionTokenTests {
 
     // MARK: - Over a real socket
 
-    @Test("The served URL carries the token and an unprefixed request 404s")
-    func unprefixedRequestIsRefusedOverTheSocket() throws {
-        let server = HLSLocalServer(provider: StubProvider())
+    @Test("The listener honors binding scope and still requires its token", arguments: [false, true])
+    func unprefixedRequestIsRefusedOverTheSocket(loopbackOnly: Bool) throws {
+        let server = HLSLocalServer(provider: StubProvider(), loopbackOnly: loopbackOnly)
         try server.start()
         defer { server.stop() }
+        #expect(server.listeningAddress == (loopbackOnly ? "127.0.0.1" : "0.0.0.0"))
 
         let served = try #require(server.mediaPlaylistURL)
         #expect(served.path == "/\(server.pathToken)/media.m3u8")

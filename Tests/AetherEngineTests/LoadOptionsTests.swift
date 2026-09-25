@@ -10,6 +10,7 @@ struct LoadOptionsTests {
         #expect(opts.omitCriteriaColorExtensions == false)
         #expect(opts.suppressDisplayCriteria == false)
         #expect(opts.httpHeaders.isEmpty)
+        #expect(opts.localServerLoopbackOnly == false)
         #expect(opts.keepDvh1TagWithoutDV == false)
         // Default matchContentEnabled MUST be true; flipping this would
         // silently regress HDR routing for non-tvOS callers that don't
@@ -35,6 +36,9 @@ struct LoadOptionsTests {
 
     @Test("Equatable distinguishes different inputs")
     func equatableDistinguishesDifferentInputs() {
+        let local = LoadOptions(localServerLoopbackOnly: true)
+        #expect(local != LoadOptions())
+        #expect(SessionOptionCorrection.refusedFields(from: local, to: LoadOptions()) == ["localServerLoopbackOnly"])
         let a = LoadOptions(matchContentEnabled: true)
         let b = LoadOptions(matchContentEnabled: false)
         #expect(a != b)

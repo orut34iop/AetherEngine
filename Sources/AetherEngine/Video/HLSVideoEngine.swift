@@ -42,6 +42,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     let sourceURL: URL
     let sourceHTTPHeaders: [String: String]
+    private let localServerLoopbackOnly: Bool
     private let dvModeAvailable: Bool
 
     /// From `LoadOptions.keepDvh1TagWithoutDV`; default OFF, set only for misreporting DV panels.
@@ -883,6 +884,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     public init(
         url: URL,
         sourceHTTPHeaders: [String: String] = [:],
+        localServerLoopbackOnly: Bool = false,
         dvModeAvailable: Bool = true,
         displaySupportsHDR: Bool = true,
         keepDvh1TagWithoutDV: Bool = false,
@@ -916,6 +918,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     ) {
         self.sourceURL = url
         self.sourceHTTPHeaders = sourceHTTPHeaders
+        self.localServerLoopbackOnly = localServerLoopbackOnly
         self.sequentialOrigin = sequentialOrigin
         self.heldSourceConnection = heldSourceConnection
         self.declaredDurationSeconds = declaredDurationSeconds
@@ -1972,7 +1975,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             + "duration=\(String(format: "%.1f", durationSeconds))s"
         )
 
-        let srv = HLSLocalServer(provider: prov)
+        let srv = HLSLocalServer(provider: prov, loopbackOnly: localServerLoopbackOnly)
         try srv.start()
         self.server = srv
 
