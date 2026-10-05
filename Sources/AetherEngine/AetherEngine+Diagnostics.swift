@@ -506,6 +506,9 @@ extension AetherEngine {
     func refreshSessionCacheStatus() {
         guard let session = nativeVideoSession else { return }
         diagnostics.sessionCacheStatus = session.sessionCacheStatus()
+        if let host = nativeHost {
+            refreshNativeBufferedPosition(playlistSeconds: host.renderedTime)
+        }
     }
 
 

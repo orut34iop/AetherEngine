@@ -1361,11 +1361,7 @@ extension AetherEngine {
                 // rendered frame. Drawn against the 0-based duration, so map onto the display axis to keep
                 // the buffer bar aligned with currentTime (0 off disc). AE#105, #207 follow-up.
                 // See docs issue #33 follow-up.
-                let renderedDisplay = PresentationAxis.display(
-                    sourcePTS: value + shift, origin: self.displayOrigin(forShift: shift))
-                let readAhead = self.nativeVideoSession?
-                    .contiguousForwardReadAheadSeconds(playlistSeconds: value) ?? 0
-                self.clock.bufferedPosition = renderedDisplay + max(0, readAhead)
+                self.refreshNativeBufferedPosition(playlistSeconds: value)
             }
             .store(in: &nativeCancellables)
         startLiveWindowTimer(host: host)
@@ -2637,5 +2633,19 @@ extension AetherEngine {
             + "clamp had nothing to read (#515)",
             category: .engine)
         videoFormat = upgraded
+    }
+}
+
+// Shared by picture ticks and the independent cache sampler. A paused picture
+// keeps its source-axis position while the real contiguous cache can advance.
+extension AetherEngine {
+    func refreshNativeBufferedPosition(playlistSeconds value: Double) {
+        let shift = presentationAxis.shiftSeconds(atItemSeconds: value)
+            ?? playlistShiftSeconds
+        let renderedDisplay = PresentationAxis.display(
+            sourcePTS: value + shift, origin: displayOrigin(forShift: shift))
+        let readAhead = nativeVideoSession?
+            .contiguousForwardReadAheadSeconds(playlistSeconds: value) ?? 0
+        clock.bufferedPosition = renderedDisplay + max(0, readAhead)
     }
 }
