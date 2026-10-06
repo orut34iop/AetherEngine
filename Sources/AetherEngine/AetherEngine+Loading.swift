@@ -286,7 +286,7 @@ extension AetherEngine {
                             category: .engine)
                     }
                     Task { @MainActor in
-                        await self.seek(to: pending.seconds, origin: pending.origin)
+                        await self.seek(to: pending.seconds, origin: pending.origin, requestID: pending.requestID)
                         if pending.origin == .liveRejoin { self.acceptCurrentItemForPublishing() }
                     }
                 }
@@ -1269,11 +1269,36 @@ extension AetherEngine {
         // keyed to the item that loaded it. Installed on the one funnel every attach passes through, so
         // the session's FIRST item is covered as well as every swap: both used to reconstruct the axis
         // from the cache instead, and a reconstruction is only as good as the older of its two samples.
-        host.onWillAttachItem = { [weak self] in
-            // The host owns this closure, so it reaches back for the host rather than capturing it.
+        let timelineLoadGeneration = loadGeneration
+        host.onWillAttachItem = { [weak self, weak host] in
+            // Preserve the existing axis hook. Only the new observation epoch
+            // additionally checks the pipeline which installed this closure.
             guard let self, let attaching = self.nativeHost else { return }
+            if let host, self.loadGeneration == timelineLoadGeneration, attaching === host {
+                self.beginTimelineObservationEpoch()
+            }
             self.nativeVideoSession?.armLiveItemAxisStatement()
             self.liveItemAxisArmedGeneration = attaching.itemGeneration
+        }
+        host.onTimelineSample = { [weak self, weak host] sample, itemGeneration in
+            guard let self, let host, self.loadGeneration == timelineLoadGeneration,
+                  self.nativeHost === host, host.itemGeneration == itemGeneration else { return }
+            // This interface currently admits Direct Play VOD host clocks. It does
+            // not guess the live item's separate placement or remote-HLS cue lead.
+            guard !self.isLive, self.clock.sourceTimeFollowsPicture else {
+                self.refreshTimelineObservation(available: false)
+                return
+            }
+            let display = self.displaySeconds(forPlaylistSeconds: sample.seconds)
+            self.recordTimelineObservation(TimelineClockSample(seconds: display,
+                sampledAtUptime: sample.sampledAtUptime, reanchored: false),
+                epoch: self.timelineObservationState.value.sessionEpoch,
+                evidence: .nativePresentationClock)
+        }
+        host.onTimelineUnavailable = { [weak self, weak host] in
+            guard let self, let host, self.loadGeneration == timelineLoadGeneration,
+                  self.nativeHost === host else { return }
+            self.refreshTimelineObservation(available: false)
         }
         applyDesiredVolume(to: host)
         applyDesiredRate(to: host)
@@ -1833,6 +1858,25 @@ extension AetherEngine {
             self?.publishLiveWindow(edgeSessionTime: edge)
         }
         self.softwareHost = host
+        let timelineEpoch = beginTimelineObservationEpoch()
+        let timelineLoadGeneration = loadGeneration
+        host.onTimelineSample = { [weak self, weak host] sample in
+            guard let self, let host, self.loadGeneration == timelineLoadGeneration,
+                  self.softwareHost === host,
+                  self.timelineObservationState.value.sessionEpoch == timelineEpoch else { return }
+            guard !self.isLive else {
+                self.refreshTimelineObservation(available: false)
+                return
+            }
+            self.recordTimelineObservation(sample, epoch: timelineEpoch,
+                evidence: sample.reanchored ? .softwareReanchoredClock : .softwarePresentationClock)
+        }
+        host.onTimelineUnavailable = { [weak self, weak host] in
+            guard let self, let host, self.loadGeneration == timelineLoadGeneration,
+                  self.softwareHost === host,
+                  self.timelineObservationState.value.sessionEpoch == timelineEpoch else { return }
+            self.refreshTimelineObservation(available: false)
+        }
         // #311: a load builds a new host and a new renderer, so an observer installed once by the
         // host app has to be carried across the seam, exactly as the native session does at load.
         host.setVideoFrameTimeObserver(softwareVideoFrameTimeObserver)

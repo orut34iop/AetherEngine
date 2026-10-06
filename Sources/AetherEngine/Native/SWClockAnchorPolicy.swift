@@ -54,6 +54,11 @@ enum SWClockAnchorPolicy {
         return seconds + sessionZeroSeconds
     }
 
+    /// The existing VOD clock fold, shared by currentTime and coherent observations.
+    static func sessionSeconds(forSource seconds: Double, sessionZeroSeconds: Double) -> Double {
+        sessionZeroSeconds > 0 ? max(0, seconds - sessionZeroSeconds) : seconds
+    }
+
     /// Whether a video packet parked on renderer back-pressure has to anchor the clock itself
     /// (#337).
     ///

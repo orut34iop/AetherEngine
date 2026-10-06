@@ -7,6 +7,10 @@ import Combine
 @MainActor
 public final class PlaybackClock: ObservableObject {
 
+    /// Coherent display-axis clock evidence. Observe this value directly rather than
+    /// joining individual @Published fields, which publish before their mutation.
+    @Published public internal(set) var timelineObservation = TimelineObservation.unavailable
+
     /// ~10 Hz. On native HLS: unified source-PTS clock (AVPlayer time folded with `playlistShiftSeconds`).
     @Published public internal(set) var currentTime: Double = 0
 

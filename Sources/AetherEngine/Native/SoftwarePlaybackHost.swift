@@ -62,6 +62,12 @@ final class SoftwarePlaybackHost {
     /// publishes this as `clock.sourceTime` so the subtitle overlay drainer scans the
     /// packet store on the right axis.
     @Published private(set) var sourceClockSeconds: Double = 0
+    /// A coherent, real synchronizer read, never the optimistic seek target.
+    var onTimelineSample: ((TimelineClockSample) -> Void)?
+    var onTimelineUnavailable: (() -> Void)?
+    // Conservatively retained for this host lifetime: existing callbacks do not
+    // establish which post-seek frame replaced the retained displayed image.
+    private var timelineClockWasReanchored = false
     @Published private(set) var duration: Double = 0
     @Published private(set) var rate: Float = 0
     /// #376: carries the classification with the message, so the engine can publish both.
@@ -76,7 +82,9 @@ final class SoftwarePlaybackHost {
     /// A LEVEL that falls whenever the layer loses its picture; the engine folds it into the
     /// load-scoped `AetherEngine.hasFirstFrameReadyForDisplay`, which is what hosts consume. A
     /// session with no video stream never arms the observation and leaves this false.
-    @Published private(set) var isVideoReadyForDisplay: Bool = false
+    @Published private(set) var isVideoReadyForDisplay: Bool = false {
+        didSet { if !isVideoReadyForDisplay { onTimelineUnavailable?() } }
+    }
 
     /// #315: `readyForDisplay` observation on the renderer's layer, re-armed per load and torn down
     /// with the session.
@@ -1294,6 +1302,7 @@ final class SoftwarePlaybackHost {
             return .landed
         }
 
+        timelineClockWasReanchored = true
         // Publish the target and hold it across the await, so the scrub clock snaps the way the native
         // path's optimistic publish does instead of drifting on the stale synchronizer anchor.
         currentTime = seconds
@@ -2949,23 +2958,34 @@ final class SoftwarePlaybackHost {
                 // still on the pre-seek anchor and would drag the published position backwards.
                 guard !self.seekInFlight else { return }
                 let raw = aOut.currentTimeSeconds
+                let sampledAt = ProcessInfo.processInfo.systemUptime
                 self.emitDiagIfDue(clock: raw)
                 if raw.isFinite, raw >= 0 {
                     self.vodPacketReadAhead?.updatePlayhead(raw)
-                    // Raw clock = source/subtitle axis; published alongside the mapped position (#107).
-                    self.sourceClockSeconds = raw
-                    // Live: subtract sessionStartPts to convert to "seconds since first frame"; VOD
-                    // subtracts the anchor's session zero (0 for zero-based sources, #107).
+                    // Capture the mapping with this raw read BEFORE either Published
+                    // property calls subscribers; a subscriber can re-enter the host.
+                    let mapped: Double
                     if self.isLive {
                         let start: Double = {
                             self.liveEdgeLock.lock(); defer { self.liveEdgeLock.unlock() }
                             return self.sessionStartPts.isFinite ? self.sessionStartPts : 0
                         }()
-                        self.currentTime = max(0, raw - start)
+                        mapped = max(0, raw - start)
                     } else {
-                        let zero = self.clockSessionZero
-                        self.currentTime = zero > 0 ? max(0, raw - zero) : raw
+                        mapped = SWClockAnchorPolicy.sessionSeconds(
+                            forSource: raw, sessionZeroSeconds: self.clockSessionZero)
                     }
+                    let reanchored = self.timelineClockWasReanchored
+                    self.sourceClockSeconds = raw
+                    self.currentTime = mapped
+                    if self.isReady, self.isVideoReadyForDisplay {
+                        self.onTimelineSample?(TimelineClockSample(seconds: mapped,
+                            sampledAtUptime: sampledAt, reanchored: reanchored))
+                    } else {
+                        self.onTimelineUnavailable?()
+                    }
+                } else {
+                    self.onTimelineUnavailable?()
                 }
                 // Feed the live edge; publishLiveWindow in the engine reads currentTime for the playhead.
                 if self.isLive, let edge = self.liveEdgeSessionTime {

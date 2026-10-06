@@ -34,6 +34,20 @@ final class NativeAVPlayerHost {
     @Published private(set) var currentTime: Double = 0
     /// AVPlayer's actually-rendered position (pre-seek parked frame during in-flight seeks). Folded to clock.sourceTime so subtitle overlay tracks the picture, not the scrub target (issue #49).
     @Published private(set) var renderedTime: Double = 0
+    /// Only actual clock reads call this seam; target/reset assignments do not.
+    var onTimelineSample: ((TimelineClockSample, Int) -> Void)?
+    var onTimelineUnavailable: (() -> Void)?
+
+    private func publishTimelineSample(_ value: Double, sampledAt: TimeInterval,
+                                       itemGeneration: Int) {
+        guard itemGeneration == sessionID else { return }
+        guard isReady, isVideoReadyForDisplay, value.isFinite, value >= 0 else {
+            onTimelineUnavailable?()
+            return
+        }
+        onTimelineSample?(TimelineClockSample(seconds: value, sampledAtUptime: sampledAt,
+                                              reanchored: false), itemGeneration)
+    }
     @Published private(set) var duration: Double = 0
     @Published private(set) var rate: Float = 0
     /// #376: the failure a host classifies on, message included. Published instead of a bare string so
@@ -61,7 +75,17 @@ final class NativeAVPlayerHost {
     /// `replaceCurrentItem`, even when the swap is meant to be invisible). The engine folds it into
     /// the load-scoped `AetherEngine.hasFirstFrameReadyForDisplay`, which is what a host should
     /// consume; nothing here is worth reacting to on its own.
-    @Published private(set) var isVideoReadyForDisplay: Bool = false
+    @Published private(set) var isVideoReadyForDisplay: Bool = false {
+        didSet {
+            if !isVideoReadyForDisplay { onTimelineUnavailable?() }
+            else {
+                // A paused first picture may receive no subsequent periodic tick.
+                let value = avPlayer.currentTime().seconds
+                publishTimelineSample(value, sampledAt: ProcessInfo.processInfo.systemUptime,
+                                      itemGeneration: sessionID)
+            }
+        }
+    }
 
     /// What the current session was loaded under, carried across an item swap (#440 round 5). See
     /// `SessionLoadContract` and `swapItem`.
@@ -798,10 +822,14 @@ final class NativeAVPlayerHost {
             queue: .main
         ) { [weak self] time in
             let value = time.seconds.isFinite ? time.seconds : 0
+            let timelineSampleTime = ProcessInfo.processInfo.systemUptime
+            let timelineSampleValue = time.seconds
             Task { @MainActor in
                 guard let self, self.sessionID == sid else { return }
                 // renderedTime tracks the parked on-screen frame mid-seek (issue #49).
                 self.renderedTime = value
+                self.publishTimelineSample(timelineSampleValue, sampledAt: timelineSampleTime,
+                                           itemGeneration: sid)
                 // seekInFlight suppresses currentTime: AVPlayer still reports pre-seek clock until physical landing (issue #37).
                 guard !self.seekInFlight else { return }
                 self.currentTime = value
@@ -1776,6 +1804,7 @@ final class NativeAVPlayerHost {
         let gen = seekGeneration
         seekInFlight = true
         latestSeekRenderedTimePublished = false
+        let timelineSampleItemGeneration = sessionID
         let resumeGuard = SeekResumeGuard()
         return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             if let deadlineSeconds, deadlineSeconds > 0 {
@@ -1814,6 +1843,9 @@ final class NativeAVPlayerHost {
                                 bufferingTowardTarget: self.isBufferingTowardSeekTarget) {
                                 self.latestSeekRenderedTimePublished = true
                                 self.renderedTime = landed
+                                self.publishTimelineSample(landed,
+                                    sampledAt: ProcessInfo.processInfo.systemUptime,
+                                    itemGeneration: timelineSampleItemGeneration)
                             }
                         }
                     }

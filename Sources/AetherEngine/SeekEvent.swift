@@ -60,13 +60,17 @@ public struct SeekEvent: Sendable, Equatable {
 
     /// Identifies one seek across its events. Monotonic per engine instance; not the internal seek fence.
     public let id: UInt64
+    /// Caller identity across deferred replay attempts; nil for legacy/internal seeks.
+    /// This is correlation, not an idempotency key or a frame-presentation receipt.
+    public let requestID: UUID?
     public let origin: Origin
     public let outcome: Outcome
     /// Seek destination on the `currentTime` axis.
     public let target: Double
 
-    public init(id: UInt64, origin: Origin, outcome: Outcome, target: Double) {
+    public init(id: UInt64, origin: Origin, outcome: Outcome, target: Double, requestID: UUID? = nil) {
         self.id = id
+        self.requestID = requestID
         self.origin = origin
         self.outcome = outcome
         self.target = target
@@ -92,7 +96,8 @@ extension SeekEvent: CustomStringConvertible {
         case .superseded: outcomeText = "superseded"
         case .rejected(let reason): outcomeText = "rejected(\(reason.rawValue))"
         }
-        return "seek#\(id) \(origin.rawValue) \(outcomeText) target=\(String(format: "%.2f", target))"
+        let correlation = requestID.map { " request=\($0.uuidString)" } ?? ""
+        return "seek#\(id) \(origin.rawValue) \(outcomeText) target=\(String(format: "%.2f", target))" + correlation
     }
 }
 
