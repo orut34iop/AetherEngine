@@ -1944,6 +1944,7 @@ public final class AetherEngine: ObservableObject {
     /// after a newer load, orphan the successor's producer+loopback server, and resurrect playback after
     /// dismissal. A superseded load throws CancellationError at the first checkpoint.
     var loadGeneration: UInt64 = 0
+    var externalSubtitleIntentGeneration: UInt64 = 0
 
     /// #361: generation of the startup the user is currently waiting through. Deliberately NOT
     /// `loadGeneration`, which counts teardowns: an engine-initiated reroute (an HLS playlist found

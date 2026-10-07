@@ -44,6 +44,7 @@ extension AetherEngine {
     /// no xsub decoder, so such a track selects and then decodes to nothing; it is deliberately not
     /// claimed anywhere in the documentation.
     public func selectSubtitleTrack(index: Int) {
+        externalSubtitleIntentGeneration &+= 1
         hostExplicitSubtitleAction = true
         selectSubtitleTrack(index: index, startAt: sourceTime)
         // Sodalite#156: while the picture is off this device the RENDITION is the display, so a pick
@@ -172,6 +173,7 @@ extension AetherEngine {
     /// Text and bitmap streams use separate channel decoders, cursors and PGS gates.
     /// External ids (#88) route onto the secondary sidecar decode.
     public func selectSecondarySubtitleTrack(index: Int) {
+        externalSubtitleIntentGeneration &+= 1
         selectSecondarySubtitleTrack(index: index, startAt: sourceTime)
     }
 
@@ -1540,6 +1542,7 @@ extension AetherEngine {
     /// Unregister an external track: delist + drop the registry entry; an active selection
     /// (primary or secondary) is cleared. Embedded ids no-op.
     public func removeExternalSubtitleTrack(id: Int) {
+        externalSubtitleIntentGeneration &+= 1
         guard externalSubtitleRegistry.removeValue(forKey: id) != nil else { return }
         subtitleTracks.removeAll { $0.id == id }
         if activeSubtitleTrackIndex == id { clearSubtitle() }
@@ -1548,6 +1551,7 @@ extension AetherEngine {
 
     /// Fetch and decode a sidecar subtitle file (.srt / .ass / .vtt / .ssa) via `SubtitleDecoder.decodeFile`, replacing `subtitleCues` atomically. `httpHeaders` nil forwards `LoadOptions.httpHeaders` only for the media URL's exact origin; cross-origin sidecars require explicit headers. Prefer registering via `addExternalSubtitleTrack` + `selectSubtitleTrack` (#88), which keeps the track listed and `activeSubtitleTrackIndex` populated; this API stays for compatibility and one-shot use.
     public func selectSidecarSubtitle(url: URL, httpHeaders: [String: String]? = nil) {
+        externalSubtitleIntentGeneration &+= 1
         hostExplicitSubtitleAction = true
         startSidecarDecode(url: url, httpHeaders: httpHeaders, externalTrackID: nil)
     }
@@ -1585,14 +1589,15 @@ extension AetherEngine {
             mediaHeaders: loadedOptions.httpHeaders)
         let sessionGeneration = loadGeneration
         // ASS/SSA sidecars honour preserveASSMarkup so hosts can drive a styled renderer. SRT/VTT fall back to plain text regardless.
-        let preserveASS = loadedOptions.preserveASSMarkup
+        let boundedText = externalTrackID.flatMap { externalSubtitleRegistry[$0] }?.boundedHostText == true
+        let preserveASS = boundedText ? false : loadedOptions.preserveASSMarkup
         sidecarTask = Task { [weak self] in
             let result: SidecarDecodeResult
             do {
                 result = try await SubtitleDecoder.decodeFile(
                     url: url, httpHeaders: effectiveHeaders,
                     preserveASSMarkup: preserveASS,
-                    sourceStreamIndex: sourceStreamIndex
+                    sourceStreamIndex: sourceStreamIndex, boundedText: boundedText
                 )
             } catch {
                 EngineLog.emit("[AetherEngine] sidecar decode failed: \(error)", category: .engine)
@@ -1632,6 +1637,7 @@ extension AetherEngine {
 
     /// Decode a sidecar as the secondary companion track (issue #47), independent of the primary.
     public func selectSecondarySidecarSubtitle(url: URL, httpHeaders: [String: String]? = nil) {
+        externalSubtitleIntentGeneration &+= 1
         hostExplicitSubtitleAction = true
         cancelSidecarTask(channel: .secondary)
         clearSubtitleDrainTarget(channel: .secondary, reason: .secondarySidecarSelected)   // #112 rework
@@ -1662,7 +1668,8 @@ extension AetherEngine {
         let effectiveHeaders = Self.resolvedSubtitleHeaders(
             for: url, explicit: httpHeaders, mediaURL: loadedURL,
             mediaHeaders: loadedOptions.httpHeaders)
-        let preserveASS = loadedOptions.preserveASSMarkup
+        let boundedText = externalTrackID.flatMap { externalSubtitleRegistry[$0] }?.boundedHostText == true
+        let preserveASS = boundedText ? false : loadedOptions.preserveASSMarkup
         let sessionGeneration = loadGeneration
         secondarySidecarTask = Task { [weak self] in
             let result: SidecarDecodeResult
@@ -1670,7 +1677,7 @@ extension AetherEngine {
                 result = try await SubtitleDecoder.decodeFile(
                     url: url, httpHeaders: effectiveHeaders,
                     preserveASSMarkup: preserveASS,
-                    sourceStreamIndex: sourceStreamIndex)
+                    sourceStreamIndex: sourceStreamIndex, boundedText: boundedText)
             } catch {
                 EngineLog.emit("[AetherEngine] secondary sidecar decode failed: \(error)", category: .engine)
                 await MainActor.run {
@@ -1708,6 +1715,7 @@ extension AetherEngine {
 
     /// Disable primary subtitles, clear cues, cancel sidecar task + side demuxer, cancel multi-decode reader, clear native mov_text stores (#55, all-tracks). `nativeSubtitleTracks` is NOT cleared: the host needs the list to re-select after an audio/subtitle switch; only `stop()` / `load()` reset it.
     public func clearSubtitle() {
+        externalSubtitleIntentGeneration &+= 1
         hostExplicitSubtitleAction = true
         // AE#359: subtitles off ends the rendition poll. The renditions themselves stay listed, only
         // the fetching stops, so re-selecting the track starts fresh from the current window.
@@ -1776,6 +1784,7 @@ extension AetherEngine {
     /// Turn the secondary subtitle off and clear its cues. Tears down
     /// the secondary sidecar decode task and the secondary side reader.
     public func clearSecondarySubtitle() {
+        externalSubtitleIntentGeneration &+= 1
         hostExplicitSubtitleAction = true
         cancelSidecarTask(channel: .secondary)
         clearSubtitleDrainTarget(channel: .secondary, reason: .subtitlesCleared)   // #112 rework
