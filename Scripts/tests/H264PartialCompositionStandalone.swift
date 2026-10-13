@@ -62,8 +62,43 @@ struct H264PartialCompositionTests {
         print("PASS missing head: corroborated lead, variable slots, bounded forward reorder; invalid/ambiguous evidence refused")
     }
 
+    static func forwardProofChecks() {
+        let ranks = [0, 4, 2, 1, 3, 8, 6, 5, 7, 12, 10, 9]
+        let dts = (0..<12).map { Int64($0) * 3600 }
+        func proof(_ order: [Int] = ranks, slots: [Int64] = dts, lead: Int64 = 7200,
+                   depth: Int = 2) -> Int? {
+            Policy.provenForwardDepth(dts: slots, ranks: order, lead: lead, reorderDepth: depth)
+        }
+        precondition(proof() == 3)
+        precondition(proof(slots: dts.map { $0 + 63_000_000 }) == 3)
+        precondition(proof(lead: 3600) == nil)
+        precondition(proof(depth: 1) == nil)
+        precondition(proof(Array(ranks.prefix(11)), slots: Array(dts.prefix(11))) == nil)
+        precondition(proof(Array(0..<12)) == nil)
+        for bad in [-1, 0, 1000, Int.max] {
+            var order = ranks; order[4] = bad
+            precondition(proof(order) == nil)
+        }
+        // Unique bounded ranks can still omit a display slot: no complete prefix, no proof.
+        precondition(proof([0, 5, 3, 2, 4, 9, 7, 6, 8, 13, 11, 10]) == nil)
+        var repeated = dts; repeated[4] = repeated[3]
+        precondition(proof(slots: repeated) == nil)
+        var missing = dts; missing[4] = Int64.min
+        precondition(proof(slots: missing) == nil)
+        precondition(proof(slots: dts.map { Int64.max - 40000 + $0 }) == nil)
+        var ladder = Policy.SlotLadder()
+        for value in dts { precondition(ladder.append(dts: value)) }
+        precondition(ladder.claim(rank: 4, decodeIndex: 1, lead: 7200, reorderDepth: 2) == .refuse)
+        precondition(ladder.refusalReason == "forward_wait_depth_exceeded")
+        precondition(ladder.claim(rank: 4, decodeIndex: 1, lead: 7200, reorderDepth: 2, forwardDepth: 3) == .time(21600))
+        precondition(ladder.claim(rank: 4, decodeIndex: 1, lead: 7200, reorderDepth: 2, forwardDepth: 3) == .refuse)
+        precondition(ladder.refusalReason == "duplicate_display_rank")
+        print("PASS partial forward proof: complete prefix, asymmetric depth, exact slot, invalid evidence refused")
+    }
+
     static func main() {
         missingHeadChecks()
+        forwardProofChecks()
         let expected = pocs.map { slots[Int($0 / 2)] + lead }
         let plain = run()
         precondition(!plain.refused)

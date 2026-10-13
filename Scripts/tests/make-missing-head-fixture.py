@@ -14,8 +14,25 @@ import subprocess
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('output', type=Path)
+parser.add_argument('--partial-hierarchical', action='store_true', help='Generate healthy/tail/middle B3 twins for the partial-region path')
 args = parser.parse_args()
 args.output.mkdir(parents=True, exist_ok=True)
+if args.partial_hierarchical:
+    healthy = args.output / 'healthy-b3.mp4'
+    subprocess.run([
+        'ffmpeg', '-hide_banner', '-loglevel', 'error', '-n',
+        '-f', 'lavfi', '-i', 'color=c=blue:s=96x64:r=25:d=24',
+        '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=24',
+        '-c:v', 'libx264', '-preset', 'fast', '-pix_fmt', 'yuv420p', '-g', '49', '-bf', '3',
+        '-x264-params', 'scenecut=0:b-adapt=0', '-c:a', 'aac', '-video_track_timescale', '90000',
+        '-metadata', 'comment=Aether synthetic timestamp fixture', '-movflags', '+faststart', str(healthy),
+    ], check=True)
+    # 49-picture GOPs align the IDR boundaries with ctts runs; mutate offsets only.
+    for mode in ('tail', 'middle'):
+        subprocess.run(['ruby', str(Path(__file__).with_name('make-partial-ctts-fixture.rb')),
+                        str(healthy), str(args.output / (mode + '-b3.mp4')), mode, '196', '392', '600'], check=True)
+    raise SystemExit(0)
+
 healthy = args.output / 'healthy-head.mp4'
 missing = args.output / 'missing-head.mp4'
 if healthy.exists() or missing.exists():

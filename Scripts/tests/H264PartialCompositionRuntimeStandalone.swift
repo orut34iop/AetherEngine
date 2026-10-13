@@ -54,6 +54,7 @@ struct H264PartialCompositionRuntimeTests {
     enum Failure: Error { case open, decoder, demux, decode, session, boundedRead }
     static func main() throws {
         guard CommandLine.arguments.count >= 2 else { throw Failure.open }
+        EngineLog.handler = { FileHandle.standardError.write(Data(($0 + "\n").utf8)) }
         av_log_set_level(AV_LOG_QUIET)
         var format: UnsafeMutablePointer<AVFormatContext>?
         guard avformat_open_input(&format, CommandLine.arguments[1], nil, nil) >= 0, let format else { throw Failure.open }
@@ -62,6 +63,7 @@ struct H264PartialCompositionRuntimeTests {
         let index = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0)
         guard index >= 0, let stream = format.pointee.streams[Int(index)],
               let par = stream.pointee.codecpar, par.pointee.codec_id == AV_CODEC_ID_H264 else { throw Failure.open }
+        let twinPTS = try ProcessInfo.processInfo.environment["AETHER_TIMESTAMP_HEALTHY_TWIN"].map(referenceTimes)
         let name = format.pointee.iformat.flatMap { $0.pointee.name }.map(String.init(cString:)) ?? ""
         let matroska = name.contains("matroska")
         guard !matroska else { throw Failure.session }
@@ -96,6 +98,9 @@ struct H264PartialCompositionRuntimeTests {
                     precondition(actual.duration == expected.duration && actual.flags == expected.flags)
                     precondition(actual.position == expected.position && actual.streamIndex == expected.streamIndex)
                     precondition(actual.dts == expected.dts, "partial repair must preserve the published decode/index axis")
+                    if let twinPTS {
+                        precondition(twinPTS[actual.dts] == actual.pts, "repaired video PTS must exactly match its healthy twin")
+                    }
                     try decode(fixed, packet: packet, into: &fixedPTS)
                 } else { precondition(actual == expected) }
                 delivered += 1
@@ -148,6 +153,29 @@ struct H264PartialCompositionRuntimeTests {
         if positions.count > 1 {
             try lifecycleChecks(session: session, format: format, stream: stream, index: index, position: positions[1])
         }
+    }
+
+    /// Optional generated healthy twin checks exact timestamps, beyond monotonic decoded output.
+    static func referenceTimes(_ path: String) throws -> [Int64: Int64] {
+        var input: UnsafeMutablePointer<AVFormatContext>?
+        guard avformat_open_input(&input, path, nil, nil) >= 0, let input else { throw Failure.open }
+        defer { var owned: UnsafeMutablePointer<AVFormatContext>? = input; avformat_close_input(&owned) }
+        guard avformat_find_stream_info(input, nil) >= 0 else { throw Failure.open }
+        let index = av_find_best_stream(input, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0)
+        guard index >= 0 else { throw Failure.open }
+        var result: [Int64: Int64] = [:]
+        while true {
+            guard let packet = trackedPacketAlloc() else { throw Failure.demux }
+            defer { av_packet_free_safe(packet) }
+            let status = av_read_frame(input, packet)
+            if status == -541478725 { break }
+            guard status >= 0 else { throw Failure.demux }
+            if packet.pointee.stream_index == index {
+                precondition(result.count < 8000 && result[packet.pointee.dts] == nil)
+                result[packet.pointee.dts] = packet.pointee.pts
+            }
+        }
+        return result
     }
 
     static func lifecycleChecks(session: H264CompositionOffsetRepairSession,

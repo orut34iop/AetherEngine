@@ -26,6 +26,10 @@ final class H264PartialCompositionRepairSession {
     private let reorderDepth: Int
     private var missingHead = false
     private var forwardDepth: Int?
+    // Numeric evidence only, capped independently of interleaved packet/byte budgets.
+    private var proofDTS: [Int64] = []
+    private var proofRanks: [Int] = []
+    private var forwardProofs = 0
     private let framing: VideoNALFraming
     private let reader: H264PictureOrderReader
     private var pending: [Entry] = []
@@ -113,16 +117,20 @@ final class H264PartialCompositionRepairSession {
             inSequence = true
         }
         if abandoned { unrepairedCount += 1; return handBack(packet) }
-        guard !missing, ladder.append(dts: packet.pointee.dts) else { return failOpen(with: packet) }
+        guard !missing, ladder.append(dts: packet.pointee.dts) else { return failOpen(with: packet, cause: "missing_or_nonincreasing_dts") }
         let poc = reader.pictureOrderCount(for: packet)
         // Complete, closed, progressive sequences only. Fields, open-GOP leading pictures and a
         // parser that cannot read an order are not guessed at.
         guard let poc, reader.isFramePicture, poc >= 0, poc % 2 == 0,
               decodeIndex > 0 || poc == 0,
               packet.pointee.flags & AV_PKT_FLAG_KEY == 0 || (idr && poc == 0)
-        else { return failOpen(with: packet) }
+        else { return failOpen(with: packet, cause: "unsupported_picture_order") }
         let rank = Int(poc / 2)
         if rank != decodeIndex { sequenceReordered = true }
+        if !missingHead && proofRanks.count < H264PartialCompositionRepair.maximumProofPictures {
+            proofDTS.append(packet.pointee.dts)
+            proofRanks.append(rank)
+        }
         append(packet, rank: rank)
         decodeIndex += 1
         drain()
@@ -136,13 +144,34 @@ final class H264PartialCompositionRepairSession {
         guard confirmed || sequenceReordered else { return }
         while let first = pending.first {
             guard let rank = first.rank else { promoteFirst(); continue }
+            if !missingHead, forwardDepth == nil, rank - first.decodeIndex > reorderDepth {
+                // Keep the existing fast path for ordinary mini-GOPs. Only an anchor beyond the
+                // old symmetric allowance waits for bounded, complete-prefix evidence.
+                if let depth = H264PartialCompositionRepair.provenForwardDepth(
+                    dts: proofDTS, ranks: proofRanks, lead: lead, reorderDepth: reorderDepth),
+                    rank - first.decodeIndex <= depth {
+                    forwardDepth = depth
+                    forwardProofs += 1
+                    if forwardProofs <= 8 {
+                        EngineLog.emit("[Demuxer] H264 slot forward wait proven: rank=\(rank)"
+                            + " decode_index=\(first.decodeIndex) samples=\(proofRanks.count)"
+                            + " reorder_depth=\(reorderDepth) forward_depth=\(depth)", category: .demux)
+                    }
+                } else if proofRanks.count < H264PartialCompositionRepair.maximumProofPictures {
+                    deepestWait = max(deepestWait, pending.count)
+                    return
+                } else {
+                    failOpen(cause: "forward_prefix_unproven")
+                    return
+                }
+            }
             switch ladder.claim(rank: rank, decodeIndex: first.decodeIndex, lead: lead,
                                 reorderDepth: reorderDepth, forwardDepth: forwardDepth) {
             case .wait:
                 deepestWait = max(deepestWait, pending.count)
                 return
             case .refuse:
-                failOpen()
+                failOpen(cause: ladder.refusalReason)
                 return
             case .time(let pts):
                 first.packet.pointee.pts = pts
@@ -178,19 +207,26 @@ final class H264PartialCompositionRepairSession {
         if pending.count >= H264PartialCompositionRepair.maximumHeldPackets
             || bytes >= H264PartialCompositionRepair.maximumHeldBytes
             || (!confirmed && !sequenceReordered && decodeIndex > H264PartialCompositionRepair.maximumProofPictures) {
-            failOpen()
+            failOpen(cause: "packet_byte_or_proof_limit")
         }
     }
 
     /// Hands every held packet back untouched and lets the rest of this sequence stream through.
     /// The next IDR starts a new candidate; nothing about the session is given up.
     @discardableResult
-    private func failOpen(with packet: UnsafeMutablePointer<AVPacket>? = nil) -> Bool {
+    private func failOpen(with packet: UnsafeMutablePointer<AVPacket>? = nil, cause: String) -> Bool {
         unrepairedCount += pending.filter { $0.packet.pointee.stream_index == streamIndex }.count
         if let packet, packet.pointee.stream_index == streamIndex { unrepairedCount += 1 }
         if !abandoned, inSequence {
             abandoned = true
             abandonedSequences += 1
+            // One bounded diagnostic per refused sequence; never log payloads or source URLs.
+            if abandonedSequences <= 8 {
+                EngineLog.emit("[Demuxer] H264 slot repair refused: cause=\(cause)"
+                    + " rank=\(pending.first?.rank ?? -1) decode_index=\(pending.first?.decodeIndex ?? decodeIndex)"
+                    + " samples=\(decodeIndex) reorder_depth=\(reorderDepth) forward_depth=\(forwardDepth ?? reorderDepth)"
+                    + " presentation_lead=\(lead) held_packets=\(pending.count) held_bytes=\(bytes)", category: .demux)
+            }
             if reason == confirmedReason {
                 reason = "partial_composition_sequence_unproven_after_repair"
             } else {
@@ -212,7 +248,7 @@ final class H264PartialCompositionRepairSession {
     private func closeSequence() {
         drain()
         // Anything still waiting is waiting for a slot this sequence never carried.
-        if !pending.isEmpty { failOpen() }
+        if !pending.isEmpty { failOpen(cause: "incomplete_sequence") }
         resetSequence()
     }
 
@@ -222,6 +258,9 @@ final class H264PartialCompositionRepairSession {
         inSequence = false
         sequenceReordered = false
         abandoned = false
+        proofDTS.removeAll(keepingCapacity: true)
+        proofRanks.removeAll(keepingCapacity: true)
+        if !missingHead { forwardDepth = nil }
     }
 
     private func publishPending() {
@@ -259,7 +298,7 @@ final class H264PartialCompositionRepairSession {
 
     var summary: String {
         "reason=\(reason) repaired=\(repairedCount) abandoned_sequences=\(abandonedSequences)"
-            + " deepest_wait=\(deepestWait) reorder_depth=\(reorderDepth)"
+            + " deepest_wait=\(deepestWait) reorder_depth=\(reorderDepth) forward_proofs=\(forwardProofs)"
             + " presentation_lead=\(lead) decode_offset=0"
     }
 
