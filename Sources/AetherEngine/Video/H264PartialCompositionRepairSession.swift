@@ -24,6 +24,8 @@ final class H264PartialCompositionRepairSession {
     private let timeBase: AVRational
     private let lead: Int64
     private let reorderDepth: Int
+    private var missingHead = false
+    private var forwardDepth: Int?
     private let framing: VideoNALFraming
     private let reader: H264PictureOrderReader
     private var pending: [Entry] = []
@@ -56,7 +58,21 @@ final class H264PartialCompositionRepairSession {
     }
 
     deinit { releasePackets() }
-    var hasDecision: Bool { reason != "composition_offsets_present" }
+    var hasDecision: Bool { missingHead || reason != "composition_offsets_present" }
+
+    /// Only the parent's head proof enables this. Healthy-head behavior is unchanged.
+    func enableMissingHead(forwardDepth: Int, firstPacket: UnsafeMutablePointer<AVPacket>) -> Bool {
+        precondition(!inSequence && pending.isEmpty && ready.isEmpty)
+        guard isIDR(firstPacket) else { return false }
+        missingHead = true
+        self.forwardDepth = forwardDepth
+        reason = "missing_composition_offsets_pending"
+        return true
+    }
+
+    private var confirmedReason: String {
+        missingHead ? "confirmed_missing_composition_offsets" : "confirmed_partial_composition_offsets"
+    }
 
     private func isIDR(_ packet: UnsafeMutablePointer<AVPacket>) -> Bool {
         guard packet.pointee.flags & AV_PKT_FLAG_KEY != 0,
@@ -120,7 +136,8 @@ final class H264PartialCompositionRepairSession {
         guard confirmed || sequenceReordered else { return }
         while let first = pending.first {
             guard let rank = first.rank else { promoteFirst(); continue }
-            switch ladder.claim(rank: rank, decodeIndex: first.decodeIndex, lead: lead, reorderDepth: reorderDepth) {
+            switch ladder.claim(rank: rank, decodeIndex: first.decodeIndex, lead: lead,
+                                reorderDepth: reorderDepth, forwardDepth: forwardDepth) {
             case .wait:
                 deepestWait = max(deepestWait, pending.count)
                 return
@@ -132,9 +149,9 @@ final class H264PartialCompositionRepairSession {
                 repairedCount += 1
                 if !confirmed {
                     confirmed = true
-                    reason = "confirmed_partial_composition_offsets"
+                    reason = confirmedReason
                     EngineLog.emit(
-                        "[Demuxer] partial H264 composition offsets confirmed: reorder_depth=\(reorderDepth)"
+                        "[Demuxer] H264 slot composition offsets confirmed: kind=\(confirmedReason) reorder_depth=\(reorderDepth)"
                         + " presentation_lead=\(lead) decode_offset=0 time_base=\(timeBase.num)/\(timeBase.den)",
                         category: .demux
                     )
@@ -174,7 +191,7 @@ final class H264PartialCompositionRepairSession {
         if !abandoned, inSequence {
             abandoned = true
             abandonedSequences += 1
-            if reason == "confirmed_partial_composition_offsets" {
+            if reason == confirmedReason {
                 reason = "partial_composition_sequence_unproven_after_repair"
             } else {
                 reason = "partial_composition_sequence_unproven"
@@ -230,7 +247,7 @@ final class H264PartialCompositionRepairSession {
         reader.reset()
         resetSequence()
         confirmed = false
-        reason = "composition_offsets_present"
+        reason = missingHead ? "missing_composition_offsets_pending" : "composition_offsets_present"
     }
 
     private func releasePackets() {
@@ -249,12 +266,13 @@ final class H264PartialCompositionRepairSession {
     /// Preserve the host's structured diagnostics while using upstream's streaming slot ladder.
     func diagnostic(sourceSeekable: Bool, isISOBaseMediaFile: Bool, isH264: Bool)
         -> H264CompositionOffsetRepairDiagnostic {
-        let repairing = reason == "confirmed_partial_composition_offsets"
+        let repairing = reason == confirmedReason
         let healthy = reason == "composition_offsets_present"
+        let pendingHead = reason == "missing_composition_offsets_pending"
         return H264CompositionOffsetRepairDiagnostic(
-            outcome: repairing ? .repairing : (healthy ? .healthy : .inconclusive),
-            reason: repairing ? .confirmedPartialCompositionOffsets
-                : (healthy ? .compositionOffsetsPresent : .partialCompositionSequenceUnproven),
+            outcome: repairing ? .repairing : (healthy ? .healthy : (pendingHead ? .sampling : .inconclusive)),
+            reason: repairing ? (missingHead ? .confirmedMissingOffsets : .confirmedPartialCompositionOffsets)
+                : (healthy ? .compositionOffsetsPresent : (pendingHead ? .sampling : .partialCompositionSequenceUnproven)),
             sourceSeekable: sourceSeekable, isISOBaseMediaFile: isISOBaseMediaFile,
             isH264: isH264, videoDelay: reorderDepth, sampleCount: decodeIndex,
             heldPacketCount: pending.count + ready.count - readyIndex, heldBytes: bytes,

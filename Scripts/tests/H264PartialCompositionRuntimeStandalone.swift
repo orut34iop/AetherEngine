@@ -120,10 +120,10 @@ struct H264PartialCompositionRuntimeTests {
                     try decode(raw, packet: packet, into: &rawPTS)
                 }
                 if !session.ingest(packet) { try emit(packet) }
-                observedRepair = observedRepair || session.summary.contains("confirmed_partial_composition_offsets")
-                if session.summary.contains("confirmed_partial_composition_offsets") {
+                observedRepair = observedRepair || (session.summary.contains("confirmed_partial_composition_offsets") || session.summary.contains("confirmed_missing_composition_offsets"))
+                if (session.summary.contains("confirmed_partial_composition_offsets") || session.summary.contains("confirmed_missing_composition_offsets")) {
                     let snapshot = session.diagnostic(sourceSeekable: true, isISOBaseMediaFile: true, isH264: true)
-                    precondition(snapshot.reason == .confirmedPartialCompositionOffsets)
+                    precondition(snapshot.reason == .confirmedPartialCompositionOffsets || snapshot.reason == .confirmedMissingOffsets)
                     precondition(snapshot.outcome == .repairing && snapshot.repairedPictures > 0)
                 }
             }
@@ -135,7 +135,7 @@ struct H264PartialCompositionRuntimeTests {
             let rawRegressions = zip(rawPTS, rawPTS.dropFirst()).filter { $1 <= $0 }.count
             let fixedRegressions = zip(fixedPTS, fixedPTS.dropFirst()).filter { $1 <= $0 }.count
             let diagnostic = session.summary
-            observedRepair = observedRepair || diagnostic.contains("confirmed_partial_composition_offsets")
+            observedRepair = observedRepair || (diagnostic.contains("confirmed_partial_composition_offsets") || diagnostic.contains("confirmed_missing_composition_offsets"))
             FileHandle.standardError.write(Data("MEASURE seek=\(position) raw=\(rawRegressions) fixed=\(fixedRegressions) offset=\(session.decodeTimestampOffset ?? 0) state=\(diagnostic) lead=\(0) shift=\(0)\n".utf8))
             precondition(rawPTS.count == fixedPTS.count && !fixedPTS.isEmpty)
             precondition(fixedRegressions == 0)
@@ -177,7 +177,7 @@ struct H264PartialCompositionRuntimeTests {
             var confirmed = false
             for _ in 0..<4000 {
                 try read()
-                if session.summary.contains("confirmed_partial_composition_offsets") { confirmed = true; break }
+                if (session.summary.contains("confirmed_partial_composition_offsets") || session.summary.contains("confirmed_missing_composition_offsets")) { confirmed = true; break }
             }
             precondition(confirmed)
             guard let packet = trackedPacketAlloc() else { throw Failure.demux }

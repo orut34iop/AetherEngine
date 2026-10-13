@@ -32,7 +32,38 @@ struct H264PartialCompositionTests {
         return (times, deepest, !queue.isEmpty)
     }
 
+    static func missingHeadChecks() {
+        let ticks: [Int64] = [-48000, 0, 48000, 96000, 144000, 192000, 240000, 288000, 336000, 384000, 424040, 464080]
+        let order: [Int64] = [0, 6, 2, 4, 12, 8, 10, 18, 14, 16, 22, 20]
+        let keys = [true] + Array(repeating: false, count: 11)
+        func proof(_ dts: [Int64] = ticks, pts: [Int64]? = nil, pocs: [Int64] = order,
+                   start: Int64 = 0, origin: Int64 = -48000, depth: Int = 1) -> Int? {
+            Policy.missingHeadForwardDepth(dts: dts, pts: pts ?? dts, pocs: pocs, keys: keys,
+                streamStart: start, ladderStart: origin, reorderDepth: depth)
+        }
+        precondition(proof() == 2) // Forward-coded P differs from backward reorder lead.
+        precondition(proof(start: -48000) == nil)
+        precondition(proof(start: 1) == nil)
+        precondition(proof(origin: 0) == nil)
+        precondition(proof(depth: 0) == nil)
+        precondition(proof(depth: 17) == nil)
+        precondition(proof(pocs: Array(stride(from: Int64(0), to: 24, by: 2))) == nil)
+        for bad: Int64 in [-1, 3, 6, 1000, Int64.max] {
+            var changed = order; changed[4] = bad
+            precondition(proof(pocs: changed) == nil)
+        }
+        var offset = ticks; offset[3] += 1
+        precondition(proof(pts: offset) == nil)
+        var flat = ticks; flat[3] = flat[2]
+        precondition(proof(flat) == nil)
+        var missing = ticks; missing[3] = Int64.min
+        precondition(proof(missing) == nil)
+        precondition(proof(Array(ticks.prefix(11))) == nil)
+        print("PASS missing head: corroborated lead, variable slots, bounded forward reorder; invalid/ambiguous evidence refused")
+    }
+
     static func main() {
+        missingHeadChecks()
         let expected = pocs.map { slots[Int($0 / 2)] + lead }
         let plain = run()
         precondition(!plain.refused)

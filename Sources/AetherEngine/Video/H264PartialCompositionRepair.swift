@@ -23,6 +23,48 @@ enum H264PartialCompositionRepair {
     /// that reorders at all shows it within its reorder delay; this is slack, not a policy.
     static let maximumProofPictures = 64
 
+    /// A missing-offset head has no healthy packet to corroborate its lead. Require
+    /// the container start/index distance to equal the observed reorder head, then
+    /// dry-run the existing slots. Never fit an average rate to variable timestamps.
+    static func missingHeadForwardDepth(
+        dts: [Int64], pts: [Int64], pocs: [Int64], keys: [Bool],
+        streamStart: Int64, ladderStart: Int64, reorderDepth: Int
+    ) -> Int? {
+        guard dts.count >= 12, dts.count <= maximumProofPictures,
+              pts.count == dts.count, pocs.count == dts.count, keys.count == dts.count,
+              (1...maximumReorderDepth).contains(reorderDepth), reorderDepth < dts.count,
+              streamStart != Int64.min, ladderStart != Int64.min,
+              dts.first == ladderStart, keys.first == true, pocs.first == 0,
+              !keys.dropFirst().contains(true), pts == dts else { return nil }
+        let (lead, overflow) = streamStart.subtractingReportingOverflow(ladderStart)
+        let (observed, headOverflow) = dts[reorderDepth].subtractingReportingOverflow(ladderStart)
+        guard !overflow, !headOverflow, lead > 0, lead == observed else { return nil }
+        var ladder = SlotLadder()
+        for timestamp in dts { guard ladder.append(dts: timestamp) else { return nil } }
+        var ranks: [Int] = []
+        for poc in pocs {
+            guard poc >= 0, poc % 2 == 0, poc / 2 < Int64(maximumPictures) else { return nil }
+            ranks.append(Int(poc / 2))
+        }
+        guard Set(ranks).count == ranks.count,
+              zip(ranks, ranks.dropFirst()).contains(where: { $1 < $0 }) else { return nil }
+        var high = 0
+        var closedPrefix = false
+        var forward = reorderDepth
+        for (index, rank) in ranks.enumerated() {
+            high = max(high, rank)
+            if index >= 8, high == index { closedPrefix = true }
+            guard index - rank <= reorderDepth, rank - index <= maximumReorderDepth else { return nil }
+            forward = max(forward, rank - index)
+        }
+        guard closedPrefix else { return nil }
+        for (index, rank) in ranks.enumerated() {
+            if ladder.claim(rank: rank, decodeIndex: index, lead: lead,
+                            reorderDepth: reorderDepth, forwardDepth: forward) == .refuse { return nil }
+        }
+        return forward
+    }
+
     enum Claim: Equatable {
         /// The slot is still ahead of the reader. The picture waits, and so does everything
         /// behind it, because the container's own order is what leaves this demuxer.
@@ -52,9 +94,13 @@ enum H264PartialCompositionRepair {
 
         /// The presentation time the picture at `decodeIndex` owns, given its display `rank`.
         /// `.wait` while its slot is still ahead of the reader, which is the mini-GOP.
-        mutating func claim(rank: Int, decodeIndex: Int, lead: Int64, reorderDepth: Int) -> Claim {
+        mutating func claim(rank: Int, decodeIndex: Int, lead: Int64, reorderDepth: Int,
+                            forwardDepth: Int? = nil) -> Claim {
+            let forward = forwardDepth ?? reorderDepth
             guard lead > 0, rank >= 0, decodeIndex >= 0, decodeIndex < slots.count,
-                  abs(rank - decodeIndex) <= reorderDepth, rank < Self.limit else { return .refuse }
+                  (1...H264PartialCompositionRepair.maximumReorderDepth).contains(forward),
+                  decodeIndex - rank <= reorderDepth, rank - decodeIndex <= forward,
+                  rank < Self.limit else { return .refuse }
             guard rank < slots.count else { return .wait }
             // One slot, one picture. A rank claimed twice is a sequence this policy cannot own.
             guard !claimed[rank] else { return .refuse }
