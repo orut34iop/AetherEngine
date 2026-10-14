@@ -12,7 +12,8 @@ public struct SoftwarePathEscalationEvent: Sendable, Equatable {
     /// The failure the rebuild absorbed. `kind` is `.nativeItemFailed`; a failure the engine
     /// inferred from a frozen position across its own revives carries no underlying code.
     public let absorbedFailure: PlaybackErrorInfo
-    /// Where the session was when the native path gave up, in seconds.
+    /// Where the session was when the native path gave up, in seconds: the position the rebuild
+    /// resumes at, which during a mount is the one the mount was handed rather than AVPlayer's clock.
     public let positionSeconds: Double
     /// True when a `load()` was still waiting on this session's startup. That `load()` keeps waiting
     /// across the rebuild and returns when the rebuilt session is up, instead of throwing the
@@ -91,10 +92,18 @@ enum SoftwarePathEscalation {
     struct Takeover {
         let supersededGeneration: UInt64
         let rebuild: Task<Void, Error>
+        /// The claim runs immediately before the rebuild's own `stopInternal`, which moves the generation by one.
+        var rebuildGeneration: UInt64 { supersededGeneration &+ 1 }
     }
 
     /// The domain of a media failure, i.e. AVFoundation could not make sense of what it was served.
     static let mediaErrorDomain = "CoreMediaErrorDomain"
+
+    /// AE#627: a live join that read video for the whole keyframe wait and found no picture the native
+    /// route can open a segment on (a feed without IDRs or recovery points, or with gradual refresh
+    /// only). Like a CoreMedia failure it is a verdict on the media, and libavcodec starts on such a
+    /// stream by decoding through it.
+    static let liveJoinErrorDomain = "AetherEngine.LiveJoin"
 
     /// Whether a failed native item is worth handing to the engine's own decoder.
     ///
@@ -111,6 +120,6 @@ enum SoftwarePathEscalation {
         guard availability.preferredDecodePath == .automatic else { return false }
         // The bypass has no local muxer and decodes nothing here, so #461 ignores the option anyway.
         guard !availability.nativeRemoteHLS else { return false }
-        return errorDomain == mediaErrorDomain
+        return errorDomain == mediaErrorDomain || errorDomain == liveJoinErrorDomain
     }
 }

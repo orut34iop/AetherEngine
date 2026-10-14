@@ -41,6 +41,14 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
     private var reportedProducerQoS: qos_class_t = QOS_CLASS_USER_INITIATED
     /// Consumer threads currently parked in `read()`. Producer-visible, under `condition`.
     private var waitingConsumers = 0
+    /// True while the producer sits in its park wait, under `condition`. A reader on another thread
+    /// only gets the lock while the producer is inside `wait()`, so a true read PROVES the park; a
+    /// counter that stopped moving for a while only suggests it, and a loaded machine breaks that.
+    private var producerParked = false
+    var producerParkedForTesting: Bool {
+        condition.lock(); defer { condition.unlock() }
+        return producerParked
+    }
     private var consumerWaitEvents: UInt64 = 0
     private var consumerBlockedSeconds: Double = 0
     private var lastStarvationLog: DispatchTime?
@@ -67,6 +75,8 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
     private var consumedVideoSeconds: Double?
     private var videoCoverage: SoftwarePacketCoverage
     private var audioCoverage: SoftwarePacketCoverage
+    /// Newest audio timestamp stored this epoch, for duration-less packets.
+    private var lastAudioPTS: Int64?
     private var presentationCoverage: SoftwareVideoPacketCoverage?
     private struct Keyframe {
         let seconds: Double
@@ -260,8 +270,9 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
     /// does not hold yet, and the frame before it is the wrong answer. The consumer cursor is not
     /// touched, so playback reads on from where it stood.
     func stillRun(atSeconds seconds: Double, maxPackets: Int, maxSpanSeconds: Double,
-                  reorderTail: Int) -> [SoftwareStoredPacket]? {
-        guard seconds.isFinite, maxPackets > 0 else { return nil }
+                  reorderTail: Int, isCancelled: (() -> Bool)? = nil) -> [SoftwareStoredPacket]? {
+        guard seconds.isFinite, maxPackets > 0, isCancelled?() != true else { return nil }
+        let deadline = ContinuousClock.now.advanced(by: .milliseconds(750))
         condition.lock()
         let eligible = !closed && !sourceRepositioning && !resetPending && failure == nil
             && (frontierLocked(at: seconds).map { $0 > seconds } ?? false)
@@ -276,6 +287,9 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         var overflow = false
         do {
             try fifo.readHistory(from: anchor.cursor) { data in
+                if isCancelled?() == true || (isCancelled != nil && ContinuousClock.now >= deadline) {
+                    overflow = true; return false
+                }
                 let packet = try SoftwareStoredPacket.decode(data)
                 guard packet.streamIndex == video.index else { return true }
                 if run.isEmpty, packet.flags & 1 == 0 { overflow = true; return false }
@@ -294,7 +308,7 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         } catch {
             return nil
         }
-        guard reached, !overflow else { return nil }
+        guard reached, !overflow, isCancelled?() != true else { return nil }
         return run
     }
 
@@ -422,6 +436,7 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         ended = false; failure = nil
         videoCoverage.reset(); audioCoverage.reset(); presentationCoverage?.reset()
         storedVideoSeconds = nil; consumedVideoSeconds = nil
+        lastAudioPTS = nil
         keyframes.removeAll(keepingCapacity: true)
         residency = SoftwarePacketResidency()
     }
@@ -452,8 +467,10 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         while true {
             condition.lock()
             while !closed && !resetPending && (sourceRepositioning || ended || failure != nil || shouldParkLocked()) {
+                producerParked = true
                 condition.wait()
             }
+            producerParked = false
             if closed { condition.unlock(); return }
             let token = sourceEpoch
             let reset = resetPending
@@ -544,7 +561,7 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
                             if audioCoverage.isFull, let tick = playheadTick(audio) {
                                 audioCoverage.prune(before: tick)
                             }
-                            audioCoverage.insert(pts: packet.pts, duration: packet.duration)
+                            insertAudioCoverageLocked(pts: packet.pts, duration: packet.duration, stream: audio)
                         }
                     }
                     condition.broadcast()
@@ -553,6 +570,29 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
             }
             operations.unlock()
         } catch { recordFailure(error, token: token) }
+    }
+
+    /// Widest gap between two duration-less audio packets that still counts as contiguous. Real
+    /// frame spacing is 0.8 ms (TrueHD) to ~100 ms (long AAC/Vorbis frames); a larger gap is a hole.
+    static let maxAudioSuccessorGapSeconds = 0.5
+
+    /// Audio arrives in presentation order, so a packet without a duration still proves coverage up
+    /// to the next packet's timestamp. Matroska TrueHD is the case that needs it: no packet carries
+    /// a duration and the millisecond timestamps repeat (0.83 ms frames), so the duration model
+    /// rejected every packet, the A/V frontier stayed nil, and no seek ever hit the cache: each one,
+    /// even back to a spot just played, refetched from the source.
+    private func insertAudioCoverageLocked(pts: Int64, duration: Int64, stream: Stream) {
+        guard pts != Int64.min else { return }
+        let previous = lastAudioPTS
+        if previous.map({ pts > $0 }) ?? true { lastAudioPTS = pts }
+        if duration > 0 {
+            audioCoverage.insert(pts: pts, duration: duration)
+            return
+        }
+        guard let previous, pts > previous, stream.numerator > 0, stream.denominator > 0,
+              Double(pts - previous) * Double(stream.numerator) / Double(stream.denominator)
+                <= Self.maxAudioSuccessorGapSeconds else { return }
+        audioCoverage.insert(pts: previous, duration: pts - previous)
     }
 
     private func shouldParkLocked() -> Bool {

@@ -7,7 +7,9 @@ import Foundation
 import Testing
 @testable import AetherEngine
 
-@Suite("Software-path escalation (AE#561)")
+// Serialized: several tests park a load's reader on a cooperative-pool thread until the test
+// releases it, and the release itself needs a pool thread (see BackgroundDecisionWaitsForLoadTests).
+@Suite("Software-path escalation (AE#561)", .serialized)
 struct SoftwarePathEscalationTests {
 
     private static func availability(
@@ -92,7 +94,8 @@ struct SoftwarePathEscalationTests {
         let escalation = Task { @MainActor in
             await engine.escalateToSoftwarePath(SoftwarePathEscalation.Request(
                 domain: SoftwarePathEscalation.mediaErrorDomain, code: 0,
-                message: "item death at a frozen position", positionSeconds: 0))
+                message: "item death at a frozen position", positionSeconds: 0),
+                expectedGeneration: engine.loadGeneration)
         }
         // The rebuild's probe is parked on the origin, so the stop lands inside the load.
         try await waitFor { origin.blocked.entered }
@@ -132,7 +135,7 @@ struct SoftwarePathEscalationTests {
         let sub = engine.softwarePathEscalations.sink { events.append($0) }
         defer { sub.cancel() }
 
-        await engine.escalateToSoftwarePath(Self.mediaFailure)
+        await engine.escalateToSoftwarePath(Self.mediaFailure, expectedGeneration: engine.loadGeneration)
 
         #expect(events.isEmpty)
         #expect(!engine.softwarePathEscalationBudget.isSpent)
@@ -141,18 +144,23 @@ struct SoftwarePathEscalationTests {
 
     /// The ask's second form. Measured by the reporter: a host that heard only `videoRoute` could not
     /// tell the rescue from a routing decision.
-    @Test("A taken rung publishes the failure it absorbed", .timeLimit(.minutes(2)))
+    @Test("A taken rung publishes the failure it absorbed, at the position the rebuild resumes", .timeLimit(.minutes(2)))
     @MainActor
     func takenRungIsPublished() async throws {
         let origin = try ProbeHTTPTestOrigin(data: ProbeTestFixtures.hdr10Plus(), stage: .headers)
         defer { origin.stop() }
         let engine = try AetherEngine()
         engine.loadedURL = try #require(URL(string: "http://127.0.0.1:\(origin.port)/source.mkv"))
+        // AE#629 round 3, measured by the reporter: a mount raised by a load() of the host's own was
+        // refused while AVPlayer's clock read 12.00 s, the start of the segment under the 15.90 s the
+        // load was handed. The rebuild resumed at 15.90 s and the event said 12.00 s.
+        engine.state = .loading
+        engine.positionUnderReconstruction = 15.9
         var events: [SoftwarePathEscalationEvent] = []
         let sub = engine.softwarePathEscalations.sink { events.append($0) }
         defer { sub.cancel() }
 
-        let escalation = Task { @MainActor in await engine.escalateToSoftwarePath(Self.mediaFailure) }
+        let escalation = Task { @MainActor in await engine.escalateToSoftwarePath(Self.mediaFailure, expectedGeneration: engine.loadGeneration) }
         try await waitFor { origin.blocked.entered }
         engine.stop()
         origin.stop()
@@ -162,8 +170,29 @@ struct SoftwarePathEscalationTests {
             absorbedFailure: PlaybackErrorInfo(
                 kind: .nativeItemFailed, message: "item death at a frozen position",
                 underlyingDomain: "CoreMediaErrorDomain", underlyingCode: -19602),
-            positionSeconds: 12,
+            positionSeconds: 15.9,
             duringStartup: false)])
+    }
+
+    /// Reported as a code reading on AE#629: a rebuild whose load failed after its teardown had
+    /// already published that failure, and the rung then published the absorbed one on top, so the
+    /// host saw two `.error`s for one failure and the second contradicted what `load()` threw.
+    @Test("A rebuild that fails after its teardown surfaces one failure, its own", .timeLimit(.minutes(2)))
+    @MainActor
+    func failedRebuildSurfacesOnce() async throws {
+        let engine = try AetherEngine()
+        // A port nothing listens on: the rebuild tears the session down and its open is refused.
+        engine.loadedURL = try #require(URL(string: "http://127.0.0.1:9/source.mkv"))
+        var errors: [PlaybackErrorInfo?] = []
+        let sub = engine.$state.sink { state in
+            if case .error = state { errors.append(engine.errorInfo) }
+        }
+        defer { sub.cancel() }
+
+        await engine.escalateToSoftwarePath(Self.mediaFailure, expectedGeneration: engine.loadGeneration)
+
+        #expect(errors.count == 1)
+        #expect(errors.first??.kind != .nativeItemFailed)
     }
 
     /// A custom source whose first read parks until the engine cancels it: a load that cannot finish
@@ -241,7 +270,7 @@ struct SoftwarePathEscalationTests {
         }
         try await waitFor { reader.entered }
 
-        await engine.escalateToSoftwarePath(Self.mediaFailure)
+        await engine.escalateToSoftwarePath(Self.mediaFailure, expectedGeneration: engine.loadGeneration)
         #expect(events.map(\.duringStartup) == [true])
         #expect(engine.softwarePathTakeover == nil)
         #expect(engine.softwarePathTakeoverArm == nil)

@@ -3,6 +3,32 @@
 This public fork carries AetherEngine changes required by the Moonfin tvOS
 application.
 
+## Canonical main + PR #775 integration — 2026-10-14
+
+User-approved merge of official main `74c81b3c5a0047e1b0229805c20562910367b0e5`
+into the existing customized branch at `a6e09fee4bf36d0486023a007dc38a8a90141347`.
+PR #775 (`cf93b6a07a4313fa1a1e4186df095392a1fd2200`, still unmerged upstream)
+is adapted to retained-range publication: duration-less audio uses bounded successor
+coverage, including repeated timestamps and real-gap controls. Tests assert both
+cache-seek eligibility and the host-visible resident ranges.
+
+Preserve exact-origin TLS and sidecar headers, independent bilingual bitmap/text
+subtitles, transactional external text preparation, correlated seek/timeline
+observations, paused/native and retained/software cache reporting, explicit session
+byte ceilings, H.264 partial/missing-head timestamp repair, fine mux timescales and
+identity-free display/timestamp diagnostics. Compose custom budgets with upstream's
+process-wide retention claims; keep bounded stale-directory cleanup and failure
+telemetry. Upstream HEVC missing-offset eligibility and PiP attachment/pool fixes
+are included; host subtitle layout remains owned by the application. Blocking
+custom probes and range sampling use upstream's dedicated blocking executor.
+
+Fixed dependencies: FFmpegBuild 3.7.1, LibTrueHD 2.3.0, LibDTSX 1.0.1;
+LibDovi 2.1.0 and SMBClient 0.3.1 unchanged. The host separately admits exact
+revisions, binary/resource hashes and licenses. No new product surfaces enabled.
+Rollback input is the pre-merge revision above with the host's prior exact pins.
+Synthetic/host verification does not establish physical audio/video acceptance;
+continuous playback and seeking must be checked on the tvOS candidate.
+
 ## Canonical 7.17.0 integration — 2026-09-25
 
 Merge stable `5b917c006c97b3b26c3fc99bf6ac35b3188f9b9a` into packaged fork

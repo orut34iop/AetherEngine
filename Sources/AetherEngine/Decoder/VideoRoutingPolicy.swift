@@ -14,6 +14,7 @@ enum VideoRoutingPolicy {
 
     /// True when a video codec must use the software decode path (SoftwarePlaybackHost) instead of
     /// native AVPlayer. `av1Available` is `VTCapabilityProbe.av1Available` (HW AV1 decode support).
+    /// Evaluated only for AV1; registering its decoder must not delay unrelated formats.
     /// #150: `spsIndicatesInterlaced` (SPS frame_mbs_only_flag == 0) breaks the tie when the demuxer's
     /// field_order probe stays UNKNOWN; a concrete PROGRESSIVE probe analyzed actual frames and wins.
     /// A false positive costs an unnecessary SW decode (deint=interlaced passes progressive frames
@@ -30,7 +31,7 @@ enum VideoRoutingPolicy {
     static func requiresSoftwarePath(
         codecID: AVCodecID,
         fieldOrder: AVFieldOrder,
-        av1Available: Bool,
+        av1Available: @autoclosure () -> Bool,
         spsIndicatesInterlaced: Bool = false,
         stereo3DType: AVStereo3DType? = nil
     ) -> Bool {
@@ -38,7 +39,7 @@ enum VideoRoutingPolicy {
         case AV_CODEC_ID_NONE, AV_CODEC_ID_HEVC:
             return false
         case AV_CODEC_ID_AV1:
-            return !av1Available
+            return !av1Available()
         case AV_CODEC_ID_H264:
             if routesSoftwareForMultiviewCarriage(codecID: codecID, stereo3DType: stereo3DType) {
                 return true
@@ -166,6 +167,32 @@ enum VideoRoutingPolicy {
         case .automatic: return routedSoftware
         case .software: return true
         }
+    }
+
+    /// A URL source that turned out forward-only (the origin ignores `Range` and names no length, so
+    /// the reader could only stream it front to back) is served the way a declared sequential origin
+    /// is, when its container states a duration: native path, one linear pass, seeks unavailable.
+    /// The software path it used to take cannot seek on such a source either, so the promotion costs
+    /// nothing it had, and it buys what only the native path has: hardware decode, AVPlayer's
+    /// buffering, and a picture on an AirPlay receiver (the software host renders on the device,
+    /// only its audio follows the route).
+    ///
+    /// Only when the routing had already chosen native and the host did not ask for software, so
+    /// the promotion never moves a session between hosts on its own. A custom reader is the host's
+    /// to describe. Without a duration the segment plan has nothing to stride over, so that source
+    /// keeps the software path.
+    static func promotesForwardOnlySourceToSequential(
+        isSourceSeekable: Bool,
+        isLive: Bool,
+        declaredSequential: Bool,
+        isCustomSource: Bool,
+        routedSoftware: Bool,
+        preferred: DecodePath,
+        containerDurationSeconds: Double
+    ) -> Bool {
+        !isSourceSeekable && !isLive && !declaredSequential && !isCustomSource
+            && !routedSoftware && preferred == .automatic
+            && containerDurationSeconds.isFinite && containerDurationSeconds > 0
     }
 
     /// #176 follow-up: DV variants whose only signal is IPT-PQ-c2 (no compatible base layer) cannot be
