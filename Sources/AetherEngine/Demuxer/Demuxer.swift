@@ -2479,7 +2479,20 @@ public final class Demuxer: @unchecked Sendable {
         if seekByDiscTableLocked(ctx, sourceSeconds: seconds) || seekByDVDTimeMapLocked(ctx, sourceSeconds: seconds) {
             return !(avioProvider?.readDeadlineFired ?? false) && probeControl?.isStopped != true
         }
+        // Bounded numeric index observations for ASF cold-seek diagnosis; never log source identity.
+        let isASF = ctx.pointee.iformat?.pointee.name.map { String(cString: $0) == "asf" } ?? false
+        let selectedAnchor = anchor >= 0 ? anchor : av_find_default_stream_index(ctx)
+        func logASFIndex(_ stage: Int) {
+            guard isASF, selectedAnchor >= 0, selectedAnchor < Int32(ctx.pointee.nb_streams),
+                  let stream = ctx.pointee.streams[Int(selectedAnchor)] else { return }
+            let count = avformat_index_get_entries_count(stream)
+            let first = count > 0 ? avformat_index_get_entry(stream, 0)?.pointee.timestamp ?? -1 : -1
+            let last = count > 0 ? avformat_index_get_entry(stream, count - 1)?.pointee.timestamp ?? -1 : -1
+            EngineLog.emit("[ASFSeekIndex] stage=\(stage) anchor=\(selectedAnchor) count=\(count) first=\(first) last=\(last) target=\(timestamp) packet_size=\(ctx.pointee.packet_size)", category: .swPlayback)
+        }
+        logASFIndex(0)
         let ret = avformat_seek_file(ctx, anchor, Int64.min, timestamp, Int64.max, 0)
+        logASFIndex(1)
         avformat_flush(ctx)
         resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
         lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
