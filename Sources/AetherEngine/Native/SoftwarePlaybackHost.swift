@@ -14,11 +14,14 @@ final class SoftwarePlaybackHost {
     /// Codecs whose presentation reordering has an established bound get the read-ahead's
     /// successor-PTS coverage; every other codec keeps strict packet-duration coverage. HEVC's bound
     /// is FFmpeg's own: `sps_max_num_reorder_pics > HEVC_MAX_DPB_SIZE - 1` (15) is rejected
-    /// (n8.1.2 hevc/ps.c:1397-1403), inside the 32-timestamp queue. On the duration model a Matroska
+    /// (n8.1.2 hevc/ps.c:1397-1403), inside the 32-timestamp queue. VC-1's max_b_frames is at most
+    /// 7 (n8.1.2 vc1.c:346,426), also within that queue including a field-picture margin. Its
+    /// 33 ms packet durations over 33/34 ms timestamps otherwise create the same tiny holes.
+    /// On the duration model a Matroska
     /// file muxed with 41 ms durations against 41/42 ms deltas split at every 42 ms step (#613).
     nonisolated static func presentationReorderDepth(codecID: UInt32) -> Int? {
         switch codecID {
-        case AV_CODEC_ID_H264.rawValue, AV_CODEC_ID_HEVC.rawValue: return 32
+        case AV_CODEC_ID_H264.rawValue, AV_CODEC_ID_HEVC.rawValue, AV_CODEC_ID_VC1.rawValue: return 32
         default: return nil
         }
     }
