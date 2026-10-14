@@ -757,7 +757,16 @@ final class SoftwarePlaybackHost {
 
     // MARK: - Init
 
-    init(videoGravity: AVLayerVideoGravity = .resizeAspect) {
+    typealias Reposition = @Sendable (Demuxer, Double, TimeInterval, DispatchQueue,
+                                      @escaping @Sendable () -> Bool) async -> Demuxer.RepositionOutcome
+    private let reposition: Reposition
+
+    init(videoGravity: AVLayerVideoGravity = .resizeAspect,
+         reposition: @escaping Reposition = { dem, target, budget, queue, superseded in
+             await dem.seekBounded(to: target, timeout: budget, on: queue,
+                                   isSuperseded: superseded)
+         }) {
+        self.reposition = reposition
         self.renderer = SampleBufferRenderer(videoGravity: videoGravity)
         // Default to the software decoder; load() swaps it for the
         // VT-backed one when the source's video codec is HEVC.
@@ -1094,11 +1103,16 @@ final class SoftwarePlaybackHost {
             let sourceStart = SWClockAnchorPolicy.sourceSeconds(forSession: start, sessionZeroSeconds: zero)
             // #254: same off-main, deadline-bounded reposition the transport seek uses. A resume into a
             // remote source that has to scan for its landing would otherwise block the main thread here.
-            _ = await dem.seekBounded(to: sourceStart, timeout: Self.seekBudgetSeconds, on: seekQueue)
+            let outcome = await reposition(dem, sourceStart, Self.seekBudgetSeconds, seekQueue,
+                                           { [weak self] in self?.stopRequested ?? true })
             // This is load()'s only suspension point, so it is also the only place a stop() can land
             // mid-load. Arming the clock and publishing isReady on a session already torn down would
             // hand the engine a host it has stopped.
-            guard !stopRequested else { return }
+            guard !stopRequested, !Task.isCancelled, outcome != .superseded else {
+                throw CancellationError()
+            }
+            EngineLog.emit("[SWReposition] flags=\(outcome == .landed ? 0 : 1)", category: .swPlayback)
+            guard outcome == .landed else { throw HostError.repositionFailed }
             // Mirror seek() skip-PTS + clock alignment so demux drops pre-keyframe frames and synchronizer starts at the resume offset.
             let startTime = CMTime(seconds: sourceStart, preferredTimescale: 90000)
             videoDecoder.skipUntilPTS = startTime
@@ -1178,6 +1192,7 @@ final class SoftwarePlaybackHost {
     // MARK: - Transport
 
     func play() {
+        guard !stopRequested, failure == nil else { return }
         // Resume after pause(): gate on clockArmed, not demuxLoopStarted. A rate change on the
         // un-anchored synchronizer (no media at its clock time yet) wedges the delayed-rate-change
         // machinery permanently frozen; the arming seekClock applies the current lastRate (#107).
@@ -1487,7 +1502,7 @@ final class SoftwarePlaybackHost {
     @discardableResult
     func seek(to seconds: Double) async -> Demuxer.RepositionOutcome {
         guard !stopRequested else { return .superseded }
-        guard let dem = demuxer else { return .stalled }
+        guard failure == nil, let dem = demuxer else { return .stalled }
         // Stop loop + bump generation to invalidate in-flight packets. Captured right after, so the
         // reposition can tell on `seekQueue` whether a newer seek has already taken over.
         bumpSeekGeneration()
@@ -1590,23 +1605,31 @@ final class SoftwarePlaybackHost {
             // existing frontier; seeking it too would duplicate or skip already retained packets.
             outcome = .landed
         } else {
-            outcome = await dem.seekBounded(
-                to: sourceSeconds, timeout: Self.seekBudgetSeconds, on: seekQueue,
-                isSuperseded: { [weak self] in
+            outcome = await reposition(dem, sourceSeconds, Self.seekBudgetSeconds, seekQueue,
+                { [weak self] in
                     self?.seekGeneration != generation || (self?.stopRequested ?? true)
                 })
         }
         // A newer seek owns the state from here: it published its own target and clears the hold itself.
         // stop() can also land in the await now that this suspends, and re-arming the clock or flipping
         // isPlaying on a torn-down session would resurrect a loop that has already been told to quit.
-        guard seekGeneration == generation, !stopRequested else { return .superseded }
+        guard seekGeneration == generation, !stopRequested, outcome != .superseded else { return .superseded }
         seekInFlight = false
-        if outcome == .stalled {
-            EngineLog.emit(
-                "[SWHost] reposition to \(String(format: "%.2f", seconds))s did not complete within "
-                + "\(String(format: "%.0f", Self.seekBudgetSeconds))s; read position is undefined",
-                category: .swPlayback
-            )
+        EngineLog.emit("[SWReposition] flags=\(outcome == .landed ? 2 : 3)", category: .swPlayback)
+        guard outcome == .landed else {
+            // No target clock, decoder run or cache producer may follow an undefined read position.
+            // Keep the last observed clock; the engine must not finalize this request as a landing.
+            isPlaying = false
+            pausedByHost = true
+            audioOutput?.setRate(0)
+            currentTime = SWClockAnchorPolicy.sessionSeconds(
+                forSource: sourceClockSeconds, sessionZeroSeconds: clockSessionZero)
+            packetSource?.close()
+            residentRanges = []
+            noteSeekSettled(generation)
+            failure = PlaybackErrorInfo(kind: .softwarePipelineFailed,
+                                       message: "Playback source could not reposition.")
+            return .stalled
         }
 
         // Re-armed after the landing: a pre-seek frame PAST the target (a backward seek) clears the
@@ -3386,7 +3409,7 @@ final class SoftwarePlaybackHost {
                 guard let aOut = self.audioOutput else { return }
                 // #254: a reposition in flight holds `currentTime` at its target; the synchronizer is
                 // still on the pre-seek anchor and would drag the published position backwards.
-                guard !self.seekInFlight else { return }
+                guard !self.seekInFlight, self.failure == nil else { return }
                 let raw = aOut.currentTimeSeconds
                 let sampledAt = ProcessInfo.processInfo.systemUptime
                 self.emitDiagIfDue(clock: raw)
@@ -3564,11 +3587,12 @@ final class SoftwarePlaybackHost {
     // MARK: - Errors
 
     enum HostError: Error, LocalizedError {
-        case noVideoStream
+        case noVideoStream, repositionFailed
 
         var errorDescription: String? {
             switch self {
             case .noVideoStream: return "Source has no video stream"
+            case .repositionFailed: return "Playback source could not resume at the requested position."
             }
         }
     }
