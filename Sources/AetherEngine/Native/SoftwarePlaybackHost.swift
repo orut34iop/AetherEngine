@@ -186,8 +186,12 @@ final class SoftwarePlaybackHost {
     /// the wrong thread for it. Serial and separate from `demuxQueue`, whose block never returns.
     private let seekQueue = DispatchQueue(label: "engine.sw.seek", qos: .userInitiated)
 
-    /// Read-deadline budget for a reposition (#254). Matches the side reader's positioning budget.
-    private static let seekBudgetSeconds: TimeInterval = 8.0
+    /// Bound foreground VOD positioning independently of speculative side-reader work.
+    /// Index-less containers can require several remote keyframe probes; cloud-mounted
+    /// sources may take 2-3 seconds per successful range response. The former 8-second
+    /// side-reader budget aborted these progressing seeks. Keep a finite total bound;
+    /// repositioning still runs off-main and failed/cancelled results remain failures.
+    private static let seekBudgetSeconds: TimeInterval = 30.0
 
     /// True while a reposition is awaiting `seekQueue`. Gates the 0.25 s time tick: the synchronizer
     /// still carries the pre-seek anchor, so an ungated tick would walk the OLD position forward for
