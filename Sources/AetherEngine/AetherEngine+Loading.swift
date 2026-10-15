@@ -1177,6 +1177,13 @@ extension AetherEngine {
         // #126: zero-progress VOD pump death (readError before any packet/segment), and #169:
         // mid-session readError after the revive cap. Without this the host sees
         // isPlayable=true / a stalled item and waits until its own timeout.
+        session.onVODVideoConfigurationChanged = { [weak self, weak session] epoch, summary in
+            Task { @MainActor in
+                guard let self, let session else { return }
+                await self.handleVODVideoConfigurationChange(session: session, epoch: epoch,
+                    summary: summary, generation: generation)
+            }
+        }
         session.onVODSourceFailed = { [weak self, weak session] code, reason, kind in
             Task { @MainActor in
                 guard let self, let session, self.nativeVideoSession === session else {
@@ -1350,6 +1357,13 @@ extension AetherEngine {
             try checkLoadCurrent(generation)
         }
         self.nativeVideoSession = session
+        if let event = session.pendingVODVideoConfigurationMismatch {
+            await handleVODVideoConfigurationChange(session: session, epoch: event.epoch,
+                summary: event.summary, generation: generation, reportRefusal: false)
+            try checkLoadCurrent(generation)
+            // If no takeover occurred, the explicitly selected route cannot serve this source.
+            throw HLSVideoEngine.HLSVideoEngineError.openFailed(reason: event.summary)
+        }
         diagnostics.h264CompositionOffsetRepairDiagnostic =
             session.h264CompositionOffsetRepairDiagnostic
         isSourceSeekable = session.openedSourceIsSeekable
