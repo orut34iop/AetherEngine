@@ -13,6 +13,7 @@ the public-API contract.
 ### Fixed
 
 - Duration-less audio cache coverage rejects an overflowing successor timestamp difference instead of trapping. Positive-duration packets, the existing gap bound and source-epoch handling are unchanged.
+- A fully prewarmed source no longer issues a redundant suffix request when its adopted head already covers the entire file. Partial warms retain their existing tail prefetch.
 
 ### Changed
 
