@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Fixed
+
+- Persistent HTTP/1.1 HLS ingest checks FIFO headroom before every segment request, including when the previous body’s final chunk filled the buffer with no pending remainder. Seek, close and cancellation retire the waiting producer.
+
 ### Changed
 
 - Correct the secondary subtitle contract: embedded bitmap tracks already use independent channel decoders. Add real dual-PGS drain regression coverage for reused palette/object IDs, clear/off, and cached seek reconstruction. No playback behavior change.
