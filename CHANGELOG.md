@@ -12,6 +12,8 @@ the public-API contract.
 
 ### Changed
 
+- Correct the secondary subtitle contract: embedded bitmap tracks already use independent channel decoders. Add real dual-PGS drain regression coverage for reused palette/object IDs, clear/off, and cached seek reconstruction. No playback behavior change.
+
 - **The documentation no longer says TrueHD Atmos objects are always lost.** The Known limitations
   entry in `docs/formats.md`, the `AudioDelivery.bridged` reference and the channel bridge's notes
   predate `objectAudioRendering` (#731) and said objects and heights never survive. They now say the
