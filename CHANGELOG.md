@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Fixed
+
+- Duration-less audio cache coverage rejects an overflowing successor timestamp difference instead of trapping. Positive-duration packets, the existing gap bound and source-epoch handling are unchanged.
+
 ### Changed
 
 - **The documentation no longer says TrueHD Atmos objects are always lost.** The Known limitations

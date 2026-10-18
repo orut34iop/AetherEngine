@@ -87,3 +87,48 @@ struct SoftwarePacketReadAheadAudioCoverageTests {
         #expect(try seekHits(source, to: 2.0) == false)
     }
 }
+extension SoftwarePacketReadAheadAudioCoverageTests {
+    private final class Packets: @unchecked Sendable {
+        private let lock = NSLock()
+        private var index = 0
+        let values: [SoftwareStoredPacket]
+        init(_ values: [SoftwareStoredPacket]) { self.values = values }
+        func next() -> SoftwareStoredPacket? {
+            lock.lock(); defer { lock.unlock() }
+            guard index < values.count else { return nil }
+            defer { index += 1 }
+            return values[index]
+        }
+    }
+
+    @Test("A huge increasing audio PTS cannot trap in the read-ahead worker", .timeLimit(.minutes(1)))
+    func overflowingSuccessor() async throws {
+        func packet(_ pts: Int64, stream: Int32, duration: Int64) -> SoftwareStoredPacket {
+            SoftwareStoredPacket(pts: pts, dts: pts, duration: duration, position: 0,
+                streamIndex: stream, flags: 1, timeBaseNumerator: 1, timeBaseDenominator: 1000,
+                bytes: Data(repeating: 1, count: 16), sideData: [])
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("audio-overflow-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let packets = Packets([
+            packet(0, stream: 0, duration: 40),
+            packet(Int64.min + 1, stream: 1, duration: 0),
+            packet(Int64.max - 1, stream: 1, duration: 0),
+            packet(40, stream: 0, duration: 40),
+        ])
+        let fifo = try SoftwarePacketDiskFIFO(chunkTargetBytes: 64 * 1024, retainConsumed: true,
+                                              parentDirectory: root)
+        let reader = SoftwarePacketReadAhead(
+            video: .init(index: 0, numerator: 1, denominator: 1000),
+            audio: .init(index: 1, numerator: 1, denominator: 1000),
+            byteBudget: 1 << 20, forwardSeconds: 100, initialSourceClock: 0, fifo: fifo
+        ) { _ in packets.next() }
+        defer { reader.close() }
+        reader.start()
+        try await waitFor { reader.snapshot.sourceEnded }
+        let token = reader.beginSeek(to: 0.02)
+        #expect(try reader.prepareSeek(token, to: 0.02) == false,
+                "Overflow must not invent audio coverage over the video interval")
+    }
+}

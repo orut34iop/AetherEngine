@@ -635,10 +635,12 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
             audioCoverage.insert(pts: pts, duration: duration)
             return
         }
-        guard let previous, pts > previous, stream.numerator > 0, stream.denominator > 0,
-              Double(pts - previous) * Double(stream.numerator) / Double(stream.denominator)
+        guard let previous, pts > previous, stream.numerator > 0, stream.denominator > 0 else { return }
+        let (delta, overflow) = pts.subtractingReportingOverflow(previous)
+        guard !overflow,
+              Double(delta) * Double(stream.numerator) / Double(stream.denominator)
                 <= Self.maxAudioSuccessorGapSeconds else { return }
-        audioCoverage.insert(pts: previous, duration: pts - previous)
+        audioCoverage.insert(pts: previous, duration: delta)
     }
 
     private func shouldParkLocked() -> Bool {
