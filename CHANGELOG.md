@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Fixed
+
+- Persistent HTTP/1.1 HLS ingest checks FIFO headroom before every segment request, including when the previous body’s final chunk filled the buffer with no pending remainder. Seek, close and cancellation retire the waiting producer.
+
 ### Changed
 
 - **The documentation no longer says TrueHD Atmos objects are always lost.** The Known limitations

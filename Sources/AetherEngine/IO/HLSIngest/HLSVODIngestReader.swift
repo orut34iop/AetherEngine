@@ -475,6 +475,9 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         defer { primed?.body.abandon() }
         for (offset, (segment, url)) in segments.enumerated() {
             try Task.checkCancellation()
+            // Runs on the producer's BlockingWork executor. The last offered chunk can fill the
+            // FIFO with no pending remainder, so admission must not depend on append() parking.
+            guard waitForSegmentAdmission(generation: generation) else { return }
             if let crypt = segment.crypt {
                 let bytes = try await decrypt(
                     try await fetch(url, limit: BoundedFetch.segmentLimit(forDuration: segment.duration)),
@@ -572,6 +575,18 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             throw HLSIngestError.playlistUnreachable(status: body.response.statusCode)
         }
         return body
+    }
+
+    /// Wait between requests, after the previous body has completed. Seek/close wake the producer
+    /// and invalidate its generation; a superseded producer must never open the next segment.
+    private func waitForSegmentAdmission(generation: UInt64) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        while self.generation == generation, !closed, !failed,
+              bufferedBytes >= Self.maximumBufferedBytes {
+            condition.wait()
+        }
+        return self.generation == generation && !closed && !failed
     }
 
     private func append(_ data: Data, generation: UInt64) -> Bool {
